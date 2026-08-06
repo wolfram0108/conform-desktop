@@ -29,7 +29,7 @@ class MainWindow(QMainWindow):
         self.api = api
         self.cfg = settings
         self.setWindowTitle("conform-desktop")
-        self.resize(980, 680)
+        self.resize(1120, 720)          # реальные пути длинные — узкое окно режет форму
 
         i18n.set_lang(str(self.cfg.value("ui/lang", "ru")))
         self.theme_mode = str(self.cfg.value("ui/theme", "system"))
@@ -63,6 +63,7 @@ class MainWindow(QMainWindow):
 
         self.gpu_badge = QLabel("…")
         self.gpu_badge.setObjectName("badge")
+        self.gpu_badge.setMaximumWidth(280)
         h.addWidget(self.gpu_badge)
 
         self.b_ru = QPushButton("RU")
@@ -109,6 +110,15 @@ class MainWindow(QMainWindow):
 
         QGuiApplication.styleHints().colorSchemeChanged.connect(self._sys_scheme_changed)
         self.apply_theme()
+        # Минимум окна = реальный минимум формы: Qt не позволит сузить его до состояния,
+        # когда поля и кнопки уезжают за край (болезнь длинных путей/названий дорожек).
+        QTimer.singleShot(0, self._apply_min_width)
+
+    def _apply_min_width(self) -> None:
+        """Не дать сузить окно до состояния, когда поля и кнопки уезжают за край."""
+        form = self.task_tab.ref_edit.parentWidget()          # страница формы задачи
+        need = form.minimumSizeHint().width() + 48            # поля + вертикальный скроллбар
+        self.setMinimumWidth(max(720, min(1100, need)))
 
     # ── вкладки ──
 

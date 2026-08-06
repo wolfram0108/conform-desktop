@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from ui.client import Api, call
 from ui.i18n import tr
+from ui.widgets import ElidedLabel
 
 _STATUS_DOT = {"running": "run", "queued": "wait", "paused": "wait", "done": "ok",
                "failed": "crit", "cancelled": "wait"}
@@ -89,8 +90,7 @@ class DubResultRow(QWidget):
         lay.setSpacing(10)
 
         lay.addWidget(_dot(level))
-        name = Path(res.get("out_path") or res["dub"]).name
-        n = QLabel(name)
+        n = ElidedLabel(Path(res.get("out_path") or res["dub"]).name)
         n.setObjectName("mono")
         n.setToolTip(res.get("out_path") or res["dub"])
         lay.addWidget(n, 1)
@@ -263,10 +263,11 @@ class JobCard(QFrame):
         h.setSpacing(12)
         self.dot = _dot("wait")
         h.addWidget(self.dot)
-        self.name = QLabel(job.get("label") or self.jid)
+        self.name = ElidedLabel(job.get("label") or self.jid)
         self.name.setStyleSheet("font-weight:600;")
+        self.name.setMaximumWidth(280)
         h.addWidget(self.name)
-        self.meta = QLabel("")
+        self.meta = ElidedLabel("")
         self.meta.setObjectName("hint")
         h.addWidget(self.meta, 1)
         self.bar = QProgressBar()
@@ -400,6 +401,7 @@ class QueueTab(QWidget):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         root.addWidget(scroll)
         page = QWidget()
         scroll.setWidget(page)

@@ -12,22 +12,28 @@ from pathlib import Path
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
-    QLabel, QLineEdit, QPushButton, QRadioButton, QScrollArea, QVBoxLayout, QWidget,
+    QLabel, QLineEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
+    QVBoxLayout, QWidget,
 )
 
 from ui.client import Api, call
 from ui.i18n import tr
+from ui.widgets import ElidedLabel, tame_combo
 
 AUDIO_EXT = {".flac", ".mka", ".mp3", ".wav", ".aac", ".opus", ".ogg", ".m4a", ".ac3", ".dts"}
 
 
-def _track_label(t: dict) -> str:
-    """Подпись дорожки в комбо: 'a1 · rus · AniLiberty · 2.0'."""
+def _track_label(t: dict, max_title: int = 26) -> str:
+    """Подпись дорожки в комбо: 'a1 · rus · AniLiberty · 2.0'.
+
+    Титул бывает длинным («Dejz, Derenn, Kari, Hekomi, MyAska [AniLibria]») — режем,
+    иначе комбо требует ширину по самому длинному пункту и распирает форму."""
     parts = [f"a{t['index']}"]
     if t.get("lang"):
         parts.append(t["lang"])
     if t.get("title"):
-        parts.append(t["title"])
+        title = t["title"]
+        parts.append(title if len(title) <= max_title else title[:max_title - 1] + "…")
     if t.get("layout"):
         parts.append(t["layout"])
     elif t.get("channels"):
@@ -51,17 +57,19 @@ class DubRow(QFrame):
         lay.setContentsMargins(12, 6, 10, 6)
         lay.setSpacing(10)
 
-        self.name = QLabel(Path(path).name)
+        self.name = ElidedLabel(Path(path).name)
         self.name.setObjectName("mono")
         self.name.setToolTip(path)
         lay.addWidget(self.name, 1)
 
         self.ref_tag = QLabel(tr("dub.same_as_ref"))
+        self.ref_tag.setMinimumWidth(0)
         self.ref_tag.setObjectName("hint")
+        self.ref_tag.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self.ref_tag.hide()
         lay.addWidget(self.ref_tag)
 
-        self.combo = QComboBox()
+        self.combo = tame_combo(QComboBox())
         self.combo.hide()
         lay.addWidget(self.combo)
 
@@ -125,6 +133,7 @@ class TaskTab(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)   # ширина = ширине окна
         outer.addWidget(scroll)
         page = QWidget()
         scroll.setWidget(page)
@@ -137,7 +146,7 @@ class TaskTab(QWidget):
             lay.setSpacing(10)
             lab = QLabel(tr(label_key))
             lab.setObjectName("muted")
-            lab.setFixedWidth(150)
+            lab.setFixedWidth(132)
             lab.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             lay.addWidget(lab)
             root.addLayout(lay)
@@ -147,6 +156,8 @@ class TaskTab(QWidget):
         self.l_ref, lay = frow("ref")
         self.ref_edit = QLineEdit()
         self.ref_edit.setObjectName("path")
+        self.ref_edit.setMinimumWidth(120)
+        self.ref_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.ref_edit.editingFinished.connect(self._ref_changed)
         lay.addWidget(self.ref_edit, 1)
         self.b_ref = QPushButton(tr("browse"))
@@ -155,10 +166,11 @@ class TaskTab(QWidget):
 
         # реф-дорожка (видна только при >1)
         self.l_rtrack, lay = frow("ref.track")
-        self.ref_combo = QComboBox()
+        self.ref_combo = tame_combo(QComboBox(), max_width=420, chars=10)
         lay.addWidget(self.ref_combo)
-        self.ref_hint = QLabel("")
+        self.ref_hint = ElidedLabel("")
         self.ref_hint.setObjectName("hint")
+        self.ref_hint.setMinimumWidth(0)
         lay.addWidget(self.ref_hint)
         lay.addStretch(1)
         self._rtrack_row = (self.l_rtrack, self.ref_combo, self.ref_hint)
@@ -193,6 +205,8 @@ class TaskTab(QWidget):
         self.l_out, lay = frow("out_dir")
         self.out_edit = QLineEdit()
         self.out_edit.setObjectName("path")
+        self.out_edit.setMinimumWidth(120)
+        self.out_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         lay.addWidget(self.out_edit, 1)
         self.b_out = QPushButton(tr("browse"))
         self.b_out.clicked.connect(self._pick_out)
@@ -264,7 +278,9 @@ class TaskTab(QWidget):
         self.tmp_edit = QLineEdit()
         self.tmp_edit.setObjectName("path")
         self.tmp_edit.setEnabled(False)
+        self.tmp_edit.setMinimumWidth(120)
         self.tmp_edit.setMaximumWidth(360)
+        self.tmp_edit.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         trow.addWidget(self.tmp_edit)
         self.b_tmp = QPushButton(tr("browse"))
         self.b_tmp.setEnabled(False)
