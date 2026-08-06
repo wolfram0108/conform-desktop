@@ -38,6 +38,7 @@ class ConformEnqueueBody(BaseModel):
     audio_muq: bool = False            # anchor-пайплайн, карта MuQ (GPU, опц. transformers)
     apply_cuts: bool = True            # band/muq: применять резкую правку резов (иначе только дрейф ≤2%)
     drift_speed_pct: float = 1.25      # band/muq: потолок скорости изменения сдвига кривой дрейфа, %/с
+    autostart: bool = True             # False → задача ждёт ручного пуска (кнопка ▶ в очереди)
     ref_atrack: int = 0                # ⭐ 5.1: аудиодорожка РЕФА (звуковой эталон band/заливки)
     dub_atracks: list[int] | None = None   # ⭐ 5.1: дорожка КАЖДОЙ озвучки (параллельно dubs;
                                        # None → все 0). «Виртуальный дубль» = тот же файл
@@ -75,6 +76,7 @@ def make_conform_router(cq: ConformQueue) -> APIRouter:
             "apply_cuts": body.apply_cuts,
             "drift_speed_pct": body.drift_speed_pct,
             "ref_atrack": body.ref_atrack, "dub_atracks": body.dub_atracks,
+            "autostart": body.autostart,
         }
         return cq.enqueue(spec)
 
@@ -135,6 +137,26 @@ def make_conform_router(cq: ConformQueue) -> APIRouter:
         if not cq.retry(jid):
             raise HTTPException(409, "нельзя перезапустить (нет задачи или ещё активна)")
         return {"retried": jid}
+
+    @r.post("/jobs/{jid}/start")
+    def start(jid: str) -> dict:
+        """Ручной пуск задачи, стоящей на паузе (кнопка ▶ у строки очереди)."""
+        if not cq.start(jid):
+            raise HTTPException(409, "нельзя запустить (нет задачи или она не на паузе)")
+        return {"started": jid}
+
+    @r.post("/jobs/{jid}/pause")
+    def pause(jid: str) -> dict:
+        """Снять задачу с автоподачи: queued → paused. Для running используйте отмену."""
+        if not cq.pause(jid):
+            raise HTTPException(409, "нельзя поставить на паузу (нет задачи или она уже идёт)")
+        return {"paused": jid}
+
+    @r.post("/clear_done")
+    def clear_done() -> dict:
+        """Убрать завершённые задачи И удалить их временные файлы (кеши/чекпоинты).
+        Выходные аудиофайлы и графики не трогаются."""
+        return cq.clear_done()
 
     @r.post("/clear")
     def clear() -> dict:

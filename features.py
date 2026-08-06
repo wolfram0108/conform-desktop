@@ -17,6 +17,7 @@ import numpy as np
 from scipy import ndimage
 
 from track_muxer.conform.config import FFMPEG, FFPROBE
+from track_muxer.conform import procreg
 from track_muxer.conform.models import Progress, SrmFeatures
 
 GW, GH = 128, 72
@@ -331,7 +332,7 @@ def build_srm(
            "-vf", vf, "-vsync", "0", "-f", "rawvideo", "-"]
     fb = GW * GH
     D = GW * GH * 2                       # размерность вектора кадра (rk[9216]+rd[9216])
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=fb * _RBLOCK)
+    p = procreg.popen(cmd, stdout=subprocess.PIPE, bufsize=fb * _RBLOCK)
     out_f = open(mmap_path, "wb") if mmap_path is not None else None   # поток на диск (низкая RAM)
     vecs: list[np.ndarray] = []           # используется только при mmap_path is None
     n_written = 0
@@ -389,7 +390,7 @@ def build_srm(
                     last = time.perf_counter()
     finally:
         p.stdout.close()
-        p.wait()
+        p.wait(); procreg.done(p)
         if out_f is not None:
             out_f.close()
 
