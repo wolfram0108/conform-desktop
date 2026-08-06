@@ -29,7 +29,8 @@ class MainWindow(QMainWindow):
         self.api = api
         self.cfg = settings
         self.setWindowTitle("conform-desktop")
-        self.resize(1120, 720)          # реальные пути длинные — узкое окно режет форму
+        self.resize(int(self.cfg.value("ui/geometry_w", 1120)),
+                    int(self.cfg.value("ui/geometry_h", 720)))   # длинные пути → окно пошире
 
         i18n.set_lang(str(self.cfg.value("ui/lang", "ru")))
         self.theme_mode = str(self.cfg.value("ui/theme", "system"))
@@ -159,6 +160,7 @@ class MainWindow(QMainWindow):
     def _set_lang(self, lang: str) -> None:
         i18n.set_lang(lang)
         self.cfg.setValue("ui/lang", lang)
+        self.cfg.sync()
         self.b_task.setText(tr("tab.task"))
         self.b_queue.setText(tr("tab.queue"))
         self.task_tab.retranslate()
@@ -168,12 +170,21 @@ class MainWindow(QMainWindow):
         i = _THEME_ORDER.index(self.theme_mode) if self.theme_mode in _THEME_ORDER else 0
         self.theme_mode = _THEME_ORDER[(i + 1) % len(_THEME_ORDER)]
         self.cfg.setValue("ui/theme", self.theme_mode)
+        self.cfg.sync()
         self.b_theme.setText(_THEME_ICONS[self.theme_mode])
         self.apply_theme()
 
     def _sys_scheme_changed(self) -> None:
         if self.theme_mode == "system":
             self.apply_theme()
+
+    def closeEvent(self, e) -> None:  # noqa: N802 — Qt-API
+        """Дописать настройки на диск до жёсткого выхода процесса."""
+        self.cfg.setValue("ui/geometry_w", self.width())
+        self.cfg.setValue("ui/geometry_h", self.height())
+        self.task_tab._save_cfg()
+        self.cfg.sync()
+        super().closeEvent(e)
 
     def apply_theme(self) -> None:
         QApplication.instance().setStyleSheet(theme.qss(theme.tokens(self.theme_mode)))

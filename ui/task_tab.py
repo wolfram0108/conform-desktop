@@ -125,6 +125,7 @@ class TaskTab(QWidget):
         self.setAcceptDrops(True)
         self._build()
         self._load_cfg()
+        self._wire_autosave()
 
     # ── каркас ──
 
@@ -331,6 +332,15 @@ class TaskTab(QWidget):
         except (TypeError, ValueError):
             pass
 
+    def _wire_autosave(self) -> None:
+        """Любая правка настройки пишется на диск СРАЗУ: приложение завершается жёстко
+        (non-daemon пул очереди), отложенная запись QSettings не успевала бы."""
+        for w in (self.c_fill, self.c_tmp, self.c_autostart, self.r_muq, self.r_band):
+            w.toggled.connect(lambda _v: self._save_cfg())
+        self.s_drift.valueChanged.connect(lambda _v: self._save_cfg())
+        for e in (self.out_edit, self.tmp_edit):
+            e.editingFinished.connect(self._save_cfg)
+
     def _save_cfg(self) -> None:
         c = self.cfg
         if c is None:
@@ -342,6 +352,7 @@ class TaskTab(QWidget):
         c.setValue("task/autostart", self.c_autostart.isChecked())
         c.setValue("task/muq", self.r_muq.isChecked())
         c.setValue("task/drift", self.s_drift.value())
+        c.sync()                                   # на диск немедленно
 
     # ── референс ──
 
