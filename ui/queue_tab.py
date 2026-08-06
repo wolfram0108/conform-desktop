@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar,
@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from ui.client import Api, call
 from ui.i18n import tr
 
-_STATUS_DOT = {"running": "run", "queued": "wait", "done": "ok",
+_STATUS_DOT = {"running": "run", "queued": "wait", "paused": "wait", "done": "ok",
                "failed": "crit", "cancelled": "wait"}
 
 
@@ -158,7 +158,7 @@ class DubResultRow(QWidget):
         grid.setHorizontalSpacing(26)
         grid.setVerticalSpacing(6)
         cells: list[tuple[str, str]] = [
-            (tr("m.resid"), f"{r.get('audio_resid_ms', 0):.1f} мс"),
+            (tr("m.resid"), f"{r.get('audio_resid_ms', 0):.1f} {tr('unit.ms')}"),
             (tr("m.coverage"), f"{r.get('audio_coverage', 0):.2f}"),
         ]
         if r.get("mode") == "audio":
@@ -171,9 +171,9 @@ class DubResultRow(QWidget):
             ]
         cuts = r.get("audio_cuts", 0)
         cells.append((tr("m.cuts"),
-                      f"{cuts} · {tr('m.max_step')} {r.get('audio_max_step_ms', 0):.0f} мс" if cuts else "0"))
-        cells.append((tr("m.filled"), f"{r.get('filled_cuts', 0)} с"))
-        cells.append((tr("m.span"), f"{r.get('audio_span_ms', 0):.0f} мс"))
+                      f"{cuts} · {tr('m.max_step')} {r.get('audio_max_step_ms', 0):.0f} {tr('unit.ms')}" if cuts else "0"))
+        cells.append((tr("m.filled"), f"{r.get('filled_cuts', 0)} {tr('unit.s')}"))
+        cells.append((tr("m.span"), f"{r.get('audio_span_ms', 0):.0f} {tr('unit.ms')}"))
         if r.get("geom_used"):
             cells.append((tr("m.geom"),
                           f"sx {r.get('geom_sx', 0):.3f} · sy {r.get('geom_sy', 0):.3f} · in {r.get('geom_n_in', 0)}"))
@@ -243,12 +243,12 @@ class DubResultRow(QWidget):
 class JobCard(QFrame):
     """Карточка задачи: шапка (статус/прогресс/кнопки) + строки озвучек."""
 
-    def __init__(self, api: Api, job: dict, on_cancel) -> None:
+    def __init__(self, api: Api, job: dict, on_action) -> None:
         super().__init__()
         self.setObjectName("card")
         self.api = api
         self.jid = job["id"]
-        self._on_cancel = on_cancel
+        self._on_action = on_action
         self._results_key = None
         self._expanded = True
 
@@ -281,10 +281,20 @@ class JobCard(QFrame):
         self.b_toggle.setObjectName("link")
         self.b_toggle.clicked.connect(self._toggle)
         h.addWidget(self.b_toggle)
+        self.b_start = QPushButton("▶")          # виден на паузе
+        self.b_start.setObjectName("rowbtn")
+        self.b_start.setToolTip(tr("q.start_tip"))
+        self.b_start.clicked.connect(lambda: self._act("start"))
+        h.addWidget(self.b_start)
+        self.b_pause = QPushButton("⏸")          # виден у ждущей задачи
+        self.b_pause.setObjectName("rowbtn")
+        self.b_pause.setToolTip(tr("q.pause_tip"))
+        self.b_pause.clicked.connect(lambda: self._act("pause"))
+        h.addWidget(self.b_pause)
         self.b_cancel = QPushButton("✕")
         self.b_cancel.setObjectName("rowbtn")
         self.b_cancel.setToolTip(tr("cancel.tip"))
-        self.b_cancel.clicked.connect(lambda: self._on_cancel(self.jid))
+        self.b_cancel.clicked.connect(lambda: self._act("cancel"))
         h.addWidget(self.b_cancel)
 
         self.sub = QFrame()
@@ -297,6 +307,11 @@ class JobCard(QFrame):
 
         self.update_job(job)
 
+    def _act(self, what: str) -> None:
+        for b in (self.b_start, self.b_pause, self.b_cancel):
+            b.setEnabled(False)                  # до ответа сервера (вернёт следующий поллинг)
+        self._on_action(what, self.jid)
+
     def _toggle(self) -> None:
         self._expanded = not self._expanded
         self.sub.setVisible(self._expanded and self.sub_col.count() > 0)
@@ -306,6 +321,12 @@ class JobCard(QFrame):
         st = job["status"]
         _set_dot(self.dot, _STATUS_DOT.get(st, "wait"))
         self.name.setText(job.get("label") or self.jid)
+
+        for b, vis in ((self.b_start, st == "paused"),
+                       (self.b_pause, st == "queued"),
+                       (self.b_cancel, True)):
+            b.setVisible(vis)
+            b.setEnabled(True)
 
         if st == "running":
             stage = tr("stage." + job.get("stage", "")) if job.get("stage") else ""
@@ -322,8 +343,8 @@ class JobCard(QFrame):
         else:
             self.bar.hide()
             self.pct.hide()
-            if st == "queued":
-                self.meta.setText(tr("q.queued") + f" · {job.get('dub_total', 0)}")
+            if st in ("queued", "paused"):
+                self.meta.setText(tr("q." + st) + f" · {job.get('dub_total', 0)}")
             elif st == "done":
                 ok = sum(1 for r in job.get("results") or [] if r.get("ok"))
                 self.meta.setText(f"{tr('q.done')} · {_fmt_elapsed(job.get('elapsed_s', 0))}"
@@ -350,6 +371,8 @@ class JobCard(QFrame):
 
 class QueueTab(QWidget):
     """Список карточек. update_jobs() — из поллера MainWindow."""
+
+    toast = Signal(str)
 
     def __init__(self, api: Api) -> None:
         super().__init__()
@@ -401,7 +424,7 @@ class QueueTab(QWidget):
             seen.add(jid)
             card = self.cards.get(jid)
             if card is None:
-                card = JobCard(self.api, job, self._cancel)
+                card = JobCard(self.api, job, self._action)
                 self.cards[jid] = card
                 self.col.insertWidget(i, card)
             else:
@@ -412,19 +435,21 @@ class QueueTab(QWidget):
         self.empty.setVisible(not self.cards)
 
     def active_count(self, jobs: list[dict]) -> int:
-        return sum(1 for j in jobs if j["status"] in ("running", "queued"))
+        return sum(1 for j in jobs if j["status"] in ("running", "queued", "paused"))
 
     # ── действия ──
 
-    def _cancel(self, jid: str) -> None:
-        call(self.api.cancel, jid)
+    def _action(self, what: str, jid: str) -> None:
+        fn = {"start": self.api.start, "pause": self.api.pause, "cancel": self.api.cancel}[what]
+        call(fn, jid, error=lambda m: self.toast.emit(tr("err.api", e=m)))
 
     def _clear_done(self) -> None:
-        # терминальные записи удаляются поштучно (DELETE на терминальной = удаление);
-        # уборка временных файлов — доработка ядра (этап 10а)
-        for jid, card in list(self.cards.items()):
-            if card.dot.property("state") in ("ok", "crit"):
-                call(self.api.cancel, jid)
+        """Убрать завершённые задачи вместе с их временными файлами (выходные и графики целы)."""
+        call(self.api.clear_done, done=self._on_cleared,
+             error=lambda m: self.toast.emit(tr("err.api", e=m)))
+
+    def _on_cleared(self, res: dict) -> None:
+        self.toast.emit(tr("q.cleared", n=res.get("cleared", 0), mb=res.get("freed_mb", 0)))
 
     def _on_settings(self, s: dict) -> None:
         self._limit_loaded = True

@@ -90,12 +90,13 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         root.addWidget(self.stack, 1)
         self.gpu = True
-        self.task_tab = TaskTab(api, gpu=True)
+        self.task_tab = TaskTab(api, gpu=True, cfg=self.cfg)
         self.queue_tab = QueueTab(api)
         self.stack.addWidget(self.task_tab)
         self.stack.addWidget(self.queue_tab)
 
         self.task_tab.toast.connect(lambda m: self.statusBar().showMessage(m, 5000))
+        self.queue_tab.toast.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.task_tab.enqueued.connect(lambda _j: self._switch_tab(1, click=True))
 
         # ── живые данные ──

@@ -108,13 +108,15 @@ class TaskTab(QWidget):
     enqueued = Signal(dict)
     toast = Signal(str)
 
-    def __init__(self, api: Api, gpu: bool = True) -> None:
+    def __init__(self, api: Api, gpu: bool = True, cfg=None) -> None:
         super().__init__()
         self.api = api
         self.gpu = gpu
+        self.cfg = cfg
         self.dub_rows: list[DubRow] = []
         self.setAcceptDrops(True)
         self._build()
+        self._load_cfg()
 
     # ── каркас ──
 
@@ -275,6 +277,9 @@ class TaskTab(QWidget):
 
         # нижний ряд: название + кнопка
         bottom = QHBoxLayout()
+        self.c_autostart = QCheckBox(tr("q.autostart"))
+        self.c_autostart.setChecked(True)
+        bottom.addWidget(self.c_autostart)
         bottom.addStretch(1)
         self.l_label = QLabel(tr("task.label"))
         self.l_label.setObjectName("muted")
@@ -288,6 +293,39 @@ class TaskTab(QWidget):
         bottom.addWidget(self.b_go)
         root.addLayout(bottom)
         root.addStretch(1)
+
+    # ── сохранение настроек между запусками ──
+
+    def _load_cfg(self) -> None:
+        c = self.cfg
+        if c is None:
+            return
+        def b(key, default):
+            v = c.value(key, default)
+            return v if isinstance(v, bool) else str(v).lower() in ("true", "1")
+        self.out_edit.setText(str(c.value("task/out_dir", "")))
+        self.tmp_edit.setText(str(c.value("task/cache_dir", "")))
+        self.c_fill.setChecked(b("task/fill_silence", True))
+        self.c_tmp.setChecked(b("task/keep_tmp", False))
+        self.c_autostart.setChecked(b("task/autostart", True))
+        if self.gpu and b("task/muq", False):
+            self.r_muq.setChecked(True)
+        try:
+            self.s_drift.setValue(float(c.value("task/drift", 1.25)))
+        except (TypeError, ValueError):
+            pass
+
+    def _save_cfg(self) -> None:
+        c = self.cfg
+        if c is None:
+            return
+        c.setValue("task/out_dir", self.out_edit.text().strip())
+        c.setValue("task/cache_dir", self.tmp_edit.text().strip())
+        c.setValue("task/fill_silence", self.c_fill.isChecked())
+        c.setValue("task/keep_tmp", self.c_tmp.isChecked())
+        c.setValue("task/autostart", self.c_autostart.isChecked())
+        c.setValue("task/muq", self.r_muq.isChecked())
+        c.setValue("task/drift", self.s_drift.value())
 
     # ── референс ──
 
@@ -397,6 +435,7 @@ class TaskTab(QWidget):
             "audio_band": not self.r_muq.isChecked(),
             "audio_muq": self.r_muq.isChecked(),
             "drift_speed_pct": self.s_drift.value(),
+            "autostart": self.c_autostart.isChecked(),
             "keep_tmp": self.c_tmp.isChecked(),
             "cache_dir": self.tmp_edit.text().strip() or None if self.c_tmp.isChecked() else None,
         }
@@ -405,6 +444,7 @@ class TaskTab(QWidget):
 
     def _on_enqueued(self, job: dict) -> None:
         self.b_go.setEnabled(True)
+        self._save_cfg()
         self.toast.emit(tr("task.added"))
         self.enqueued.emit(job)
         # форма НЕ очищается целиком: типовой сценарий — следующая серия тем же составом;
@@ -436,6 +476,7 @@ class TaskTab(QWidget):
         self.l_drift.setText(tr("set.drift"))
         self.l_drift_u.setText(tr("set.drift_unit"))
         self.c_tmp.setText(tr("set.keep_tmp"))
+        self.c_autostart.setText(tr("q.autostart"))
         self.l_label.setText(tr("task.label"))
         self.b_go.setText(tr("task.enqueue"))
         if self.ref_combo.count():

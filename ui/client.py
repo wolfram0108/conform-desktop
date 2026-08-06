@@ -57,6 +57,15 @@ class Api:
     def set_limit(self, limit: int) -> dict:
         return self._json("PUT", "/conform/settings", {"limit": limit})
 
+    def start(self, jid: str) -> dict:
+        return self._json("POST", f"/conform/jobs/{jid}/start")
+
+    def pause(self, jid: str) -> dict:
+        return self._json("POST", f"/conform/jobs/{jid}/pause")
+
+    def clear_done(self) -> dict:
+        return self._json("POST", "/conform/clear_done")
+
     def clear(self) -> dict:
         return self._json("POST", "/conform/clear")
 
