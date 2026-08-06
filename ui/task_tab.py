@@ -293,8 +293,8 @@ class TaskTab(QWidget):
 
         # нижний ряд: название + кнопка
         bottom = QHBoxLayout()
-        self.c_autostart = QCheckBox(tr("q.autostart"))
-        self.c_autostart.setChecked(True)
+        self.c_autostart = QCheckBox(tr("q.autostart"))   # по умолчанию ВЫКЛ: задача ждёт ▶
+        self.c_autostart.setChecked(False)
         bottom.addWidget(self.c_autostart)
         bottom.addStretch(1)
         self.l_label = QLabel(tr("task.label"))
@@ -323,7 +323,7 @@ class TaskTab(QWidget):
         self.tmp_edit.setText(str(c.value("task/cache_dir", "")))
         self.c_fill.setChecked(b("task/fill_silence", True))
         self.c_tmp.setChecked(b("task/keep_tmp", False))
-        self.c_autostart.setChecked(b("task/autostart", True))
+        self.c_autostart.setChecked(b("task/autostart", False))
         if self.gpu and b("task/muq", False):
             self.r_muq.setChecked(True)
         try:
@@ -461,7 +461,7 @@ class TaskTab(QWidget):
     def _on_enqueued(self, job: dict) -> None:
         self.b_go.setEnabled(True)
         self._save_cfg()
-        self.toast.emit(tr("task.added"))
+        self.toast.emit(tr("task.added_run") if self.c_autostart.isChecked() else tr("task.added"))
         self.enqueued.emit(job)
         # форма НЕ очищается целиком: типовой сценарий — следующая серия тем же составом;
         # чистим только озвучки
