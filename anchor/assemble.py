@@ -6,6 +6,8 @@
 Порт-этап 1: тракт по файлам (как в стенде). `write_output=False` пропускает запись
 большого 44.1к аудиофайла (только метрики/остаток) — для быстрой регрессии без I/O на NAS."""
 import os, json, subprocess, wave, time, numpy as np, torch
+
+from track_muxer.conform import procreg
 from .params import T as _DEFT, FRAME, make_T
 from .audioio import load_window
 from .maps import multispec
@@ -40,13 +42,13 @@ def apply_warp(dub_ch, sr, seglines, n_out, freezes=()):
 
 # ---------- утилиты ----------
 def _dur(p):
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(p)],
+    r = procreg.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(p)],
                        stdout=subprocess.PIPE)
     return float(json.loads(r.stdout)["format"]["duration"])
 
 def _load_stereo(path, sr):
     cmd = ["ffmpeg", "-v", "error", "-i", str(path), "-map", "0:a:0", "-ar", str(sr), "-f", "f32le", "-"]
-    a = np.frombuffer(subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout, np.float32)
+    a = np.frombuffer(procreg.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout, np.float32)
     ch = 2 if a.size % 2 == 0 else 1; return a.reshape(-1, ch)
 
 def _wwrite(path, x, sr):

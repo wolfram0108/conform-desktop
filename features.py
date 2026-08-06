@@ -28,7 +28,7 @@ _RBLOCK = 1024
 
 
 def probe_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-show_entries", "format=duration",
          "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -61,7 +61,7 @@ def probe_video_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
     fps=кадры/длительность врёт (Призрак-2: format 1748с против видео 1511с → fps 25.9 вместо
     29.97 → растяжка выхода и развал аудио-доводки). Приоритет: длительность видеопотока →
     его тег DURATION → format.duration (фолбэк)."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=duration", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -72,7 +72,7 @@ def probe_video_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
             return v
     except ValueError:
         pass
-    r = subprocess.run(                                   # тег DURATION видеопотока ('00:25:11.41' — надёжен в mkv)
+    r = procreg.run(                                   # тег DURATION видеопотока ('00:25:11.41' — надёжен в mkv)
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream_tags=DURATION", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -89,7 +89,7 @@ def probe_audio_channels(video: Path, ffprobe: str = FFPROBE,
     наследовать 2.0/5.1/7.1 на выход. -> (channels, channel_layout|None). При любой
     неудаче — безопасный fallback (2, None).
     csv-строка вида '6,5.1(side)' / '2,stereo' / '2,' (пустая раскладка → None)."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", f"a:{int(atrack)}",
          "-show_entries", "stream=channels,channel_layout", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -109,7 +109,7 @@ def probe_audio_tracks(video: Path, ffprobe: str = FFPROBE) -> list[dict]:
     дорожки озвучек, требование 10 CHARTER standalone). Каждая запись:
     {index (0-based среди аудио), codec, channels, layout, lang, title, default}.
     Ошибка/нет аудио → []."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "a",
          "-show_entries",
          "stream=codec_name,channels,channel_layout:stream_disposition=default"
@@ -139,7 +139,7 @@ def probe_audio_tracks(video: Path, ffprobe: str = FFPROBE) -> list[dict]:
 
 def probe_resolution(video: Path, ffprobe: str = FFPROBE) -> int:
     """Высота кадра ПЕРВОГО видеопотока — для выбора бэкенда декода (CPU/GPU). Ошибка → 0 (→ CPU)."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=height", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -164,7 +164,7 @@ def _parse_fps(s: str | None) -> float | None:
 
 def probe_fps(video: Path, ffprobe: str = FFPROBE) -> float | None:
     """fps видеопотока (r_frame_rate, напр. '24000/1001') — для ОЦЕНКИ числа кадров в прогрессе."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -186,7 +186,7 @@ def probe_frame_count_hints(video: Path, ffprobe: str = FFPROBE) -> tuple[int | 
     Отчёт: doc/reports/conform_input_robustness/."""
     # JSON, не csv: ffprobe выводит поля во ВНУТРЕННЕМ порядке, а не в порядке запроса
     # (проверено: `stream=nb_frames,avg_frame_rate` → csv «avg,nb»), позиционный разбор хрупок.
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=nb_frames,avg_frame_rate", "-of", "json", str(video)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -209,7 +209,7 @@ def probe_packet_count(video: Path, ffprobe: str = FFPROBE) -> int | None:
     Единственный источник, не врущий на VFR (там и `nb_frames` отсутствует, и `avg_frame_rate`
     номинален). Цена замерена: 0.04с на клип 180с, 0.68с на MP4 182МБ, 4.3с на MKV 1.5ГБ —
     против 40-60с самого декода SRM, т.е. ≤10% накладных, и только когда `nb_frames` нет."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets",
          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -227,7 +227,7 @@ def probe_has_video(video: Path, ffprobe: str = FFPROBE) -> bool:
     ⚠ Обложка (attached_pic у mp3/flac) — формально видеопоток, но НЕ видео: исключаем по
     disposition. Ошибка пробы → True (консервативно: пусть падает видео-путь с понятной
     ошибкой, а не молча уходит в аудио-режим)."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v",
          "-show_entries", "stream=codec_type:stream_disposition=attached_pic",
          "-of", "json", str(video)],
@@ -248,7 +248,7 @@ def probe_frame_pts(video: Path, ffprobe: str = FFPROBE) -> np.ndarray | None:
     в порядке показа. Замер (VFR-клип стенда): sorted(packet pts_time) == frame pts_time
     БИТ-В-БИТ (0.000 мс расхождения) при цене 0.05с против 2.80с покадрового прохода с декодом;
     на реальном MKV 700МБ — 1.2с. Любой N/A / мусор / пусто → None (осторожный отказ)."""
-    r = subprocess.run(
+    r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True, encoding="utf-8", errors="replace",

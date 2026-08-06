@@ -16,6 +16,7 @@ import threading
 from contextlib import contextmanager
 
 from track_muxer.conform.config import CUDA_MAX, FFMPEG, HYBRID_MIN_GPU_H
+from track_muxer.conform import procreg
 
 _lock = threading.Lock()
 _cuda_active = 0
@@ -38,7 +39,7 @@ def cuda_available(ffmpeg: str = FFMPEG) -> bool:
             if not torch.cuda.is_available():          # нет реального GPU-устройства → CPU-декод
                 _cuda_ok = False
                 return _cuda_ok
-            out = subprocess.run([ffmpeg, "-hide_banner", "-hwaccels"],
+            out = procreg.run([ffmpeg, "-hide_banner", "-hwaccels"],
                                  capture_output=True, text=True, timeout=15).stdout
             _cuda_ok = "cuda" in out.split()
         except Exception:  # noqa: BLE001 — нет ffmpeg/torch/таймаут → CPU-only

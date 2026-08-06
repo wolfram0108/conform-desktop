@@ -87,7 +87,7 @@ def available() -> bool:
 
 
 def probe_fps(video: Path) -> float:
-    out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+    out = procreg.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
                           "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0",
                           str(video)], capture_output=True, text=True).stdout.strip()
     a, b = out.split("/") if "/" in out else (out, "1")
@@ -95,7 +95,7 @@ def probe_fps(video: Path) -> float:
 
 
 def probe_wh(video: Path) -> tuple[int, int]:
-    out = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+    out = procreg.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
                           "-show_entries", "stream=width,height", "-of", "csv=p=0",
                           str(video)], capture_output=True, text=True).stdout.strip()
     w, h = out.split(",")[:2]
@@ -109,7 +109,7 @@ def crop_detect(video: Path, *, thr: int = 20, samples=(120, 300, 500, 700, 900)
     W, H = probe_wh(video)
     mrow = np.zeros(H, np.float32); mcol = np.zeros(W, np.float32); got = 0
     for t in samples:
-        out = subprocess.run([FFMPEG, "-ss", f"{t}", "-i", str(video), "-frames:v", "1",
+        out = procreg.run([FFMPEG, "-ss", f"{t}", "-i", str(video), "-frames:v", "1",
                               "-vf", "format=gray", "-f", "rawvideo", "-", "-loglevel", "error"],
                              capture_output=True).stdout
         if len(out) < W * H:
@@ -247,7 +247,7 @@ def _decode_frame(video: Path, t: float, crop: str):
     W, H = map(int, crop.split(":")[:2])
     tw = max(2, round(W / H * FRAME_H)); tw -= tw % 2
     coarse = max(0, int(t - 4))
-    out = subprocess.run([FFMPEG, "-ss", f"{coarse}", "-copyts", "-i", str(video),
+    out = procreg.run([FFMPEG, "-ss", f"{coarse}", "-copyts", "-i", str(video),
                           "-vf", f"crop={crop},select=gte(t\\,{t}),scale={tw}:{FRAME_H},format=gray",
                           "-frames:v", "1", "-f", "rawvideo", "-", "-loglevel", "error"],
                          capture_output=True).stdout
