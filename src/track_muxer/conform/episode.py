@@ -48,7 +48,7 @@ def conform_episode(
     """Выровнять все озвучки серии на таймлайн ref_video. Возвращает EpisodeResult.
 
     pair_opts → conform_pair/conform_features (fps_dub, free_start, recover_edges,
-    fill_silence, audio_band, audio_muq, apply_cuts, drift_speed_pct, audio_fix).
+    fill_silence, audio_band, audio_muq, apply_cuts, drift_speed_pct).
     on_pair(PairResult) — после КАЖДОЙ озвучки (живой прогресс в очереди).
 
     Многодорожечность (этап 5.1 standalone, 2026-08-06): дорожка ≠ 0 у озвучки → выход

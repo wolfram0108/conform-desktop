@@ -38,7 +38,10 @@ class ConformEnqueueBody(BaseModel):
     audio_muq: bool = False            # anchor-пайплайн, карта MuQ (GPU, опц. transformers)
     apply_cuts: bool = True            # band/muq: применять резкую правку резов (иначе только дрейф ≤2%)
     drift_speed_pct: float = 1.25      # band/muq: потолок скорости изменения сдвига кривой дрейфа, %/с
-    audio_fix: bool = False
+    ref_atrack: int = 0                # ⭐ 5.1: аудиодорожка РЕФА (звуковой эталон band/заливки)
+    dub_atracks: list[int] | None = None   # ⭐ 5.1: дорожка КАЖДОЙ озвучки (параллельно dubs;
+                                       # None → все 0). «Виртуальный дубль» = тот же файл
+                                       # (хоть сам реф) с другой дорожкой.
 
 
 class ConformSettingsBody(BaseModel):
@@ -58,6 +61,8 @@ def make_conform_router(cq: ConformQueue) -> APIRouter:
             raise HTTPException(400, f"нет озвучек: {', '.join(missing)}")
         if not body.dubs:
             raise HTTPException(400, "пустой список озвучек")
+        if body.dub_atracks is not None and len(body.dub_atracks) != len(body.dubs):
+            raise HTTPException(400, f"dub_atracks ({len(body.dub_atracks)}) не параллелен dubs ({len(body.dubs)})")
         label = body.label or ref.parent.name
         out_dir = body.out_dir or str(cq.output_dir / "_conform_out" / label)
         spec = {
@@ -69,9 +74,17 @@ def make_conform_router(cq: ConformQueue) -> APIRouter:
             "audio_band": body.audio_band, "audio_muq": body.audio_muq,
             "apply_cuts": body.apply_cuts,
             "drift_speed_pct": body.drift_speed_pct,
-            "audio_fix": body.audio_fix,
+            "ref_atrack": body.ref_atrack, "dub_atracks": body.dub_atracks,
         }
         return cq.enqueue(spec)
+
+    @r.get("/atracks")
+    def atracks(path: str = Query(..., description="файл: список аудиодорожек для выбора в UI")) -> list[dict]:
+        p = Path(path)
+        if not p.exists():
+            raise HTTPException(400, f"нет файла: {path}")
+        from track_muxer.conform.features import probe_audio_tracks
+        return probe_audio_tracks(p)
 
     @r.get("/device")
     def device() -> dict:
