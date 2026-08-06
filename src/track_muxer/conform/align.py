@@ -26,6 +26,7 @@ from scipy.signal import butter, medfilt, resample_poly, sosfiltfilt
 
 from track_muxer.conform import cache as cache_mod
 from track_muxer.conform.config import FFMPEG, FFPROBE
+from track_muxer.conform import procreg
 from track_muxer.conform.decode_backend import decode_backend
 from track_muxer.conform.interp_backend import warp_interp        # GPU/CPU варп аудио (ресэмпл на сетку рефа)
 from track_muxer.conform.features import (
@@ -141,12 +142,12 @@ def _decode_audio(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 
     dur = (probe_duration(video, FFPROBE) or 0.0) if progress is not None else 0.0
     cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack),
            "-progress", "pipe:2", "-nostats", "pipe:1"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    proc = procreg.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     th = threading.Thread(target=_pump_progress,
                           args=(proc.stderr, dur, progress, progress_meta, label), daemon=True)
     th.start()
     buf = proc.stdout.read()
-    proc.wait(); th.join(timeout=2)
+    proc.wait(); procreg.done(proc); th.join(timeout=2)
     if proc.returncode not in (0, None):
         raise subprocess.CalledProcessError(proc.returncode, cmd)
     a = np.frombuffer(buf, np.int16)
@@ -176,9 +177,9 @@ def _decode_audio_mmap(video: Path, ffmpeg: str, audio_fix: bool, *, channels: i
     dur = (probe_duration(video, FFPROBE) or 0.0) if progress is not None else 0.0
     cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack),
            "-progress", "pipe:1", "-nostats", str(raw)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    proc = procreg.popen(cmd, stdout=subprocess.PIPE, text=True)
     _pump_progress(proc.stdout, dur, progress, progress_meta, label)   # дренит stdout до конца
-    proc.wait()
+    proc.wait(); procreg.done(proc)
     if proc.returncode not in (0, None):
         raise subprocess.CalledProcessError(proc.returncode, cmd)
     a = np.memmap(raw, dtype=np.int16, mode="r")
@@ -200,7 +201,7 @@ def _write_audio_streamed(path: Path, out, ffmpeg: str, *, layout: str | None = 
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
            "-f", "s16le", "-ar", str(SR), "-ac", str(ch), *lay, "-i", "pipe:0",
            "-c:a", "flac", "-compression_level", "8", str(path)]
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    proc = procreg.popen(cmd, stdin=subprocess.PIPE)
     n = len(out)
     BLK = 1 << 20
     try:
@@ -210,7 +211,7 @@ def _write_audio_streamed(path: Path, out, ffmpeg: str, *, layout: str | None = 
                 on_prog(min(1.0, (s + BLK) / max(1, n)))
     finally:
         proc.stdin.close()
-    rc = proc.wait()
+    rc = proc.wait(); procreg.done(proc)
     if rc != 0:
         raise subprocess.CalledProcessError(rc, cmd)
 

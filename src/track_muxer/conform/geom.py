@@ -31,6 +31,7 @@ import numpy as np
 from scipy.signal import fftconvolve
 
 from track_muxer.conform.config import FFMPEG, FFPROBE
+from track_muxer.conform import procreg
 
 try:
     import cv2
@@ -135,7 +136,7 @@ def _decode_sig(video: Path, crop: str):
            "-vf", f"crop={crop},scale={DESC_W}:{DESC_H},format=rgb24", "-vsync", "0",
            "-f", "rawvideo", "-"]
     fb = DESC_W * DESC_H * 3
-    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=fb * 1024)
+    p = procreg.popen(cmd, stdout=subprocess.PIPE, bufsize=fb * 1024)
     rows: list[np.ndarray] = []
     prevY = None; buf = b""
     while True:
@@ -157,7 +158,8 @@ def _decode_sig(video: Path, crop: str):
             prevY = Y[j]
         rows.append(np.concatenate([zones, pcts, nov[:, None]], axis=1))
     p.stdout.close()
-    if p.wait() not in (0, None):   # обрыв декода слепков — не молчать (класс dr-stone ep09)
+    rc_geom = p.wait(); procreg.done(p)
+    if rc_geom not in (0, None):   # обрыв декода слепков — не молчать (класс dr-stone ep09)
         raise RuntimeError(f"geom: декод слепков упал (ffmpeg rc={p.returncode}): {Path(video).name}")
     sig = np.concatenate(rows) if rows else np.zeros((0, NZONES * 3 + 4), np.float32)
     return sig, probe_fps(video)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import itertools
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -19,10 +20,12 @@ from pathlib import Path
 from loguru import logger
 from pydantic import BaseModel, Field
 
+from track_muxer.conform import procreg
 from track_muxer.conform.episode import conform_episode
 from track_muxer.conform.models import PairResult
 
 QUEUED = "queued"
+PAUSED = "paused"                # ждёт РУЧНОГО пуска (кнопка ▶ у строки очереди)
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
@@ -113,6 +116,7 @@ class ConformJob(BaseModel):
     drift_speed_pct: float = 1.25      # band/muq: потолок скорости изменения сдвига кривой дрейфа, %/с
     ref_atrack: int = 0                # ⭐ 5.1: аудиодорожка РЕФА (звуковой эталон band/заливки)
     dub_atracks: list[int] | None = None   # ⭐ 5.1: дорожка каждой озвучки (параллельно dubs; None → все 0)
+    autostart: bool = True             # False → задача встаёт в PAUSED и ждёт ручного пуска
     # состояние
     status: str = QUEUED
     progress: float = 0.0          # 0..1 общий
@@ -127,6 +131,58 @@ class ConformJob(BaseModel):
     elapsed_s: float = 0.0
     created_at: str = Field(default_factory=_now)
     updated_at: str = Field(default_factory=_now)
+
+
+def _is_inside(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _dir_size(p: Path) -> int:
+    try:
+        return sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
+    except OSError:
+        return 0
+
+
+def _purge_tmp(job: ConformJob) -> int:
+    """Удалить временные файлы завершённой задачи. Возврат: освобождено байт.
+
+    Что удаляем: кеш серии (CK1/CK2/CK3-чекпоинты, гигабайты) и наши каталоги
+    `_tmp` рядом с исходниками (memmap-раскладки декода). Что НЕ трогаем НИКОГДА:
+    выходной каталог задачи с аудиофайлами и `_plots` — прямое требование
+    пользователя. При отмене штатная чистка `conform_episode` не отрабатывает
+    (серия прервана) — этот проход её и заменяет.
+    """
+    out = Path(job.out_dir)
+    targets: list[Path] = []
+    if job.cache_dir:
+        targets.append(Path(job.cache_dir))
+    targets.append(Path(job.ref).parent / "_conform_cache")     # дефолтная раскладка серии
+    for src in [job.ref, *job.dubs]:
+        targets.append(Path(src).parent / "_tmp")
+
+    freed = 0
+    seen: set[str] = set()
+    for t in targets:
+        key = str(t.resolve()) if t.exists() else str(t)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not t.is_dir():
+            continue
+        if _is_inside(out, t) or t.resolve() == out.resolve():   # защита результатов
+            logger.warning("conform purge: пропуск {} — внутри выходного каталога", t)
+            continue
+        size = _dir_size(t)
+        shutil.rmtree(t, ignore_errors=True)
+        if t.exists():
+            logger.warning("conform purge: каталог не удалён полностью: {}", t)
+        freed += size - _dir_size(t)
+    return freed
 
 
 def _suspect(r: PairResult) -> bool:
@@ -149,6 +205,7 @@ class ConformQueue:
         self._lock = threading.RLock()
         self._items: dict[str, ConformJob] = {}
         self._stops: dict[str, threading.Event] = {}
+        self._groups: dict[str, procreg.ProcGroup] = {}   # живые подпроцессы задач (надёжная отмена)
         self._limit = limit
         self._active = 0
         self._counter = itertools.count(1)
@@ -161,6 +218,8 @@ class ConformQueue:
             n = next(self._counter)
             job = ConformJob(id=f"cf{n:05d}", seq=n, **spec)
             job.dub_total = len(job.dubs)
+            if not job.autostart:
+                job.status = PAUSED
             self._items[job.id] = job
             self._stops[job.id] = threading.Event()
             self._persist_locked()
@@ -177,6 +236,10 @@ class ConformQueue:
             return j.model_copy(deep=True) if j else None
 
     def cancel(self, jid: str) -> bool:
+        """Отмена задачи. Для RUNNING — НАДЁЖНАЯ: помимо стоп-флага (проверяется между
+        этапами) немедленно убивает дерево живых подпроцессов задачи, иначе длинный
+        ffmpeg-декод доработал бы до конца. Для терминальной — удаление записи."""
+        group = None
         with self._lock:
             j = self._items.get(jid)
             if j is None:
@@ -184,13 +247,56 @@ class ConformQueue:
             if j.status in _TERMINAL:
                 self._items.pop(jid, None)
                 self._stops.pop(jid, None)
+                self._groups.pop(jid, None)
             else:
                 ev = self._stops.get(jid)
                 if ev is not None:
                     ev.set()
+                group = self._groups.get(jid)
                 self._set(j, CANCELLED)
             self._persist_locked()
+        if group is not None:                     # kill вне блокировки (ждёт смерти процессов)
+            n = group.kill_all()
+            if n:
+                logger.info("conform {}: отмена — убито процессов: {}", jid, n)
         return True
+
+    def pause(self, jid: str) -> bool:
+        """QUEUED → PAUSED (задача ждёт ручного пуска). Running не трогаем — для него отмена."""
+        with self._lock:
+            j = self._items.get(jid)
+            if j is None or j.status != QUEUED:
+                return False
+            self._set(j, PAUSED)
+            self._persist_locked()
+        return True
+
+    def start(self, jid: str) -> bool:
+        """PAUSED → QUEUED + попытка немедленного запуска (кнопка ▶ у строки)."""
+        with self._lock:
+            j = self._items.get(jid)
+            if j is None or j.status != PAUSED:
+                return False
+            self._set(j, QUEUED)
+            self._persist_locked()
+            self._pump_locked()
+        return True
+
+    def clear_done(self) -> dict:
+        """Убрать ЗАВЕРШЁННЫЕ задачи из очереди И удалить их временные файлы.
+        Выходные аудиофайлы и графики (_plots) НЕ трогаются — решение пользователя
+        2026-08-06. Активные задачи не задеваются."""
+        with self._lock:
+            gone = [j.model_copy(deep=True) for j in self._items.values() if j.status in _TERMINAL]
+            for j in gone:
+                self._items.pop(j.id, None)
+                self._stops.pop(j.id, None)
+                self._groups.pop(j.id, None)
+            self._persist_locked()
+        freed = 0
+        for j in gone:
+            freed += _purge_tmp(j)
+        return {"cleared": len(gone), "freed_mb": round(freed / (1 << 20), 1)}
 
     def retry(self, jid: str) -> bool:
         with self._lock:
@@ -268,6 +374,9 @@ class ConformQueue:
                 return
             spec = j.model_copy(deep=True)
             stop = self._stops.get(jid)
+            group = procreg.ProcGroup()          # реестр подпроцессов ЭТОЙ задачи
+            self._groups[jid] = group
+        procreg.bind(group)                      # потоко-локально: чужие задачи не задеты
 
         def progress(p) -> None:
             with self._lock:
@@ -349,7 +458,9 @@ class ConformQueue:
             status, err = FAILED, str(e)
             logger.exception("conform job {} упал", jid)
 
+        procreg.bind(None)
         with self._lock:
+            self._groups.pop(jid, None)
             jj = self._items.get(jid)
             if jj is not None and jj.status == RUNNING:   # не перетирать CANCELLED
                 jj.error = err
