@@ -5,7 +5,9 @@ __pycache__/
 *.pyc
 
 # сборка
-build/work/
+_work/
+dist/
+build/build/
 build/dist/
 *.spec.bak
 dist/

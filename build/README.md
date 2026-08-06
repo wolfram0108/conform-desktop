@@ -4,10 +4,17 @@
 # из корня conform-desktop, окружением по requirements.txt:
 cd build
 set FFMPEG_DIR=D:\путь\где\лежат\ffmpeg.exe\и\ffprobe.exe
-python -m PyInstaller conform-desktop.spec --noconfirm
+python -m PyInstaller conform-desktop.spec --noconfirm ^
+    --workpath ..\_work --distpath ..\dist
 ```
 
-Результат — `build/dist/conform-desktop/` (~5.5 ГБ), запуск `conform-desktop.exe`.
+⚠ **`--workpath` и `--distpath` — обязательны.** Без них PyInstaller кладёт рядом
+ДВА одноимённых `conform-desktop.exe`: рабочий в `dist/` и промежуточный в
+`build/` (workpath). Промежуточный НЕ запускается — «Failed to load Python DLL
+python312.dll», и отличить их по имени невозможно. С этими флагами рабочий
+дистрибутив один и лежит в `dist/`, мусор сборки — в `_work/` (обе папки в .gitignore).
+
+**Готовый продукт: `dist/conform-desktop/conform-desktop.exe`** (~5.5 ГБ).
 Архив доставки: `7z a -t7z -mx=5 conform-desktop.7z dist/conform-desktop` (~1.7 ГБ).
 
 ## Устройство сборки
@@ -23,6 +30,9 @@ python -m PyInstaller conform-desktop.spec --noconfirm
 
 ## Грабли, на которые уже наступали (не повторять)
 
+0. **Два одноимённых exe.** См. предупреждение о `--workpath`/`--distpath` выше:
+   промежуточный `build/build/conform-desktop/conform-desktop.exe` внешне не
+   отличим от рабочего, но падает с «Failed to load Python DLL python312.dll».
 1. **`ROOT` в spec.** `SPECPATH` = каталог `build/`, поэтому корень репозитория —
    `Path(SPECPATH).resolve().parent`. Ошибка на один уровень вверх → в сборку не
    попадают пакеты `ui`/`server` → `ModuleNotFoundError: No module named 'ui'`,
