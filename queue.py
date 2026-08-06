@@ -111,7 +111,8 @@ class ConformJob(BaseModel):
     audio_muq: bool = False            # anchor-пайплайн, карта MuQ (GPU, опц. transformers)
     apply_cuts: bool = True            # band/muq: применять резкую правку резов (иначе только дрейф ≤2%)
     drift_speed_pct: float = 1.25      # band/muq: потолок скорости изменения сдвига кривой дрейфа, %/с
-    audio_fix: bool = False
+    ref_atrack: int = 0                # ⭐ 5.1: аудиодорожка РЕФА (звуковой эталон band/заливки)
+    dub_atracks: list[int] | None = None   # ⭐ 5.1: дорожка каждой озвучки (параллельно dubs; None → все 0)
     # состояние
     status: str = QUEUED
     progress: float = 0.0          # 0..1 общий
@@ -342,7 +343,7 @@ class ConformQueue:
                 audio_band=spec.audio_band, audio_muq=spec.audio_muq,
                 apply_cuts=spec.apply_cuts,
                 drift_speed_pct=spec.drift_speed_pct,
-                audio_fix=spec.audio_fix,
+                ref_atrack=spec.ref_atrack, dub_atracks=spec.dub_atracks,
                 progress=progress, should_stop=should_stop, on_pair=on_pair)
         except Exception as e:  # noqa: BLE001
             status, err = FAILED, str(e)

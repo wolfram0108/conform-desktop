@@ -103,6 +103,39 @@ def probe_audio_channels(video: Path, ffprobe: str = FFPROBE,
     return (max(1, ch), layout if layout and layout != "unknown" else None)
 
 
+def probe_audio_tracks(video: Path, ffprobe: str = FFPROBE) -> list[dict]:
+    """Список ВСЕХ аудиодорожек файла — для выбора дорожки в UI (реф-дорожка /
+    дорожки озвучек, требование 10 CHARTER standalone). Каждая запись:
+    {index (0-based среди аудио), codec, channels, layout, lang, title, default}.
+    Ошибка/нет аудио → []."""
+    r = subprocess.run(
+        [ffprobe, "-v", "error", "-select_streams", "a",
+         "-show_entries",
+         "stream=codec_name,channels,channel_layout:stream_disposition=default"
+         ":stream_tags=language,title",
+         "-of", "json", str(video)],
+        capture_output=True, text=True,
+    )
+    try:
+        streams = json.loads(r.stdout or "{}").get("streams") or []
+    except json.JSONDecodeError:
+        return []
+    out: list[dict] = []
+    for i, s in enumerate(streams):
+        tags = s.get("tags") or {}
+        layout = (s.get("channel_layout") or "").strip()
+        out.append({
+            "index": i,
+            "codec": s.get("codec_name") or "",
+            "channels": int(s.get("channels") or 0),
+            "layout": layout if layout and layout != "unknown" else None,
+            "lang": (tags.get("language") or "").strip() or None,
+            "title": (tags.get("title") or "").strip() or None,
+            "default": bool((s.get("disposition") or {}).get("default")),
+        })
+    return out
+
+
 def probe_resolution(video: Path, ffprobe: str = FFPROBE) -> int:
     """Высота кадра ПЕРВОГО видеопотока — для выбора бэкенда декода (CPU/GPU). Ошибка → 0 (→ CPU)."""
     r = subprocess.run(
