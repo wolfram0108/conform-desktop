@@ -20,6 +20,11 @@ import threading
 
 _local = threading.local()
 
+# Windows: не показывать консольное окно дочернего процесса. В windowed-EXE (Qt без
+# консоли) КАЖДЫЙ запуск ffmpeg/ffprobe иначе мигает чёрным окном — при десятках
+# probe-вызовов на задачу это «куча консолей» на экране.
+_CREATE_NO_WINDOW = 0x08000000
+
 
 class Cancelled(RuntimeError):
     """Запуск отклонён: группа уже убита (задача отменяется)."""
@@ -91,11 +96,13 @@ def current() -> ProcGroup | None:
 
 
 def popen(cmd, **kw) -> subprocess.Popen:
-    """subprocess.Popen + регистрация в группе текущего потока."""
+    """subprocess.Popen + регистрация в группе текущего потока + без консольного окна."""
     g = current()
     if g is not None and g.killed:
         raise Cancelled("задача отменена")
-    if os.name != "nt":
+    if os.name == "nt":
+        kw["creationflags"] = kw.get("creationflags", 0) | _CREATE_NO_WINDOW
+    else:
         kw.setdefault("start_new_session", True)   # своя process group → killpg
     p = subprocess.Popen(cmd, **kw)
     if g is not None:
@@ -111,10 +118,14 @@ def done(p: subprocess.Popen) -> None:
 
 
 def run(cmd, **kw) -> subprocess.CompletedProcess:
-    """Аналог subprocess.run для ДОЛГИХ вызовов (короткие ffprobe можно оставлять как есть)."""
+    """Замена subprocess.run для ВСЕХ вызовов ffmpeg/ffprobe в conform: без консольного
+    окна (windowed-EXE) и с учётом в группе задачи (надёжная отмена)."""
     inp = kw.pop("input", None)
     timeout = kw.pop("timeout", None)
     check = kw.pop("check", False)
+    if kw.pop("capture_output", False):            # совместимость с subprocess.run
+        kw.setdefault("stdout", subprocess.PIPE)
+        kw.setdefault("stderr", subprocess.PIPE)
     p = popen(cmd, **kw)
     try:
         out, err = p.communicate(inp, timeout=timeout)
