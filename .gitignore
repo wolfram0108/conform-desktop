@@ -1,0 +1,16 @@
+# окружения
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+
+# сборка
+build/work/
+build/dist/
+*.spec.bak
+dist/
+*.7z
+
+# локальный инструментарий (не артефакт проекта)
+CLAUDE.md
+.claude/

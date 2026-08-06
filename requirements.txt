@@ -1,0 +1,49 @@
+# Манифест зависимостей standalone-приложения conform (миссия conform-standalone-app, этап 7).
+# = requirements-windows.txt МИНУС всё, что нужно только демону track-muxer:
+#   - стек загрузки (playwright / curl_cffi / requests / httpx) — в EXE нет загрузчика;
+#   - CLI-UX (typer / rich / questionary) — у EXE интерфейс Qt, не терминальный;
+#   - pydantic-settings / pillow как прямые — conform их напрямую не импортирует
+#     (pillow всё равно приедет транзитивно с matplotlib/kornia).
+# Проверка полноты — ЧИСЛАМИ: чистый venv по этому файлу обязан прогнать реальную пару
+# conform end-to-end (см. отчёт этапа 7).
+#
+# Python 3.12. Установка:
+#   pip install -r requirements-standalone.txt
+# Пакет track_muxer НЕ ставится (в conform-desktop свой 3-строчный __init__ + subtree conform).
+# ffmpeg/ffprobe — бинарями рядом с exe, пути через env TM_FFMPEG / TM_FFPROBE (frozen-режим
+# НЕ полагается на автодетект parents[3] в conform/config.py — запрет CHARTER).
+
+--extra-index-url https://download.pytorch.org/whl/cu124
+
+# --- GPU-ядро (ОДИН универсальный дистрибутив torch-CUDA; на машине без NVIDIA тот же
+#     полный пайплайн исполняется на CPU — CPU-only варианта НЕ СУЩЕСТВУЕТ, запрет юзера) ---
+torch==2.6.0
+torchvision==0.21.0        # транзитивное требование transformers (muq-стек)
+torchaudio==2.6.0          # ресемпл anchor (conform/anchor/apply.py: torchaudio.functional)
+
+# --- MuQ: опциональный аудио-метод (CHARTER п.7, выключен по умолчанию) ---
+# Пакеты ОБЯЗАНЫ ехать в дистрибутиве: portable-пользователь не может доустановить pip'ом.
+# ВЕСА модели (OpenMuQ/MuQ-large-msd-iter, CC-BY-NC 4.0) НЕ бандлятся — автозагрузка
+# в HF-кэш при первом явном включении фичи (⛔ запрет CHARTER на бандл весов).
+# Хвост muq: librosa, nnAudio, einops, x_clip, soundfile — приедет транзитивно.
+transformers==5.12.0
+muq==0.1.0
+
+# --- числодробилка conform ---
+numpy==2.4.6
+scipy==1.17.1
+numba==0.65.1              # JIT DTW-ядер (тянет llvmlite)
+matplotlib==3.10.9         # PNG-график укладки (conform/anchor/plots.py)
+plotly==6.8.0              # интерактивный HTML-график (conform/anchor/plots_html.py)
+
+# --- геом-коррекция (conform/geom.py): кроп/зум/анаморф — зрение слепнет без неё ---
+opencv-python-headless==4.13.0.92
+kornia==0.8.3              # LoFTR; веса loftr_outdoor качаются в torch-hub-кэш (редкий фоллбэк)
+
+# --- локальный API-слой (этап 9: embedded FastAPI поверх conform/routes.py) ---
+fastapi==0.136.3
+uvicorn==0.48.0
+
+# --- база ---
+pydantic==2.13.4
+loguru==0.7.3

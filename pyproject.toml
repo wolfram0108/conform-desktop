@@ -1,0 +1,26 @@
+# conform-desktop — portable Windows-приложение выравнивания озвучек по видео.
+# Ядро (src/track_muxer/conform/) синхронизируется из канонического репозитория
+# git subtree pull --squash (см. docs/SYNC.md) — правки алгоритма ТОЛЬКО там,
+# здесь код ядра не редактируется.
+
+[project]
+name = "conform-desktop"
+version = "0.1.0"
+description = "Автоматическое выравнивание аудиодорожек (озвучек) по референс-видео / Automatic audio track conforming against a reference video"
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.12"
+readme = "README.md"
+
+# Версии зафиксированы = requirements.txt (единый источник — см. комментарии там).
+# Установка для разработки:  pip install -r requirements.txt
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/wolfram0108/conform-desktop"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
