@@ -14,3 +14,5 @@ dist/
 # локальный инструментарий (не артефакт проекта)
 CLAUDE.md
 .claude/
+run_ui.bat
+appdata/
