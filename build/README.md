@@ -6,6 +6,9 @@ cd build
 set FFMPEG_DIR=D:\путь\где\лежат\ffmpeg.exe\и\ffprobe.exe
 python -m PyInstaller conform-desktop.spec --noconfirm ^
     --workpath ..\_work --distpath ..\dist
+
+# ОБЯЗАТЕЛЬНЫЙ шаг: снять с дистрибутива то, что продукту не нужно (−1.4 ГБ)
+python prune_dist.py --dist ..\dist\conform-desktop --apply
 ```
 
 ⚠ **`--workpath` и `--distpath` — обязательны.** Без них PyInstaller кладёт рядом
@@ -14,8 +17,8 @@ python -m PyInstaller conform-desktop.spec --noconfirm ^
 python312.dll», и отличить их по имени невозможно. С этими флагами рабочий
 дистрибутив один и лежит в `dist/`, мусор сборки — в `_work/` (обе папки в .gitignore).
 
-**Готовый продукт: `dist/conform-desktop/conform-desktop.exe`** (~5.5 ГБ).
-Архив доставки: `7z a -t7z -mx=5 conform-desktop.7z dist/conform-desktop` (~1.7 ГБ).
+**Готовый продукт: `dist/conform-desktop/conform-desktop.exe`** (после прунинга ~4.6 ГБ).
+Архив доставки: `7z a -t7z -mx=5 conform-desktop.7z dist/conform-desktop`.
 
 ## Устройство сборки
 
@@ -23,6 +26,7 @@ python312.dll», и отличить их по имени невозможно. 
 |---|---|
 | `entry_desktop.py` | Точка входа frozen-exe (обёртка над `ui.__main__`) |
 | `conform-desktop.spec` | `--onedir`, **windowed** (`console=False`), UPX выключен; `collect_all` для torch/transformers/muq-хвоста/kornia/numba; ffmpeg+ffprobe из `FFMPEG_DIR` |
+| `prune_dist.py` | Пост-шаг: снимает с готового дистрибутива артефакты линковки, отладочные ресурсы движка страницы, чужие локали, неиспользуемые модули Qt и CUDA-библиотеки без импортёров |
 
 **Portable-контракт:** `ffmpeg.exe`/`ffprobe.exe` лежат в `_internal/` рядом с exe и
 подставляются в `TM_FFMPEG`/`TM_FFPROBE` **до** импорта ядра; данные приложения
@@ -46,6 +50,14 @@ python312.dll», и отличить их по имени невозможно. 
    после закрытия окна обычный возврат из `app.exec()` оставляет процесс висеть.
    Поэтому `os._exit(rc)`. ⚠ Осиротевшие ffmpeg-подпроцессы закроет «надёжная
    отмена» (этап 10а: kill дерева процессов задачи).
+
+5. **Список модулей Qt «на глаз» составлять нельзя.** Движок страницы построен на
+   Qt Quick: удаление `Qt6Quick`/`Qt6Qml` роняет `ImportError: DLL load failed while
+   importing QtWebEngineCore`, хотя интерфейс у нас на виджетах. Что можно снимать —
+   решает только карта загрузки живого прогона (стенд `baseline_dllmap.py`).
+6. **Карта загрузки слепа к `torch/lib`.** `torch/__init__.py` грузит оттуда ВСЁ по
+   маске, поэтому в карте числятся и заведомо ненужные библиотеки. Для этого каталога
+   судья — таблицы импорта PE и прогон после удаления, а не карта.
 
 ## Приёмка сборки (замеры 2026-08-06)
 
