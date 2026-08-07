@@ -88,6 +88,15 @@ QPushButton#primary {{
     background: {t['acc']}; color: {t['accink']}; border-color: {t['acc']}; font-weight: 600;
 }}
 QPushButton#ghost {{ border-style: dashed; color: {t['muted']}; }}
+QToolButton#picker {{
+    background: {t['ctl']}; border: 1px solid {t['bd']}; border-radius: 6px;
+    padding: 5px 22px 5px 10px; color: {t['ink']};
+}}
+QToolButton#picker:hover {{ border-color: {t['acc']}; }}
+QToolButton#picker::menu-indicator {{ subcontrol-position: right center; right: 6px; }}
+QMenu {{ background: {t['panel']}; border: 1px solid {t['bd']}; padding: 4px; }}
+QMenu::item {{ padding: 5px 26px 5px 24px; }}
+QMenu::item:selected {{ background: {t['acc']}; color: {t['accink']}; }}
 QPushButton#rowbtn {{ padding: 1px 7px; font-size: 9pt; color: {t['muted']}; }}
 QPushButton#link {{
     background: transparent; border: none; color: {t['acc']}; padding: 2px 4px; font-size: 9.5pt;

@@ -12,6 +12,13 @@ _STRINGS: dict[str, dict[str, str]] = {
     "ref": {"ru": "Референс:", "en": "Reference:"},
     "ref.track": {"ru": "реф-дорожка:", "en": "ref track:"},
     "tracks.n": {"ru": "дорожек: {n}", "en": "tracks: {n}"},
+    "tracks.chosen": {"ru": "дорожки", "en": "tracks"},
+    "tracks.none": {"ru": "не выбрано", "en": "none selected"},
+    "ref.rest_as_dubs": {"ru": "+ остальные дорожки в озвучки", "en": "+ other tracks as dubs"},
+    "ref.rest_tip": {"ru": "Добавить все дорожки этого файла, кроме эталонной, одной строкой — "
+                           "каждая станет отдельной озвучкой",
+                     "en": "Add every track of this file except the reference one as a single row — "
+                           "each becomes its own dub"},
     "dubs": {"ru": "Озвучки:", "en": "Dubs:"},
     "dubs.add": {"ru": "+ Добавить файлы", "en": "+ Add files"},
     "dubs.drop": {"ru": "или перетащите файлы в окно", "en": "or drop files onto the window"},
@@ -41,6 +48,7 @@ _STRINGS: dict[str, dict[str, str]] = {
     "task.added_run": {"ru": "Задача добавлена и запущена", "en": "Task added and started"},
     "task.need_ref": {"ru": "Укажите файл референса", "en": "Choose a reference file"},
     "task.need_dubs": {"ru": "Добавьте хотя бы одну озвучку", "en": "Add at least one dub"},
+    "task.n_dubs": {"ru": "озвучек в задаче: {n}", "en": "dubs in task: {n}"},
     "task.need_out": {"ru": "Укажите выходной каталог", "en": "Choose an output folder"},
     "q.parallel": {"ru": "параллельно:", "en": "parallel:"},
     "q.clear_done": {"ru": "Очистить готовые", "en": "Clear finished"},

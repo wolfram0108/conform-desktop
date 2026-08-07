@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 from ui.client import Api, call
 from ui.i18n import tr
-from ui.widgets import ElidedLabel, tame_combo
+from ui.widgets import ElidedLabel, MultiTrackPicker, tame_combo
 
 AUDIO_EXT = {".flac", ".mka", ".mp3", ".wav", ".aac", ".opus", ".ogg", ".m4a", ".ac3", ".dts"}
 
@@ -46,12 +46,13 @@ class DubRow(QFrame):
 
     removed = Signal(object)
 
-    def __init__(self, path: str, api: Api) -> None:
+    def __init__(self, path: str, api: Api, preselect: list[int] | None = None) -> None:
         super().__init__()
         self.setObjectName("dubrow")
         self.path = path
         self.is_audio = Path(path).suffix.lower() in AUDIO_EXT
         self._tracks: list[dict] = []
+        self._preselect = preselect
 
         lay = QHBoxLayout(self)
         lay.setContentsMargins(12, 6, 10, 6)
@@ -69,9 +70,9 @@ class DubRow(QFrame):
         self.ref_tag.hide()
         lay.addWidget(self.ref_tag)
 
-        self.combo = tame_combo(QComboBox())
-        self.combo.hide()
-        lay.addWidget(self.combo)
+        self.picker = MultiTrackPicker()          # НЕСКОЛЬКО дорожек одного файла
+        self.picker.hide()
+        lay.addWidget(self.picker)
 
         self.tag = QLabel(tr("dub.audio_only") if self.is_audio else "")
         self.tag.setObjectName("tag")
@@ -89,11 +90,17 @@ class DubRow(QFrame):
     def _on_tracks(self, tracks: list[dict]) -> None:
         self._tracks = tracks
         if len(tracks) > 1:
-            self.combo.addItems([_track_label(t) for t in tracks])
-            self.combo.show()
+            self.picker.set_texts(tr("tracks.chosen"), tr("tracks.none"))
+            sel = self._preselect if self._preselect is not None else [0]
+            self.picker.set_tracks([_track_label(t) for t in tracks],
+                                   [i for i in sel if i < len(tracks)])
+            self.picker.show()
 
-    def atrack(self) -> int:
-        return self.combo.currentIndex() if self.combo.isVisible() else 0
+    def atracks(self) -> list[int]:
+        """Выбранные дорожки файла: КАЖДАЯ станет отдельной озвучкой задачи."""
+        if not self.picker.isVisible():
+            return [0]
+        return self.picker.selected() or [0]
 
     def mark_virtual(self, is_ref_file: bool) -> None:
         """Пометить строку как виртуальный дубль (тот же файл, что референс)."""
@@ -104,6 +111,8 @@ class DubRow(QFrame):
 
     def retranslate(self) -> None:
         self.ref_tag.setText(tr("dub.same_as_ref"))
+        if self.picker.isVisible():
+            self.picker.set_texts(tr("tracks.chosen"), tr("tracks.none"))
         if self.is_audio:
             self.tag.setText(tr("dub.audio_only"))
         elif self.tag.isVisible():
@@ -169,12 +178,17 @@ class TaskTab(QWidget):
         self.l_rtrack, lay = frow("ref.track")
         self.ref_combo = tame_combo(QComboBox(), max_width=420, chars=10)
         lay.addWidget(self.ref_combo)
+        self.b_rest = QPushButton(tr("ref.rest_as_dubs"))
+        self.b_rest.setObjectName("ghost")
+        self.b_rest.setToolTip(tr("ref.rest_tip"))
+        self.b_rest.clicked.connect(self._add_rest_as_dubs)
+        lay.addWidget(self.b_rest)
         self.ref_hint = ElidedLabel("")
         self.ref_hint.setObjectName("hint")
         self.ref_hint.setMinimumWidth(0)
         lay.addWidget(self.ref_hint)
         lay.addStretch(1)
-        self._rtrack_row = (self.l_rtrack, self.ref_combo, self.ref_hint)
+        self._rtrack_row = (self.l_rtrack, self.ref_combo, self.b_rest, self.ref_hint)
         for w in self._rtrack_row:
             w.hide()
 
@@ -383,6 +397,19 @@ class TaskTab(QWidget):
             for w in self._rtrack_row:
                 w.show()
 
+    def _add_rest_as_dubs(self) -> None:
+        """Все дорожки файла-референса, КРОМЕ выбранной эталонной, — одной строкой озвучки.
+        Ровно сценарий «в файле 10 озвучек, выровнять 9 остальных по одной»."""
+        ref = self.ref_edit.text().strip()
+        n = self.ref_combo.count()
+        if not ref or n < 2:
+            return
+        rest = [i for i in range(n) if i != self.ref_combo.currentIndex()]
+        for r in list(self.dub_rows):                 # не плодить дубликаты того же файла
+            if r.path == ref:
+                self._remove_dub(r)
+        self._add_dub(ref, preselect=rest)
+
     # ── озвучки ──
 
     def _pick_dubs(self) -> None:
@@ -390,8 +417,8 @@ class TaskTab(QWidget):
         for p in paths:
             self._add_dub(p)
 
-    def _add_dub(self, path: str) -> None:
-        row = DubRow(path, self.api)
+    def _add_dub(self, path: str, preselect: list[int] | None = None) -> None:
+        row = DubRow(path, self.api, preselect=preselect)
         row.removed.connect(self._remove_dub)
         row.mark_virtual(path == self.ref_edit.text().strip())
         self.dub_rows.append(row)
@@ -451,10 +478,16 @@ class TaskTab(QWidget):
         if not out:
             self.toast.emit(tr("task.need_out"))
             return
+        dubs: list[str] = []
+        atracks: list[int] = []
+        for r in self.dub_rows:                       # строка с N дорожками → N озвучек
+            for a in r.atracks():
+                dubs.append(r.path)
+                atracks.append(a)
         body = {
             "ref": ref,
-            "dubs": [r.path for r in self.dub_rows],
-            "dub_atracks": [r.atrack() for r in self.dub_rows],
+            "dubs": dubs,
+            "dub_atracks": atracks,
             "ref_atrack": self.ref_combo.currentIndex() if self.ref_combo.count() else 0,
             "out_dir": out,
             "label": self.label_edit.text().strip() or None,
@@ -472,7 +505,9 @@ class TaskTab(QWidget):
     def _on_enqueued(self, job: dict) -> None:
         self.b_go.setEnabled(True)
         self._save_cfg()
-        self.toast.emit(tr("task.added_run") if self.c_autostart.isChecked() else tr("task.added"))
+        n = len(job.get("dubs") or [])
+        self.toast.emit((tr("task.added_run") if self.c_autostart.isChecked() else tr("task.added"))
+                        + " · " + tr("task.n_dubs", n=n))
         self.enqueued.emit(job)
         # форма НЕ очищается целиком: типовой сценарий — следующая серия тем же составом;
         # чистим только озвучки
@@ -493,6 +528,8 @@ class TaskTab(QWidget):
         self.l_out.setText(tr("out_dir"))
         for b in (self.b_ref, self.b_out, self.b_tmp):
             b.setText(tr("browse"))
+        self.b_rest.setText(tr("ref.rest_as_dubs"))
+        self.b_rest.setToolTip(tr("ref.rest_tip"))
         self.b_add.setText(tr("dubs.add"))
         self.l_drop.setText(tr("dubs.drop"))
         self.g_head.setText(("▾ " if self.g_body.isVisible() else "▸ ") + tr("settings"))
