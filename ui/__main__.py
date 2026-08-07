@@ -54,6 +54,7 @@ if os.name == "nt":
 
     _sp.Popen = _HiddenPopen
 
+from loguru import logger                                 # noqa: E402
 from PySide6.QtCore import QSettings                      # noqa: E402
 from PySide6.QtWidgets import QApplication                # noqa: E402
 
@@ -63,6 +64,30 @@ from ui.shell_api import create_bridge, make_shell_router  # noqa: E402
 from ui.window import MainWindow, enable_debug_port, web_dir  # noqa: E402
 
 PORT = int(os.environ.get("CONFORM_PORT", "8799"))
+
+
+def _setup_log() -> Path:
+    """Журнал работы рядом с приложением: `appdata/conform.log`.
+
+    Зачем отдельный файл, если есть `ui.log`. В `ui.log` попадает лишь то, что пишут
+    в стандартный вывод сторонние библиотеки; сообщения ядра туда не доходят, а в
+    windowed-сборке стандартного вывода вообще нет. Из-за этого разбор отказа
+    приходилось вести по обрывкам: прогон длиной в полтора часа заканчивался строкой
+    «Broken pipe» без единой записи о том, на чём он споткнулся.
+
+    Пишем всё, что идёт через журнал ядра: этапы задач, ошибки с трассой, вывод
+    упавших внешних процессов. Ротация — чтобы файл не рос бесконечно.
+    """
+    log_dir = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+               else Path(__file__).resolve().parent.parent) / "appdata"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "conform.log"
+    logger.add(str(path), rotation="10 MB", retention=5, encoding="utf-8",
+               enqueue=True,          # задачи идут в потоках — записи не должны рваться
+               backtrace=True, diagnose=False, level="INFO",
+               format="{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}")
+    logger.info("conform-desktop запущен (порт {}), журнал: {}", PORT, path)
+    return path
 
 
 def _health_ok(base: str) -> bool:
@@ -87,6 +112,7 @@ def main() -> int:
     # Рубеж №1 (страховка ОС): все потомки умрут вместе с процессом ЛЮБЫМ способом —
     # включая taskkill /F и падение, когда наш код выхода отработать не успевает.
     winjob.enable_kill_on_close()
+    _setup_log()                   # журнал — до всего остального, иначе ранние отказы немы
     enable_debug_port()            # порт отладки страницы — до создания QApplication
 
     app = QApplication(sys.argv)

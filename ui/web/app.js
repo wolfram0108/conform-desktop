@@ -243,8 +243,12 @@ function jobCard(j) {
     if (j.cur_dub) bits.push(baseName(j.cur_dub));
     meta.textContent = bits.join(" · ");
   } else if (j.status === "done") {
-    const ok = (j.results || []).filter(r => r.ok).length;
-    meta.textContent = `${t("q.done")} · ${Math.round(j.elapsed_s)} ${t("unit.s")} · ${ok}/${(j.results || []).length} ok`;
+    const res = j.results || [], ok = res.filter(r => r.ok).length;
+    // задача, где НИ ОДНА озвучка не удалась, не должна выглядеть выполненной:
+    // раньше она подписывалась «готово · 0/1 ok» и читалась как успех
+    const head = res.length && ok === 0 ? t("q.done_failed") : t("q.done");
+    meta.textContent = `${head} · ${Math.round(j.elapsed_s)} ${t("unit.s")} · ${ok}/${res.length} ok`;
+    if (res.length && ok === 0) meta.style.color = "var(--crit)";
   } else if (j.status === "failed") {
     meta.textContent = t("q.failed") + (j.error ? " · " + j.error.slice(0, 80) : "");
   } else {

@@ -43,6 +43,7 @@ const STRINGS = {
   "q.queued":        {ru:"в очереди", en:"queued"},
   "q.paused":        {ru:"на паузе", en:"paused"},
   "q.done":          {ru:"готово", en:"done"},
+  "q.done_failed":   {ru:"без результата", en:"no output"},
   "q.failed":        {ru:"ошибка", en:"failed"},
   "q.cancelled":     {ru:"отменено", en:"cancelled"},
   "q.dub_of":        {ru:"озвучка {i}/{n}", en:"dub {i}/{n}"},
