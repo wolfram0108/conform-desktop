@@ -35,9 +35,11 @@ def _kill_tree(p: subprocess.Popen) -> None:
         return
     try:
         if os.name == "nt":
-            # taskkill /T — вместе с потомками (ffmpeg может порождать свои)
+            # taskkill /T — вместе с потомками (ffmpeg может порождать свои);
+            # CREATE_NO_WINDOW обязателен: иначе САМ taskkill мигает консолью
             subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
-                           capture_output=True, check=False)
+                           capture_output=True, check=False,
+                           creationflags=_CREATE_NO_WINDOW)
         else:
             os.killpg(os.getpgid(p.pid), signal.SIGKILL)
     except Exception:  # noqa: BLE001 — процесс мог уже умереть
