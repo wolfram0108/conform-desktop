@@ -32,10 +32,33 @@ if getattr(sys, "frozen", False):
     if sys.stderr is None or not hasattr(sys.stderr, "write"):
         sys.stderr = _log
 
+# ── ГАРАНТИЯ: ни одного консольного окна из ЛЮБОГО кода процесса ──
+# Точечных флагов в ядре мало: окно может открыть сторонняя библиотека, служебный
+# taskkill или любой будущий вызов. Патчим subprocess на уровне процесса ДО импорта
+# ядра — каждый дочерний процесс стартует скрытым и без консоли, поэтому фокус
+# никогда не уходит из окна приложения.
+if os.name == "nt":
+    import subprocess as _sp
+
+    _CREATE_NO_WINDOW = 0x08000000
+    _orig_popen = _sp.Popen
+
+    class _HiddenPopen(_orig_popen):          # noqa: D101 — техническая обёртка
+        def __init__(self, *a, **kw):
+            kw["creationflags"] = kw.get("creationflags", 0) | _CREATE_NO_WINDOW
+            si = kw.get("startupinfo") or _sp.STARTUPINFO()
+            si.dwFlags |= _sp.STARTF_USESHOWWINDOW
+            si.wShowWindow = 0                # SW_HIDE
+            kw["startupinfo"] = si
+            super().__init__(*a, **kw)
+
+    _sp.Popen = _HiddenPopen
+
 from PySide6.QtCore import QSettings                      # noqa: E402
 from PySide6.QtWidgets import QApplication                # noqa: E402
 
 from server.app import create_app, data_dir, get_queue    # noqa: E402
+from ui import winjob                                     # noqa: E402
 from ui.client import Api                                 # noqa: E402
 from ui.main_window import MainWindow                     # noqa: E402
 
@@ -57,6 +80,10 @@ def _start_server() -> None:
 
 
 def main() -> int:
+    # Рубеж №1 (страховка ОС): все потомки умрут вместе с процессом ЛЮБЫМ способом —
+    # включая taskkill /F и падение, когда наш код выхода отработать не успевает.
+    winjob.enable_kill_on_close()
+
     base = f"http://127.0.0.1:{PORT}"
     if not _health_ok(base):
         threading.Thread(target=_start_server, daemon=True, name="api").start()
@@ -80,9 +107,9 @@ def main() -> int:
 def _shutdown() -> None:
     """Закрытие окна = конец работы: гасим задачи и НЕ оставляем ffmpeg-сирот.
 
-    Два рубежа: (1) очередь убивает подпроцессы своих задач штатно; (2) контрольный
-    kill всего дерева ЭТОГО процесса — на случай процессов, запущенных в обход реестра
-    (сторонний код), потому что os._exit детей не забирает.
+    Рубежи: (2) очередь убивает подпроцессы своих задач штатно; (3) контрольный kill
+    дерева ЭТОГО процесса — на случай процессов в обход реестра, потому что os._exit
+    детей не забирает. Рубеж (1) — job object ОС, включён в main().
     """
     try:
         q = get_queue()
