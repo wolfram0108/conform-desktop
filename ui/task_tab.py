@@ -11,7 +11,7 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
+    QAbstractSpinBox, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFrame, QHBoxLayout,
     QLabel, QLineEdit, QPushButton, QRadioButton, QScrollArea, QSizePolicy,
     QVBoxLayout, QWidget,
 )
@@ -274,11 +274,29 @@ class TaskTab(QWidget):
         self.l_drift = QLabel(tr("set.drift"))
         self.l_drift.setObjectName("muted")
         drow.addWidget(self.l_drift)
+        # Нативные стрелки QDoubleSpinBox мелкие и «слипшиеся» — попасть можно было
+        # только по одной. Заменяем на две явные кнопки с нормальной зоной клика.
         self.s_drift = QDoubleSpinBox()
         self.s_drift.setRange(0.1, 10.0)
         self.s_drift.setSingleStep(0.25)
+        self.s_drift.setDecimals(2)
         self.s_drift.setValue(1.25)
+        self.s_drift.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.s_drift.setAlignment(Qt.AlignCenter)
+        self.s_drift.setFixedWidth(88)
+        self.b_minus = QPushButton("−")
+        self.b_plus = QPushButton("+")
+        for b, step in ((self.b_minus, self.s_drift.stepDown), (self.b_plus, self.s_drift.stepUp)):
+            b.setObjectName("stepbtn")
+            b.setFixedSize(34, 30)
+            b.setAutoRepeat(True)                 # удержание = плавное изменение
+            b.setAutoRepeatDelay(400)
+            b.setAutoRepeatInterval(120)
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(step)
+        drow.addWidget(self.b_minus)
         drow.addWidget(self.s_drift)
+        drow.addWidget(self.b_plus)
         self.l_drift_u = QLabel(tr("set.drift_unit"))
         self.l_drift_u.setObjectName("muted")
         drow.addWidget(self.l_drift_u)

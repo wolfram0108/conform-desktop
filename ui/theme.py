@@ -76,10 +76,15 @@ QLineEdit:focus, QComboBox:focus {{ border-color: {t['acc']}; }}
    невозможно попасть. Задаём только рамку и явную зону кнопок. */
 QAbstractSpinBox {{
     background: {t['ctl']}; border: 1px solid {t['bd']}; border-radius: 6px;
-    padding-left: 8px; min-height: 26px; min-width: 92px;
+    min-height: 26px; padding: 2px 6px;
 }}
 QAbstractSpinBox:focus {{ border-color: {t['acc']}; }}
-/* стрелки — нативные: любые переопределения без картинок делают их невидимыми */
+QPushButton#stepbtn {{
+    background: {t['ctl']}; border: 1px solid {t['bd']}; border-radius: 6px;
+    font-size: 13pt; font-weight: 600; color: {t['ink']}; padding: 0;
+}}
+QPushButton#stepbtn:hover {{ background: {t['thumb']}; border-color: {t['acc']}; color: {t['acc']}; }}
+QPushButton#stepbtn:pressed {{ background: {t['acc']}; color: {t['accink']}; }}
 QLineEdit#path {{ font-family: "Cascadia Mono", Consolas; font-size: 9pt; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{
