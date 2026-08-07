@@ -16,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from loguru import logger
+
 from track_muxer.conform import cache as cache_mod
 from track_muxer.conform.align import conform_pair
 from track_muxer.conform.config import FFMPEG
@@ -131,6 +133,9 @@ def conform_episode(
                                    low_mem=low_mem, cache_dir=cache_dir, keep_tmp=keep_tmp,
                                    **pair_opts)
             except Exception as e:  # noqa: BLE001 — одна озвучка не валит серию
+                # ⚠ в результат уходит только текст ошибки; без записи в журнал причина
+                # (трасса, этап) теряется навсегда — а прогон мог идти час
+                logger.exception("conform: озвучка {} упала на серии {}", dub_video.name, ref.name)
                 res = PairResult(dub=dub_video.name, out_path=None, ok=False, error=str(e))
         pairs.append(res)
         if on_pair is not None:

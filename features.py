@@ -88,19 +88,24 @@ def probe_audio_channels(video: Path, ffprobe: str = FFPROBE,
     """Число каналов и раскладка аудиодорожки `atrack` (дефолт 0 — как было) — чтобы
     наследовать 2.0/5.1/7.1 на выход. -> (channels, channel_layout|None). При любой
     неудаче — безопасный fallback (2, None).
-    csv-строка вида '6,5.1(side)' / '2,stereo' / '2,' (пустая раскладка → None)."""
+
+    ⚠ Разбор ТОЛЬКО по JSON. Текстовый формат ffprobe (`-of csv`) на потоках с
+    дополнительными данными даёт ХВОСТОВУЮ ЗАПЯТУЮ: у обычного файла строка
+    `2,stereo`, а у ремукса с HDR — `6,5.1(side),`. Прежний разбор отдавал раскладку
+    вместе с запятой, ffmpeg отвечал `Unable to parse "ch_layout" option value
+    "5.1(side)," as channel layout` и умирал на старте записи — а мы видели лишь
+    «Broken pipe» после полутора часов работы (случай 2026-08-07)."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", f"a:{int(atrack)}",
-         "-show_entries", "stream=channels,channel_layout", "-of", "csv=p=0", str(video)],
+         "-show_entries", "stream=channels,channel_layout", "-of", "json", str(video)],
         capture_output=True, text=True,
     )
-    line = next((s for s in r.stdout.splitlines() if s.strip()), "")
-    parts = line.split(",", 1)                    # раскладки запятых не содержат → split(1) безопасен
     try:
-        ch = int(parts[0])
-    except (ValueError, IndexError):
+        streams = json.loads(r.stdout or "{}").get("streams") or []
+        ch = int(streams[0].get("channels"))
+    except (ValueError, TypeError, IndexError, json.JSONDecodeError):
         return (2, None)
-    layout = parts[1].strip() if len(parts) > 1 else ""
+    layout = str(streams[0].get("channel_layout") or "").strip().strip(",")
     return (max(1, ch), layout if layout and layout != "unknown" else None)
 
 
