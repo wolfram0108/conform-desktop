@@ -42,6 +42,7 @@ _STRINGS: dict[str, dict[str, str]] = {
     "set.drift_unit": {"ru": "%/с", "en": "%/s"},
     "set.keep_tmp": {"ru": "Сохранять промежуточные файлы (повтор без пересчёта)",
                      "en": "Keep intermediate files (instant re-runs)"},
+    "set.keep_tmp_dir": {"ru": "каталог для промежуточных файлов", "en": "folder for intermediate files"},
     "task.label": {"ru": "Название:", "en": "Label:"},
     "task.enqueue": {"ru": "Добавить в очередь", "en": "Add to queue"},
     "task.added": {"ru": "Задача добавлена в очередь — запустите её кнопкой ▶", "en": "Task added to the queue — press ▶ to start it"},

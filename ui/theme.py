@@ -67,11 +67,19 @@ QPushButton#icon {{
     background: {t['ctl']}; color: {t['muted']}; border: 1px solid {t['bd']};
     border-radius: 7px; padding: 2px 8px;
 }}
-QLineEdit, QComboBox, QAbstractSpinBox {{
+QLineEdit, QComboBox {{
     background: {t['ctl']}; border: 1px solid {t['bd']}; border-radius: 6px;
     padding: 5px 9px; selection-background-color: {t['acc']}; selection-color: {t['accink']};
 }}
-QLineEdit:focus, QComboBox:focus, QAbstractSpinBox:focus {{ border-color: {t['acc']}; }}
+QLineEdit:focus, QComboBox:focus {{ border-color: {t['acc']}; }}
+/* Спинбокс: НИКАКОГО общего padding — он сдвигает нативные стрелки так, что по ним
+   невозможно попасть. Задаём только рамку и явную зону кнопок. */
+QAbstractSpinBox {{
+    background: {t['ctl']}; border: 1px solid {t['bd']}; border-radius: 6px;
+    padding-left: 8px; min-height: 26px; min-width: 92px;
+}}
+QAbstractSpinBox:focus {{ border-color: {t['acc']}; }}
+/* стрелки — нативные: любые переопределения без картинок делают их невидимыми */
 QLineEdit#path {{ font-family: "Cascadia Mono", Consolas; font-size: 9pt; }}
 QComboBox::drop-down {{ border: none; width: 22px; }}
 QComboBox QAbstractItemView {{
@@ -109,6 +117,11 @@ QFrame#card, QFrame#group {{
     background: {t['panel']}; border: 1px solid {t['bd']}; border-radius: 8px;
 }}
 QFrame#group {{ border-color: {t['bdsoft']}; }}
+QPushButton#gheader {{
+    background: transparent; border: none; color: {t['ink']}; font-weight: 600;
+    text-align: left; padding: 9px 14px; border-radius: 0;
+}}
+QPushButton#gheader:hover {{ color: {t['acc']}; }}
 QFrame#subrows {{ background: {t['win']}; border: none; border-top: 1px solid {t['bdsoft']}; }}
 QFrame#dubrow, QFrame#drow {{ background: transparent; border: none; border-bottom: 1px solid {t['bdsoft']}; }}
 QFrame#drowWarn {{ background: {t['warnbg']}; border: none; border-left: 3px solid {t['warn']}; }}
@@ -137,7 +150,21 @@ QScrollArea {{ border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 10px; }}
 QScrollBar::handle:vertical {{ background: {t['bd']}; border-radius: 5px; min-height: 30px; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-QRadioButton, QCheckBox {{ spacing: 8px; }}
-QRadioButton::indicator, QCheckBox::indicator {{ width: 15px; height: 15px; }}
+QRadioButton, QCheckBox {{ spacing: 9px; padding: 3px 0; }}
+QRadioButton::indicator, QCheckBox::indicator {{
+    width: 14px; height: 14px; background: {t['ctl']}; border: 2px solid {t['muted']};
+}}
+QRadioButton::indicator {{ border-radius: 9px; }}
+QCheckBox::indicator {{ border-radius: 4px; }}
+QRadioButton::indicator:hover, QCheckBox::indicator:hover {{ border-color: {t['acc']}; }}
+/* выбранное состояние: толстое кольцо акцента с «ядром» цвета фона = точка/заливка */
+QRadioButton::indicator:checked {{
+    width: 8px; height: 8px; border: 5px solid {t['acc']}; border-radius: 9px;
+    background: {t['accink']};
+}}
+QCheckBox::indicator:checked {{
+    border: 2px solid {t['acc']}; background: {t['acc']};
+}}
+QRadioButton:disabled, QCheckBox:disabled {{ color: {t['muted']}; }}
 QToolTip {{ background: {t['panel']}; color: {t['ink']}; border: 1px solid {t['bd']}; }}
 """
