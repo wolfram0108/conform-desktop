@@ -226,7 +226,19 @@ function renderJobs(jobs) {
   const box = $("#jobs");
   box.innerHTML = "";
   if (!jobs.length) { box.append(el("div", "empty", t("q.empty"))); return; }
-  [...jobs].reverse().forEach(j => box.append(jobCard(j)));
+  // каждая карточка — отдельно: ошибка отрисовки ОДНОЙ задачи не должна прятать
+  // остальные (контейнер уже очищен, и пользователь увидел бы пустую очередь)
+  [...jobs].reverse().forEach(j => {
+    try {
+      box.append(jobCard(j));
+    } catch (e) {
+      console.error("не удалось отрисовать задачу", j && j.id, e);
+      const stub = el("div", "job");
+      stub.append(el("span", "dot crit"), el("span", "jname", (j && (j.label || j.id)) || "?"),
+                  el("span", "metrics", t("q.render_error")));
+      box.append(stub);
+    }
+  });
 }
 
 function jobCard(j) {
@@ -297,7 +309,14 @@ function dubRow(job, r) {
   if (r.ok) row.append(el("span", "metrics",
     t("d.resid", {v: (r.audio_resid_ms || 0).toFixed(1)}) + " · " + t("d.coverage", {v: (r.audio_coverage || 0).toFixed(2)})));
   if (level === "warn") { const w = el("span", "metrics", t("d.suspect")); w.style.color = "var(--warn)"; w.title = (r.warnings || []).join("\n"); row.append(w); }
-  if (level === "crit") { const w = el("span", "metrics", (r.critical || [r.error || ""])[0].slice(0, 60)); w.style.color = "var(--crit)"; w.title = r.error || ""; row.append(w); }
+  if (level === "crit") {
+    // ⚠ пустой массив в JS «истинный»: выражение (r.critical || [r.error])[0] брало
+    // ПУСТОЙ critical, давало undefined и роняло отрисовку — а вместе с ней ВЕСЬ список
+    // очереди (контейнер уже очищен). Ломалась ровно та задача, у которой была ошибка.
+    const msg = (r.critical && r.critical.length ? r.critical[0] : r.error) || t("d.failed");
+    const w = el("span", "metrics", String(msg).slice(0, 60));
+    w.style.color = "var(--crit)"; w.title = r.error || String(msg); row.append(w);
+  }
 
   const key = job.id + "|" + r.dub + "|" + (r.out_path || "");
   const detail = el("div", "detail" + (openDetails.has(key) ? " on" : ""));
