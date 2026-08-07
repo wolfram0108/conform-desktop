@@ -86,7 +86,12 @@ select { width:auto; max-width:420px; }
 .hint { color:var(--muted); font-size:12px; }
 
 /* список озвучек */
-.dubs { border:1px solid var(--bd); border-radius:var(--r); background:var(--panel); overflow:hidden; }
+/* ⚠ БЕЗ overflow:hidden — иначе контейнер ОБРЕЗАЕТ выпадающее меню выбора дорожек
+   (оно absolute и выходит за нижнюю границу строки): меню открыто, но невидимо и
+   не принимает клики. Скругление углов делают сами строки. */
+.dubs { border:1px solid var(--bd); border-radius:var(--r); background:var(--panel); }
+.dubs > .dub:first-child { border-radius:var(--r) var(--r) 0 0; }
+.dubs > .dub:last-child { border-radius:0 0 var(--r) var(--r); }
 .dub {
   display:flex; align-items:center; gap:10px; padding:8px 12px;
   border-bottom:1px solid var(--bd-soft);

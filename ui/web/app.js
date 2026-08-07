@@ -130,6 +130,10 @@ function renderDubs() {
   });
 }
 
+function closeTrackMenus() {
+  document.querySelectorAll(".tracks-menu.on").forEach(m => m.classList.remove("on"));
+}
+
 function trackPicker(d, idx) {
   const wrap = el("span", "tracks");
   const btn = el("button", "btn small");
@@ -160,8 +164,15 @@ function trackPicker(d, idx) {
     refresh();
   };
   menu.append(all);
-  btn.onclick = e => { e.stopPropagation(); menu.classList.toggle("on"); };
-  document.addEventListener("click", () => menu.classList.remove("on"));
+  // клик ВНУТРИ меню не должен его закрывать: иначе выбор первой же дорожки схлопывает
+  // список и выбрать несколько невозможно (снаружи выглядит как «список не открывается»)
+  menu.onclick = e => e.stopPropagation();
+  btn.onclick = e => {
+    e.stopPropagation();
+    const open = menu.classList.contains("on");
+    closeTrackMenus();                       // одновременно открыто не больше одного меню
+    if (!open) menu.classList.add("on");
+  };
   wrap.append(btn, menu);
   refresh();
   return wrap;
@@ -376,6 +387,11 @@ async function refreshJobs() {
 
 /* ═══════════ запуск ═══════════ */
 function bind() {
+  // одна привязка на всё приложение: раньше слушатель вешался в trackPicker и копился
+  // при каждой перерисовке списка озвучек
+  document.addEventListener("click", closeTrackMenus);
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeTrackMenus(); });
+
   document.querySelectorAll(".tab").forEach(b => b.onclick = () => showPage(b.dataset.page));
   $("#theme").onclick = () => applyTheme({auto: "light", light: "dark", dark: "auto"}[state.theme]);
   $("#theme").title = t("theme.tip");
