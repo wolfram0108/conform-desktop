@@ -21,6 +21,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+from loguru import logger
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import butter, medfilt, resample_poly, sosfiltfilt
 
@@ -201,19 +202,36 @@ def _write_audio_streamed(path: Path, out, ffmpeg: str, *, layout: str | None = 
     cmd = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error",
            "-f", "s16le", "-ar", str(SR), "-ac", str(ch), *lay, "-i", "pipe:0",
            "-c:a", "flac", "-compression_level", "8", str(path)]
-    proc = procreg.popen(cmd, stdin=subprocess.PIPE)
+    # stderr перехватываем: если приёмник умрёт посреди записи, запись в его канал даёт
+    # «Broken pipe» — сообщение БЕЗ причины. Настоящая причина лежит в stderr ffmpeg,
+    # и без перехвата она терялась насовсем (случай 2026-08-07: полтора часа работы → пусто).
     n = len(out)
+    logger.info("запись {}: {} сэмплов × {} кан. ({:.1f} мин, ~{:.1f} ГБ int16), раскладка {}",
+                path.name, n, ch, n / SR / 60, n * ch * 2 / 2**30, layout or "по числу каналов")
+    proc = procreg.popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     BLK = 1 << 20
+    broken = None
     try:
         for s in range(0, n, BLK):
             proc.stdin.write(np.ascontiguousarray(out[s:s + BLK]).astype(np.int16).tobytes())
             if on_prog is not None:
                 on_prog(min(1.0, (s + BLK) / max(1, n)))
+    except (BrokenPipeError, OSError) as e:
+        broken = e                      # приёмник закрыл канал — дочитаем ЕГО жалобу ниже
     finally:
-        proc.stdin.close()
+        try:
+            proc.stdin.close()
+        except OSError:
+            pass
+    err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip() if proc.stderr else ""
     rc = proc.wait(); procreg.done(proc)
-    if rc != 0:
-        raise subprocess.CalledProcessError(rc, cmd)
+    if broken is not None or rc != 0:
+        written = path.stat().st_size if path.exists() else 0
+        raise RuntimeError(
+            f"запись {path.name} не удалась: код {rc}"
+            + (f", обрыв канала ({broken})" if broken is not None else "")
+            + f", записано {written / 2**20:.1f} МБ, ожидалось сэмплов {n}"
+            + (f"; ffmpeg: {err[-2000:]}" if err else "; ffmpeg промолчал"))
 
 
 def _fill_silence_from_ref(out, ref_buf, *, sr=SR, sil_db=SIL_FILL_DB,

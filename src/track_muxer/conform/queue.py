@@ -430,6 +430,13 @@ class ConformQueue:
                 jj.updated_at = _now()
 
         def on_pair(res: PairResult) -> None:
+            if res.ok:
+                logger.info("conform {} озвучка {} готова: назначено {:.1f}%, остаток {:.1f} мс, "
+                            "покрытие {:.3f}, выход {}", jid, res.dub, res.assigned_pct,
+                            res.audio_resid_ms, res.audio_coverage, res.out_path)
+            else:
+                logger.error("conform {} озвучка {} НЕ удалась: {}", jid, res.dub,
+                             res.error or "без сообщения")
             with self._lock:
                 jj = self._items.get(jid)
                 if jj is None:
@@ -460,6 +467,8 @@ class ConformQueue:
 
         status, err = DONE, None
         t0 = time.perf_counter()
+        logger.info("conform {} старт: реф={} озвучек={} выход={}",
+                    jid, Path(spec.ref).name, len(spec.dubs), spec.out_dir)
         try:
             conform_episode(
                 spec.ref, spec.dubs, spec.out_dir,
