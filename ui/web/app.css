@@ -1,0 +1,190 @@
+/* Оформление интерфейса conform-desktop.
+   Токены и раскладка — из утверждённого макета (doc/missions/.../ui_mockup.html).
+   Тема следует за системной; переключатель в шапке принудительно ставит светлую/тёмную. */
+
+:root {
+  --page:#eef0f3; --win:#f7f8fa; --chrome:#eceef1; --panel:#fff; --ctl:#fdfdfe;
+  --bd:#d3d7dd; --bd-soft:#e3e6ea; --ink:#20242a; --muted:#5c6470;
+  --acc:#0a6ccb; --acc-ink:#fff; --ok:#1a7f37;
+  --warn:#9a6700; --warn-bg:#fff3d6; --crit:#b42318; --crit-bg:#fde8e8;
+  --thumb:#f2f6fb;
+  --r:8px; --gap:12px;
+}
+:root[data-theme="dark"], :root[data-theme="auto"].sys-dark {
+  --page:#17191d; --win:#22252b; --chrome:#1b1e23; --panel:#282c33; --ctl:#2e333b;
+  --bd:#3c424c; --bd-soft:#333941; --ink:#e6e8ec; --muted:#9aa2ad;
+  --acc:#4cc2ff; --acc-ink:#0b2233; --ok:#3fb950;
+  --warn:#d29922; --warn-bg:#3a3020; --crit:#f2555a; --crit-bg:#3d2222;
+  --thumb:#20242b;
+}
+
+* { box-sizing:border-box; }
+html, body { height:100%; }
+body {
+  margin:0; background:var(--win); color:var(--ink);
+  font:14px/1.5 "Segoe UI Variable","Segoe UI",system-ui,sans-serif;
+  overflow:hidden; user-select:none;
+}
+button, input, select { font:inherit; color:inherit; }
+button { cursor:pointer; }
+
+/* ── шапка ── */
+.top {
+  display:flex; align-items:center; gap:8px; padding:8px 14px;
+  background:var(--chrome); border-bottom:1px solid var(--bd-soft);
+}
+.tab {
+  padding:7px 18px; border:none; background:transparent; color:var(--muted);
+  border-radius:7px; font-size:14px;
+}
+.tab:hover { color:var(--ink); }
+.tab.on { background:var(--panel); color:var(--ink); font-weight:600; }
+.tab .n {
+  display:inline-block; min-width:18px; padding:0 5px; margin-left:6px;
+  background:var(--acc); color:var(--acc-ink); border-radius:10px; font-size:11px;
+}
+.spacer { flex:1; }
+.badge {
+  padding:4px 11px; border:1px solid var(--bd); border-radius:20px;
+  background:var(--ctl); color:var(--muted); font-size:12px; white-space:nowrap;
+  max-width:280px; overflow:hidden; text-overflow:ellipsis;
+}
+.badge.gpu { color:var(--ok); border-color:color-mix(in srgb, var(--ok) 40%, var(--bd)); }
+.seg { display:flex; border:1px solid var(--bd); border-radius:7px; overflow:hidden; }
+.seg button { padding:4px 10px; border:none; background:var(--ctl); color:var(--muted); font-size:12px; }
+.seg button.on { background:var(--acc); color:var(--acc-ink); }
+.icon-btn {
+  width:34px; height:28px; border:1px solid var(--bd); border-radius:7px;
+  background:var(--ctl); color:var(--muted);
+}
+.icon-btn:hover { border-color:var(--acc); color:var(--acc); }
+
+/* ── страницы ── */
+.page { display:none; height:calc(100% - 45px); overflow:auto; padding:18px 20px 24px; }
+.page.on { display:block; }
+
+/* ── форма задачи ── */
+.row { display:flex; align-items:center; gap:10px; margin-bottom:var(--gap); }
+.row.top-align { align-items:flex-start; }
+.lbl { flex:0 0 158px; text-align:right; color:var(--muted); }
+.grow { flex:1; min-width:0; }
+input[type=text], select {
+  width:100%; padding:7px 10px; background:var(--ctl); color:var(--ink);
+  border:1px solid var(--bd); border-radius:6px; outline:none;
+}
+input[type=text]:focus, select:focus { border-color:var(--acc); }
+input.path { font-family:"Cascadia Mono",Consolas,monospace; font-size:12px; }
+select { width:auto; max-width:420px; }
+.btn {
+  padding:7px 14px; background:var(--ctl); color:var(--ink);
+  border:1px solid var(--bd); border-radius:6px; white-space:nowrap;
+}
+.btn:hover { border-color:var(--acc); }
+.btn.primary { background:var(--acc); border-color:var(--acc); color:var(--acc-ink); font-weight:600; }
+.btn.ghost { border-style:dashed; color:var(--muted); }
+.btn.small { padding:3px 9px; font-size:12px; }
+.hint { color:var(--muted); font-size:12px; }
+
+/* список озвучек */
+.dubs { border:1px solid var(--bd); border-radius:var(--r); background:var(--panel); overflow:hidden; }
+.dub {
+  display:flex; align-items:center; gap:10px; padding:8px 12px;
+  border-bottom:1px solid var(--bd-soft);
+}
+.dub:last-child { border-bottom:none; }
+.dub .name {
+  flex:1; min-width:60px; font-family:"Cascadia Mono",Consolas,monospace; font-size:12px;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.tag {
+  padding:2px 9px; background:var(--thumb); border:1px solid var(--bd-soft);
+  border-radius:12px; color:var(--muted); font-size:11px; white-space:nowrap;
+}
+.x { width:26px; height:24px; border:1px solid var(--bd); border-radius:6px; background:var(--ctl); color:var(--muted); }
+.x:hover { border-color:var(--crit); color:var(--crit); }
+
+/* мультивыбор дорожек */
+.tracks { position:relative; }
+.tracks > button { max-width:340px; overflow:hidden; text-overflow:ellipsis; }
+.tracks-menu {
+  position:absolute; z-index:20; top:calc(100% + 4px); left:0; min-width:280px; max-height:280px;
+  overflow:auto; background:var(--panel); border:1px solid var(--bd); border-radius:var(--r);
+  box-shadow:0 8px 24px rgba(0,0,0,.18); padding:4px; display:none;
+}
+.tracks-menu.on { display:block; }
+.tracks-menu label { display:flex; align-items:center; gap:8px; padding:6px 8px; border-radius:6px; cursor:pointer; }
+.tracks-menu label:hover { background:var(--thumb); }
+
+/* настройки */
+.group { border:1px solid var(--bd-soft); border-radius:var(--r); background:var(--panel); overflow:hidden; }
+.group > .head {
+  width:100%; text-align:left; padding:10px 14px; background:transparent;
+  border:none; border-bottom:1px solid transparent; font-weight:600; color:var(--ink);
+}
+.group.open > .head { border-bottom-color:var(--bd-soft); }
+.group > .body { display:none; padding:12px 16px 14px; }
+.group.open > .body { display:block; }
+.opt { display:flex; align-items:center; gap:9px; margin:9px 0; }
+.opt input[type=checkbox], .opt input[type=radio] { width:16px; height:16px; accent-color:var(--acc); cursor:pointer; }
+.opt label { cursor:pointer; }
+.note { color:var(--muted); font-size:12px; margin:2px 0 10px 25px; max-width:70ch; }
+
+/* число со стрелками — своя реализация: одинакова во всех системах */
+.num { display:inline-flex; align-items:stretch; border:1px solid var(--bd); border-radius:6px; overflow:hidden; background:var(--ctl); }
+.num input {
+  width:74px; padding:6px 8px; border:none; background:transparent; text-align:center;
+  outline:none; font-variant-numeric:tabular-nums;
+}
+.num .steps { display:flex; flex-direction:column; border-left:1px solid var(--bd-soft); }
+.num .steps button {
+  width:26px; height:16px; border:none; background:var(--ctl); color:var(--muted);
+  display:flex; align-items:center; justify-content:center; font-size:9px; line-height:1;
+}
+.num .steps button:first-child { border-bottom:1px solid var(--bd-soft); }
+.num .steps button:hover { background:var(--thumb); color:var(--acc); }
+.num .steps button:active { background:var(--acc); color:var(--acc-ink); }
+
+/* ── очередь ── */
+.qhead { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+.job { border:1px solid var(--bd); border-radius:var(--r); background:var(--panel); margin-bottom:10px; overflow:hidden; }
+.job > .jrow { display:flex; align-items:center; gap:12px; padding:10px 14px; }
+.dot { width:9px; height:9px; border-radius:50%; flex:none; background:var(--muted); }
+.dot.run { background:var(--acc); box-shadow:0 0 0 3px color-mix(in srgb, var(--acc) 25%, transparent); }
+.dot.ok { background:var(--ok); }
+.dot.warn { background:var(--warn); }
+.dot.crit { background:var(--crit); }
+.jname { font-weight:600; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.jmeta { color:var(--muted); font-size:12px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bar { flex:0 0 190px; height:8px; background:var(--thumb); border:1px solid var(--bd-soft); border-radius:5px; overflow:hidden; }
+.bar > i { display:block; height:100%; background:var(--acc); }
+.subrows { border-top:1px solid var(--bd-soft); background:var(--win); }
+.drow { display:flex; align-items:center; gap:12px; padding:9px 14px 9px 32px; border-bottom:1px solid var(--bd-soft); }
+.drow:last-child { border-bottom:none; }
+.drow.warn { background:var(--warn-bg); border-left:3px solid var(--warn); }
+.drow.crit { background:var(--crit-bg); border-left:3px solid var(--crit); }
+.metrics { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; }
+.link { background:none; border:none; color:var(--acc); font-size:13px; padding:2px 4px; }
+.link:hover { text-decoration:underline; }
+.detail { padding:12px 14px 14px 32px; background:var(--win); border-top:1px dashed var(--bd-soft); display:none; }
+.detail.on { display:block; }
+.mgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr)); gap:8px 20px; margin-bottom:12px; }
+.mcell b { display:block; font-size:11px; color:var(--muted); font-weight:500; text-transform:uppercase; letter-spacing:.04em; }
+.mcell span { font-variant-numeric:tabular-nums; }
+.previews { display:flex; gap:12px; flex-wrap:wrap; }
+.preview img { width:250px; height:84px; object-fit:cover; background:var(--thumb); border:1px solid var(--bd-soft); border-radius:6px; cursor:zoom-in; }
+.preview b { display:block; font-size:11px; color:var(--muted); font-weight:500; margin-top:4px; }
+.empty { color:var(--muted); text-align:center; padding:40px 0; }
+
+/* модальное окно графика */
+.modal { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; align-items:center; justify-content:center; z-index:50; }
+.modal.on { display:flex; }
+.modal img { max-width:94vw; max-height:92vh; background:var(--panel); border-radius:var(--r); }
+
+/* всплывающее сообщение */
+.toast {
+  position:fixed; left:50%; bottom:22px; transform:translateX(-50%);
+  background:var(--panel); border:1px solid var(--bd); border-radius:20px;
+  padding:8px 18px; box-shadow:0 6px 20px rgba(0,0,0,.18); opacity:0;
+  transition:opacity .2s; pointer-events:none; z-index:60; max-width:80vw;
+}
+.toast.on { opacity:1; }

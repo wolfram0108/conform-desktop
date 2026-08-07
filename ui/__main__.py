@@ -59,8 +59,8 @@ from PySide6.QtWidgets import QApplication                # noqa: E402
 
 from server.app import create_app, data_dir, get_queue    # noqa: E402
 from ui import winjob                                     # noqa: E402
-from ui.client import Api                                 # noqa: E402
-from ui.main_window import MainWindow                     # noqa: E402
+from ui.shell_api import create_bridge, make_shell_router  # noqa: E402
+from ui.window import MainWindow, enable_debug_port, web_dir  # noqa: E402
 
 PORT = int(os.environ.get("CONFORM_PORT", "8799"))
 
@@ -73,29 +73,42 @@ def _health_ok(base: str) -> bool:
         return False
 
 
+_APP = None                       # FastAPI-приложение процесса (ядро + мост оболочки)
+
+
 def _start_server() -> None:
     import uvicorn
-    cfg = uvicorn.Config(create_app(), host="127.0.0.1", port=PORT, log_level="warning")
+    cfg = uvicorn.Config(_APP, host="127.0.0.1", port=PORT, log_level="warning")
     uvicorn.Server(cfg).run()      # в не-главном потоке uvicorn сам пропускает signal-handlers
 
 
 def main() -> int:
+    global _APP
     # Рубеж №1 (страховка ОС): все потомки умрут вместе с процессом ЛЮБЫМ способом —
     # включая taskkill /F и падение, когда наш код выхода отработать не успевает.
     winjob.enable_kill_on_close()
+    enable_debug_port()            # порт отладки страницы — до создания QApplication
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("conform-desktop")
 
     base = f"http://127.0.0.1:{PORT}"
     if not _health_ok(base):
+        bridge = create_bridge(app)               # диалоги файлов выполняются в GUI-потоке
+        _APP = create_app()
+        _APP.include_router(make_shell_router(bridge))
+        # Страница отдаётся ТЕМ ЖЕ сервером: одинаковый источник → браузер не блокирует
+        # запросы к API (при загрузке с file:// они запрещены политикой безопасности).
+        from fastapi.staticfiles import StaticFiles
+        _APP.mount("/app", StaticFiles(directory=str(web_dir()), html=True), name="ui")
         threading.Thread(target=_start_server, daemon=True, name="api").start()
-        for _ in range(100):                       # ждём готовности (torch-импорты небыстрые)
+        for _ in range(150):                      # ждём готовности (torch-импорты небыстрые)
             if _health_ok(base):
                 break
             time.sleep(0.2)
 
-    app = QApplication(sys.argv)
-    app.setApplicationName("conform-desktop")
     cfg = QSettings(str(data_dir() / "ui.ini"), QSettings.IniFormat)
-    win = MainWindow(Api(base), cfg)
+    win = MainWindow(base, cfg)
     win.show()
     rc = app.exec()
     _shutdown()

@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>conform-desktop</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <div class="top">
+    <button class="tab on" id="tab-task" data-page="task"></button>
+    <button class="tab" id="tab-queue" data-page="queue"></button>
+    <span class="spacer"></span>
+    <span class="badge" id="device">…</span>
+    <span class="seg">
+      <button id="lang-ru" class="on">RU</button><button id="lang-en">EN</button>
+    </span>
+    <button class="icon-btn" id="theme" title="">◐</button>
+  </div>
+
+  <!-- ═══ Задача ═══ -->
+  <section class="page on" id="page-task">
+    <div class="row">
+      <span class="lbl" data-i="ref"></span>
+      <span class="grow"><input type="text" class="path" id="ref"></span>
+      <button class="btn" id="ref-browse" data-i="browse"></button>
+    </div>
+
+    <div class="row" id="ref-track-row" hidden>
+      <span class="lbl" data-i="ref.track"></span>
+      <select id="ref-track"></select>
+      <button class="btn" id="rest-as-dubs" data-i="ref.rest_as_dubs"></button>
+      <span class="hint" id="ref-track-hint"></span>
+    </div>
+
+    <div class="row top-align">
+      <span class="lbl" data-i="dubs" style="padding-top:8px"></span>
+      <div class="grow">
+        <div class="dubs" id="dubs" hidden></div>
+        <div class="row" style="margin:8px 0 0">
+          <button class="btn ghost" id="dubs-add" data-i="dubs.add"></button>
+          <span class="hint" data-i="dubs.drop"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="row">
+      <span class="lbl" data-i="out_dir"></span>
+      <span class="grow"><input type="text" class="path" id="out"></span>
+      <button class="btn" id="out-browse" data-i="browse"></button>
+    </div>
+
+    <div class="row top-align">
+      <span class="lbl"></span>
+      <div class="grow group" id="settings">
+        <button class="head" id="settings-head"></button>
+        <div class="body">
+          <div class="opt">
+            <span class="hint" data-i="set.analysis"></span>
+            <input type="radio" name="analysis" id="a-band" checked>
+            <label for="a-band" data-i="set.band"></label>
+            <input type="radio" name="analysis" id="a-muq">
+            <label for="a-muq">MuQ</label>
+          </div>
+          <div class="note" id="muq-note" data-i="set.muq_note"></div>
+
+          <div class="opt">
+            <input type="checkbox" id="fill" checked>
+            <label for="fill" data-i="set.fill"></label>
+          </div>
+
+          <div class="opt">
+            <span class="hint" data-i="set.drift"></span>
+            <span class="num">
+              <input type="text" id="drift" value="1.25" inputmode="decimal">
+              <span class="steps">
+                <button id="drift-up" aria-label="+">▲</button>
+                <button id="drift-down" aria-label="−">▼</button>
+              </span>
+            </span>
+            <span class="hint" data-i="set.drift_unit"></span>
+          </div>
+
+          <div class="opt">
+            <input type="checkbox" id="keeptmp">
+            <label for="keeptmp" data-i="set.keep_tmp"></label>
+          </div>
+          <div class="row" id="tmp-row" style="margin-left:25px" hidden>
+            <span class="grow" style="max-width:420px"><input type="text" class="path" id="tmpdir"></span>
+            <button class="btn" id="tmp-browse" data-i="browse"></button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="row" style="margin-top:16px">
+      <span class="opt" style="margin:0">
+        <input type="checkbox" id="autostart">
+        <label for="autostart" data-i="q.autostart"></label>
+      </span>
+      <span class="spacer"></span>
+      <span class="hint" data-i="task.label"></span>
+      <input type="text" id="label" style="width:240px">
+      <button class="btn primary" id="enqueue" data-i="task.enqueue"></button>
+    </div>
+  </section>
+
+  <!-- ═══ Очередь ═══ -->
+  <section class="page" id="page-queue">
+    <div class="qhead">
+      <span class="hint" data-i="q.parallel"></span>
+      <select id="limit" style="width:80px"></select>
+      <span class="spacer"></span>
+      <button class="btn" id="clear-done" data-i="q.clear_done"></button>
+    </div>
+    <div id="jobs"></div>
+  </section>
+
+  <div class="modal" id="modal"><img id="modal-img" alt=""></div>
+  <div class="toast" id="toast"></div>
+
+  <script src="i18n.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

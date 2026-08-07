@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 _STRINGS: dict[str, dict[str, str]] = {
+    "theme.tip": {"ru": "Тема: системная / светлая / тёмная", "en": "Theme: system / light / dark"},
     "tab.task": {"ru": "Задача", "en": "Task"},
     "tab.queue": {"ru": "Очередь", "en": "Queue"},
     "ref": {"ru": "Референс:", "en": "Reference:"},
