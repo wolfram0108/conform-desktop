@@ -282,6 +282,25 @@ class ConformQueue:
             self._pump_locked()
         return True
 
+    def shutdown(self) -> int:
+        """Завершение работы приложения: остановить ВСЕ активные задачи и убить их
+        подпроцессы. Без этого закрытие окна оставляет ffmpeg-сирот, продолжающих
+        писать файлы. Возврат: сколько процессов убито."""
+        with self._lock:
+            groups = list(self._groups.values())
+            for ev in self._stops.values():
+                ev.set()
+            for j in self._items.values():
+                if j.status == RUNNING:
+                    self._set(j, CANCELLED)
+            self._persist_locked()
+        killed = 0
+        for g in groups:
+            killed += g.kill_all()
+        if killed:
+            logger.info("conform shutdown: убито процессов: {}", killed)
+        return killed
+
     def clear_done(self) -> dict:
         """Убрать ЗАВЕРШЁННЫЕ задачи из очереди И удалить их временные файлы.
         Выходные аудиофайлы и графики (_plots) НЕ трогаются — решение пользователя
