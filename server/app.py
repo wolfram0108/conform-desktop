@@ -28,11 +28,21 @@ def data_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "appdata"
 
 
+_QUEUE: ConformQueue | None = None
+
+
+def get_queue() -> ConformQueue | None:
+    """Очередь этого процесса — нужна UI, чтобы при выходе погасить активные задачи."""
+    return _QUEUE
+
+
 def create_app(base: Path | None = None) -> FastAPI:
+    global _QUEUE
     base = Path(base) if base else data_dir()
     base.mkdir(parents=True, exist_ok=True)
 
     cq = ConformQueue(output_dir=base)
+    _QUEUE = cq
     cq.restore()                                   # оборванные running → queued
 
     app = FastAPI(title="conform-desktop", docs_url=None, redoc_url=None)

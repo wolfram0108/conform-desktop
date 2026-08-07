@@ -35,7 +35,7 @@ if getattr(sys, "frozen", False):
 from PySide6.QtCore import QSettings                      # noqa: E402
 from PySide6.QtWidgets import QApplication                # noqa: E402
 
-from server.app import create_app, data_dir               # noqa: E402
+from server.app import create_app, data_dir, get_queue    # noqa: E402
 from ui.client import Api                                 # noqa: E402
 from ui.main_window import MainWindow                     # noqa: E402
 
@@ -71,11 +71,33 @@ def main() -> int:
     win = MainWindow(Api(base), cfg)
     win.show()
     rc = app.exec()
-    # Жёсткий выход обязателен: ConformQueue держит non-daemon ThreadPoolExecutor —
-    # обычный sys.exit() оставляет процесс (и консоль) висеть после закрытия окна.
-    # ⚠ Запущенные ffmpeg-подпроцессы при этом осиротеют — их аккуратное убийство
-    # придёт вместе с «надёжной отменой» (этап 10а, kill process-tree задачи).
+    _shutdown()
+    # Жёсткий выход: ConformQueue держит non-daemon ThreadPoolExecutor — обычный
+    # возврат оставил бы процесс висеть после закрытия окна.
     os._exit(rc)
+
+
+def _shutdown() -> None:
+    """Закрытие окна = конец работы: гасим задачи и НЕ оставляем ffmpeg-сирот.
+
+    Два рубежа: (1) очередь убивает подпроцессы своих задач штатно; (2) контрольный
+    kill всего дерева ЭТОГО процесса — на случай процессов, запущенных в обход реестра
+    (сторонний код), потому что os._exit детей не забирает.
+    """
+    try:
+        q = get_queue()
+        if q is not None:
+            q.shutdown()
+    except Exception:  # noqa: BLE001 — выход не должен падать
+        pass
+    if os.name == "nt":
+        try:
+            import subprocess
+            subprocess.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
+                           capture_output=True, check=False,
+                           creationflags=0x08000000)     # без консольного окна
+        except Exception:  # noqa: BLE001
+            pass
 
 
 if __name__ == "__main__":
