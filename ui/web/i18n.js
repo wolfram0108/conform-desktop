@@ -69,8 +69,8 @@ const STRINGS = {
   "m.span":          {ru:"диапазон сдвига", en:"shift span"},
   "m.geom":          {ru:"геометрия", en:"geometry"},
   "m.mode_audio":    {ru:"режим", en:"mode"},
-  "p.track":         {ru:"укладка — весь трек", en:"alignment — full track"},
-  "p.cut":           {ru:"рез @{t} с · {v} мс", en:"cut @{t} s · {v} ms"},
+  "p.track":         {ru:"сдвиг звука — вся дорожка", en:"audio shift — full track"},
+  "p.cut":           {ru:"разрыв @{t} с · {v} мс", en:"discontinuity @{t} s · {v} ms"},
   "p.open":          {ru:"открыть ↗", en:"open ↗"},
   /* Названия операций — из словаря терминов миссии (GLOSSARY_terms.md).
      Одна операция — один термин, одинаково в интерфейсе, журнале и отчётах. */
