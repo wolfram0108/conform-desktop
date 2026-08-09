@@ -68,7 +68,7 @@ def conform_episode(
 
     # Реф: ref_features → дисковый кеш → декод (+сохранить в кеш).
     if progress is not None:
-        progress(Progress("decode", 0.0, f"реф {ref_video.name}", 0, total, "реф"))
+        progress(Progress("decode", 0.0, f"референс {ref_video.name}", 0, total, "референс"))
     ref = ref_features
     if ref is None and cache_dir is not None:
         ref = cache_mod.load_srm(cache_dir, ref_video)        # memmap, если в кеше

@@ -20,7 +20,7 @@ from pathlib import Path
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from track_muxer.conform import procreg
+from track_muxer.conform import features, procreg
 from track_muxer.conform.episode import conform_episode
 from track_muxer.conform.models import PairResult
 
@@ -58,6 +58,17 @@ class PlotRef(BaseModel):
     v_ms: float | None = None       # величина реза, мс (для kind=cut)
 
 
+class MediaInfo(BaseModel):
+    """Паспорт файла для показа и оценки времени (метаданные, без прохода по файлу)."""
+
+    duration_s: float = 0.0
+    width: int = 0
+    height: int = 0
+    fps: float = 0.0
+    frames: int = 0
+    has_video: bool = True
+
+
 class JobOp(BaseModel):
     """Одна ВЫПОЛНЕННАЯ или идущая операция задачи — для показа хода работы.
 
@@ -80,6 +91,7 @@ class DubResult(BaseModel):
     mode: str = "av"                # "av" = зрение+звук | "audio" = аудио-only (озвучка без видео)
     skipped: bool = False           # уже было готово (файл на диске)
     out_path: str | None = None     # путь к выходному аудиофайлу (формат — деталь записи)
+    out_size: int = 0               # размер выхода, байт (0 = файла нет / не удалось узнать)
     assigned_pct: float = 0.0
     slope: float = 0.0
     cos_median: float = 0.0
@@ -140,6 +152,8 @@ class ConformJob(BaseModel):
     dub_index: int = 0
     dub_total: int = 0
     cur_dub: str = ""
+    ref_info: MediaInfo | None = None                # паспорт референса (для шапки и прогноза)
+    dub_infos: list[MediaInfo] = Field(default_factory=list)   # паспорта исходных файлов
     ops: list[JobOp] = Field(default_factory=list)   # журнал операций: что пройдено и за сколько
     results: list[DubResult] = Field(default_factory=list)
     error: str | None = None
@@ -485,9 +499,13 @@ class ConformQueue:
                     jj.ops[-1].sec = time.perf_counter() - op_t0[0]
                     jj.ops[-1].state = "done" if res.ok else "failed"
                     op_t0[0] = time.perf_counter()
+                try:
+                    out_size = res.out_path.stat().st_size if res.out_path else 0
+                except OSError:
+                    out_size = 0
                 jj.results.append(DubResult(
                     dub=res.dub, ok=res.ok, mode=getattr(res, "mode", "av"), skipped=res.skipped,
-                    out_path=(str(res.out_path) if res.out_path else None),
+                    out_path=(str(res.out_path) if res.out_path else None), out_size=out_size,
                     assigned_pct=res.assigned_pct, slope=res.slope, cos_median=res.cos_median,
                     real_cuts=len(res.real_cuts), filled_cuts=res.filled_cuts,
                     edge_recovered=res.edge_recovered, audio_resid_ms=res.audio_resid_ms,
@@ -513,6 +531,17 @@ class ConformQueue:
         t0 = time.perf_counter()
         logger.info("conform {} старт: реф={} озвучек={} выход={}",
                     jid, Path(spec.ref).name, len(spec.dubs), spec.out_dir)
+        # Паспорта файлов — по метаданным, до начала работы: панель показывает, с чем
+        # работаем, и оценивает остаток (нормативы привязаны к минутам и гигапикселям).
+        try:
+            infos = [features.probe_media_info(Path(p)) for p in [spec.ref, *spec.dubs]]
+            with self._lock:
+                jj = self._items.get(jid)
+                if jj is not None:
+                    jj.ref_info = MediaInfo(**infos[0]) if infos[0] else None
+                    jj.dub_infos = [MediaInfo(**i) if i else MediaInfo() for i in infos[1:]]
+        except Exception as e:  # noqa: BLE001 — сведения для показа, работу не блокируют
+            logger.warning("conform {}: не удалось прочитать паспорта файлов: {}", jid, e)
         try:
             conform_episode(
                 spec.ref, spec.dubs, spec.out_dir,

@@ -528,7 +528,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     plot_dir+plot_stem (если заданы) → сырьё (npz+json). render_own=True → ещё и СВОЙ PNG/HTML
     графика band; render_own=False → conform рисует ЕДИНЫЙ график (зрение+аудио), band свой не рисует."""
     if progress is not None:
-        progress(0.0, "грубая кривая (band ±2.5с)")
+        progress(0.0, "широкое измерение сдвига")
     n_out = out.shape[0]
     T = make_T(n_out / sr_audio)              # сетка от РЕАЛЬНОЙ длины пары (любая длительность)
     _memlog('вход аудио-слоя')
@@ -577,7 +577,8 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     _memlog('после широкого измерения')
     off0 = _coarse_off0(oc, wc, spans=vision_spans, T=T)
     if progress is not None:
-        progress(0.25, f"карта {method} (следит за off0)")
+        progress(0.25, "измерение сдвига по частотным полосам" if method == "band"
+                       else "измерение сдвига моделью MuQ")
     # Тонкий проход (±0.7с) СЛЕДИТ за off0 — ПЕРЕИЗМЕРЯЕТ остаток на пред-варпленном дубле. Детектор
     # резов со-адаптирован с этим переизмерением (o И w) — статистикой поверх широкого прохода оно НЕ
     # заменяется (доказано на case/, см. ROADMAP recreate-sluh). Варпится ТОЛЬКО mono@MAP_SR: измеритель
@@ -600,7 +601,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     seglines, cuts = detect.detect(o, w, T=T)            # cuts = большие СТУПЕНИ (сдвиг опенинга)
     det_cuts = list(cuts)
     if progress is not None:
-        progress(0.65, "укладка")
+        progress(0.65, "построение кривой сдвига")
     # Кривая дрейфа (ГОРКИ) + варп. apply_cuts=True → разрыв+тишина в резах;
     # =False → ТОТ ЖЕ алгоритм, но резы НЕ передаём → ступень станет пандусом ≤SMAX (без тишины).
     cut_times = [float(tc) for tc, _ in det_cuts] if apply_cuts else []
