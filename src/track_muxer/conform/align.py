@@ -563,14 +563,14 @@ def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
         if not geom.available():
             return _none
         if progress is not None:
-            progress(Progress("geom", 0.0, "детект геометрии (кроп/зум/полосы)", di, dt, dnm))
+            progress(Progress("geom", 0.0, "оценка кадрирования и масштаба", di, dt, dnm))
         G = geom.consensus_G(Path(ref.src), Path(dub_audio))
         if G is None:
             return _none
         if keep_tmp and cache_dir is not None:
             cache_mod.save_geom(cache_dir, Path(ref.src), Path(dub_audio), G)
     if progress is not None:
-        progress(Progress("geom", 0.7, "пересборка SRM (коррекция)", di, dt, dnm))
+        progress(Progress("geom", 0.7, "пересчёт признаков кадров", di, dt, dnm))
 
     def _srm(video: Path, fps: float, crop: str) -> SrmFeatures:
         # tmp-чекпоинт кропнутого SRM (CK1 geom): повтор слепой пары без передекода
@@ -604,7 +604,7 @@ def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
     dsrm, fps_dub2, tcd = (_detelecine(dub2.srm, fps_dub, tmp_dir=_tctmp)
                            if ax_dub2 is None else (dub2.srm, fps_dub, dict(_no_tc)))
     if progress is not None:
-        progress(Progress("geom", 0.95, "грубый проход заново", di, dt, dnm))
+        progress(Progress("geom", 0.95, "повторное грубое соответствие", di, dt, dnm))
     off0, _, _, _ = (coarse_windowed if low_mem else coarse_robust)(dsrm, rsrm)
     return rsrm, dsrm, off0, G, fps_ref2, fps_dub2, tcr, tcd, ax_ref2, ax_dub2
 
@@ -726,13 +726,13 @@ def conform_features(
     _ck3 = (_load_align_ckpt(out_path, N, _astamp)
             if (keep_tmp and cache_dir is not None and not _is_tc) else None)
     cache_mod._a("CK3 зрение", _ck3 is not None, out_path.stem)        # реюз матчинга (пропуск GPU-матчинга)
-    _band_prog = ((lambda f: progress(Progress("band", f, "полоса Drop-DTW", di, dt, dnm)))
+    _band_prog = ((lambda f: progress(Progress("band", f, "сопоставление кадров в полосе поиска", di, dt, dnm)))
                   if progress is not None else None)
     if _ck3 is not None:
         pred, asg, cut_intervals = _ck3
     else:
         if progress is not None:
-            progress(Progress("coarse", 0.0, "грубый проход", di, dt, dnm))
+            progress(Progress("coarse", 0.0, "оценка общего смещения", di, dt, dnm))
         off0, _, n_keep, chain_aj0 = (coarse_windowed if low_mem else coarse_robust)(syn, refv)  # 3.2: длинные файлы
         # ── ГЕЙТ: грубый проход не нашёл структуру (n_keep≈0) → зрение слепнет от геом-рассинхрона
         #     (кроп/зум/анаморф/полосы) → геом-разбор + пересборка SRM с crop ДО отсечки «чужое видео». ──
@@ -758,7 +758,7 @@ def conform_features(
             N = len(syn)
             off0, _, n_keep, chain_aj0 = (coarse_windowed if low_mem else coarse_robust)(syn, refv)
         if progress is not None:
-            progress(Progress("band", 0.0, "полоса Drop-DTW", di, dt, dnm))
+            progress(Progress("band", 0.0, "сопоставление кадров в полосе поиска", di, dt, dnm))
         pred = band_align(syn, refv, off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
                           free_start=free_start, on_prog=_band_prog, chain_aj=chain_aj0,
                           chain_off=(off0[chain_aj0] if chain_aj0 is not None else None))
@@ -802,7 +802,7 @@ def conform_features(
             if _tcr is not None: tc_ref = _tcr
             if _tcd is not None: tc_dub = _tcd
             if progress is not None:
-                progress(Progress("band", 0.0, "полоса Drop-DTW (геом-повтор)", di, dt, dnm))
+                progress(Progress("band", 0.0, "сопоставление кадров после коррекции", di, dt, dnm))
             pred = band_align(syn, refv, off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
                               free_start=free_start, on_prog=_band_prog)
             if recover_edges:
@@ -830,7 +830,7 @@ def conform_features(
     # --- ВИДЕО-КАРТА анализатором зрения (ЕДИНСТВЕННЫЙ путь): детект ступеней + ломаная вместо
     #     ската. tg_s со ступенями на резах (без maximum.accumulate) — резы перекроет тишина ниже. ---
     if progress is not None:                                   # карта зрения быстрая → лид-ин к декоду аудио
-        progress(Progress("extract", 0.0, "карта зрения + аудио", di, dt, dnm))
+        progress(Progress("extract", 0.0, "декодирование звука исходного файла", di, dt, dnm))
     # Длина рефа: по VFR-оси = время последнего кадра + средний кадр (индекс/fps на VFR врёт).
     dur_ref = (float(ax_ref[-1]) + 1.0 / fps_ref) if ax_ref is not None else len(refv) / fps_ref
     cos_asg = _cos_anchors(syn, refv, pred, asg)   # cos якорей: вес анализатора зрения И единого графика
@@ -866,7 +866,7 @@ def conform_features(
         for s1 in range(0, n_out, BLK):
             s2 = min(s1 + BLK, n_out)
             if progress is not None:
-                progress(Progress("resample", s2 / max(1, n_out), "ресэмпл аудио", di, dt, dnm))
+                progress(Progress("resample", s2 / max(1, n_out), "перекладка звука на таймлайн референса", di, dt, dnm))
             src = np.interp(np.arange(s1, s2) / SR, grid, tg_s) * SR
             # Полоса [a1:a2] покрывает src. clamp в [0,n_aud] обязателен: карта (vision/любая)
             # может указывать ЗА пределы аудио дубля (дубль КОРОЧЕ рефа → хвостовые блоки src за
@@ -887,7 +887,7 @@ def conform_features(
         src = t_syn_at * SR; sg = np.arange(len(aud))
         out = np.empty((n_out, dub_ch), np.float32)
         if progress is not None:
-            progress(Progress("resample", 0.5, "ресэмпл аудио", di, dt, dnm))
+            progress(Progress("resample", 0.5, "перекладка звука на таймлайн референса", di, dt, dnm))
         for ch in range(dub_ch):
             out[:, ch] = warp_interp(aud[:, ch], src)        # sg=arange(len(aud)) → grid; GPU/CPU
         del aud, t_out, t_syn_at, src, sg   # 1.2: освобождаем крупные индекс-массивы сразу после ресэмпла
@@ -987,7 +987,7 @@ def conform_features(
     if anchor_on:
         from .anchor import apply as _anchor          # ленивый импорт: GPU+опц. transformers только при выборе
         if progress is not None:
-            progress(Progress("audio", 0.0, "доводка по аудио", di, dt, dnm))
+            progress(Progress("audio", 0.0, "звуковой анализ", di, dt, dnm))
         # CK4: кэш benv рефа (coarse_dtw) — реф переиспользуется между дублями эпизода/запусками (keep_tmp).
         _dsp_cache = (cache_mod.dsp_ref_path(cache_dir, ref.src, ref_atrack)
                       if (keep_tmp and cache_dir is not None and ref.src is not None) else None)
@@ -1171,13 +1171,13 @@ def _warnings(*, asg, n_syn, pred, fps_ref, fps_dub, dur_ref, real_cuts_s,
     exp = (fps_ref / fps_dub) if fps_dub else 1.0
     # — геометрия —
     if metrics["slope"] and abs(metrics["slope"] - exp) > 0.05:
-        w.append(f"масштаб подозрителен (наклон {metrics['slope']:.3f}, ждали {exp:.3f})")
+        w.append(f"ход времени {metrics['slope']:.3f} вместо ожидаемого {exp:.3f}")
     if metrics["mono"] > max(20, int(0.01 * len(asg))):
         w.append(f"нарушений монотонности {metrics['mono']}")
     # — покрытие видео —
     ap = 100.0 * len(asg) / max(1, n_syn)
     if ap < 85.0:
-        w.append(f"мало сопоставлено видео ({ap:.0f}%)")
+        w.append(f"сопоставлено лишь {ap:.0f}% кадров")
     d = np.diff(asg)
     if len(d):
         i = int(np.argmax(d)); gap_s = (int(d[i]) - 1) / fps_dub
@@ -1186,7 +1186,7 @@ def _warnings(*, asg, n_syn, pred, fps_ref, fps_dub, dur_ref, real_cuts_s,
     # — заливка / начало —
     ff = real_cuts_s / max(1e-6, dur_ref)
     if ff > 0.15:
-        w.append(f"много заливки рефом ({ff * 100:.0f}% длины)")
+        w.append(f"звуком референса заполнено {ff * 100:.0f}% длительности")
     if metrics["intro_s"] > 5.0:
         w.append(f"выпало/залито начало ~{metrics['intro_s']:.0f}с")
     # — аудио-слой band/muq (диагностика процесса по РЕАЛЬНЫМ метрикам слоя; на wav НЕ влияет) —
@@ -1195,13 +1195,13 @@ def _warnings(*, asg, n_syn, pred, fps_ref, fps_dub, dur_ref, real_cuts_s,
         cov = float(audio_info.get("audio_coverage", 0.0))                     # доля трека с надёжными якорями
         drift = float(audio_info.get("audio_drift_ms", 0.0))                   # непрерывный аудио-дрейф, мс
         if cov < 0.15:
-            w.append("аудио почти без опор (нет общей музыки/эффектов — проверить вручную)")
+            w.append("звуковому измерению почти не на что опереться: у файлов нет общего звука — проверьте результат")
         elif cov < 0.5:
-            w.append(f"аудио-опоры лишь на {cov * 100:.0f}% длины")
+            w.append(f"звуковое измерение имело опору лишь на {cov * 100:.0f}% длительности")
         if resid > 80.0:                                  # главный критерий проекта: место вне ±80мс
-            w.append(f"звук не сошёлся: остаток {resid:.0f}мс (> ±80мс)")
+            w.append(f"остаточное рассогласование {resid:.0f} мс — больше допустимых ±80 мс")
         if abs(drift) > 1000.0:
-            w.append(f"крупный аудио-дрейф {drift / 1000:+.1f}с (вероятно бракованный исходник/масштаб)")
+            w.append(f"сдвиг звука уходит на {drift / 1000:+.1f} с — вероятно, дефект исходного файла")
     return w
 
 
@@ -1318,7 +1318,7 @@ def _align_audio_only(
     if anchor_on:
         from .anchor import apply as _anchor
         if progress is not None:
-            progress(Progress("audio", 0.0, "аудио-only: слуховая укладка", di, dt, dnm))
+            progress(Progress("audio", 0.0, "звуковой анализ (файл без видеоряда)", di, dt, dnm))
         ap = ((lambda f, s: progress(Progress("audio", f, s, di, dt, dnm)))
               if progress is not None else None)
         _dsp_cache = (cache_mod.dsp_ref_path(cache_dir, ref.src, ref_atrack)
@@ -1346,7 +1346,7 @@ def _align_audio_only(
             warns.append(f"аудио-only: низкое покрытие якорями ({cov * 100:.0f}%) — "
                          f"слуху не за что держаться на большей части дорожки, проверить")
         if abs(audio_resid_ms) > 80.0:
-            warns.append(f"звук не сошёлся: остаток {audio_resid_ms:.0f}мс (> ±80мс)")
+            warns.append(f"остаточное рассогласование {audio_resid_ms:.0f} мс — больше допустимых ±80 мс")
 
     _wprog = ((lambda f: progress(Progress("write", f, out_path.name, di, dt, dnm)))
               if progress is not None else None)

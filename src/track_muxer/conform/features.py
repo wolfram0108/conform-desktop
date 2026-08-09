@@ -208,6 +208,53 @@ def probe_frame_count_hints(video: Path, ffprobe: str = FFPROBE) -> tuple[int | 
     return (nb if (nb and nb > 0) else None), avg
 
 
+def probe_media_info(path: Path, ffprobe: str = FFPROBE) -> dict:
+    """Паспорт файла ОДНОЙ пробой метаданных: длительность, кадр, частота, число кадров.
+
+    Нужен панели: показать, с чем работаем, и оценить остаток времени (нормативы
+    привязаны к минутам материала и к гигапикселям декода — см.
+    doc/reports/conform_standalone_build/PROGRESS_metrics_design.md).
+
+    Только метаданные, БЕЗ прохода по файлу: цена — доли секунды. Число кадров может
+    отсутствовать (VFR, битые заголовки) — тогда оценивается как длительность × частоту,
+    а если и частоты нет, остаётся None. Здесь это допустимо: величина идёт в оценку
+    времени, а не в укладку. Любая неудача → пустой словарь, вызывающий работает без него.
+
+    -> {duration_s, width, height, fps, frames, has_video}
+    """
+    r = procreg.run(
+        [ffprobe, "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames,duration"
+         ":format=duration", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    try:
+        data = json.loads(r.stdout or "{}")
+    except json.JSONDecodeError:
+        return {}
+    st = (data.get("streams") or [{}])[0]
+    fmt = data.get("format") or {}
+
+    def _f(x):
+        try:
+            v = float(x)
+            return v if v > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    dur = _f(st.get("duration")) or _f(fmt.get("duration"))
+    fps = _parse_fps(st.get("avg_frame_rate")) or _parse_fps(st.get("r_frame_rate"))
+    try:
+        frames = int(st.get("nb_frames"))
+    except (TypeError, ValueError):
+        frames = 0
+    if frames <= 0:
+        frames = int(dur * fps) if (dur and fps) else 0
+    w, h = st.get("width") or 0, st.get("height") or 0
+    return {"duration_s": dur or 0.0, "width": int(w), "height": int(h),
+            "fps": fps or 0.0, "frames": frames, "has_video": bool(w and h)}
+
+
 def probe_packet_count(video: Path, ffprobe: str = FFPROBE) -> int | None:
     """ЧЕСТНОЕ число видеопакетов — один проход по файлу БЕЗ декода пикселей.
 
