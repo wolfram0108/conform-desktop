@@ -214,77 +214,315 @@ async function enqueue() {
 
 /* ═══════════ очередь ═══════════ */
 const openDetails = new Set();          // какие строки раскрыты (переживает обновление)
+const openJobs = new Set();             // какие задачи развёрнуты
+
+/* Последовательность операций детерминирована, поэтому полосу прогресса можно
+   разложить заранее. Веса — РОВНО те, по которым ядро считает progress
+   (queue.py), иначе полоса и процент разойдутся.
+   Доля 0 — подготовка референса, одна на задачу; доли 1..N — аудиодорожки. */
+const REF_OPS = [{op: "decode", w: 85}, {op: "extract", w: 15}];
+const TRACK_OPS = [
+  {op: "decode",   w: 52},
+  {op: "coarse",   w:  3},
+  {op: "geom",     w:  7, opt: true},   // только если грубое сопоставление не удалось
+  {op: "band",     w: 16},
+  {op: "extract",  w: 10},
+  {op: "resample", w:  5},
+  {op: "audio",    w:  4},
+  {op: "write",    w:  3},
+];
+const opsOf = sliceI => (sliceI === 0 ? REF_OPS : TRACK_OPS);
+const opName = (sliceI, op) => t(sliceI === 0 ? "op.ref." + op : "op." + op);
+
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(sec || 0));
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
+  if (h) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+const jobDone = j => j.status === "done";
+const trackCount = j => j.dub_total || (j.dubs || []).length || 1;
+const sliceCount = j => 1 + trackCount(j);
+/* какая доля обрабатывается сейчас: 0 — референс, 1..N — дорожка */
+const curSlice = j => j.status === "running" ? (j.dub_index || 0) : -1;
+
+/* Состояние операции берётся из журнала ядра (job.ops), а не угадывается по
+   текущему этапу: только журнал знает, была ли необязательная операция пропущена. */
+function opState(j, sliceI, op) {
+  const rec = (j.ops || []).find(o => o.slice_i === sliceI && o.op === op);
+  if (rec) return {state: rec.state === "run" ? "run" : rec.state, sec: rec.sec};
+  // Записи нет — операция либо ещё предстоит, либо была пропущена. Пропущена, если
+  // доля уже позади ИЛИ внутри неё началась операция, идущая ПОЗЖЕ по порядку.
+  const logged = (j.ops || []).length > 0;
+  if (!logged) return {state: "pending", sec: 0};   // журнала нет (задача из старой версии)
+  const cur = curSlice(j);
+  if (jobDone(j) || (cur >= 0 && sliceI < cur)) return {state: "skipped", sec: 0};
+  const order = opsOf(sliceI).map(o => o.op);
+  const reached = (j.ops || []).filter(o => o.slice_i === sliceI)
+                               .some(o => order.indexOf(o.op) > order.indexOf(op));
+  return {state: reached ? "skipped" : "pending", sec: 0};
+}
+
+function trackResult(j, sliceI) {          // результаты приходят в порядке обработки дорожек
+  return (j.results || [])[sliceI - 1] || null;
+}
 
 function jobDot(status, results) {
   if (status === "running") return "run";
-  if (status === "done") return results.some(r => !r.ok) ? "crit" : "ok";
+  // отказ ОДНОЙ дорожки не делает задачу сбойной: остальные обработаны
+  if (status === "done") return results.every(r => !r.ok) ? "crit"
+                              : results.some(r => !r.ok) ? "warn" : "ok";
   if (status === "failed") return "crit";
-  return "";
+  return "wait";
 }
+
+const barSizes = new ResizeObserver(es => es.forEach(e => {
+  const card = e.target.closest(".job");
+  if (card) layoutBar(card);
+}));
+
+/* Карточки живут между обновлениями: полностью пересобираются только при смене
+   «скелета» (состояние, число долей, число результатов), иначе обновляются на месте.
+   Иначе список пересоздавался бы раз в секунду и срывал клики по кнопкам. */
+const cards = new Map();
+const cardSig = j => [j.status, sliceCount(j), (j.results || []).length].join("|");
 
 function renderJobs(jobs) {
   const box = $("#jobs");
-  box.innerHTML = "";
-  if (!jobs.length) { box.append(el("div", "empty", t("q.empty"))); return; }
-  // каждая карточка — отдельно: ошибка отрисовки ОДНОЙ задачи не должна прятать
-  // остальные (контейнер уже очищен, и пользователь увидел бы пустую очередь)
-  [...jobs].reverse().forEach(j => {
+  if (!jobs.length) { box.replaceChildren(el("div", "empty", t("q.empty"))); cards.clear(); return; }
+  const order = [...jobs].reverse();
+  const alive = new Set(order.map(j => j.id));
+  for (const [id, card] of cards) if (!alive.has(id)) { card.remove(); cards.delete(id); }
+
+  order.forEach((j, i) => {
+    let card = cards.get(j.id);
     try {
-      box.append(jobCard(j));
+      if (!card || card.dataset.sig !== cardSig(j)) {
+        const fresh = jobCard(j);
+        fresh.dataset.sig = cardSig(j);
+        if (card) card.replaceWith(fresh); else box.append(fresh);
+        cards.set(j.id, fresh);
+        card = fresh;
+        layoutBar(card);
+        const bar = card.querySelector(".pbar");
+        if (bar) barSizes.observe(bar);   // подача подписей меняется вместе с шириной окна
+      } else if (card.update) {
+        card.update(j);
+      }
     } catch (e) {
+      // ошибка отрисовки ОДНОЙ задачи не должна прятать остальные
       console.error("не удалось отрисовать задачу", j && j.id, e);
       const stub = el("div", "job");
-      stub.append(el("span", "dot crit"), el("span", "jname", (j && (j.label || j.id)) || "?"),
+      stub.append(el("span", "dot crit"), el("span", "nm", (j && (j.label || j.id)) || "?"),
                   el("span", "metrics", t("q.render_error")));
-      box.append(stub);
+      if (card) card.replaceWith(stub); else box.append(stub);
+      cards.set(j.id, stub);
+      card = stub;
+    }
+    if (box.children[i] !== card) box.insertBefore(card, box.children[i] || null);
+  });
+}
+
+/* ── полоса: одна доля на референс + по доле на дорожку, внутри — операции ── */
+function progressBar(j) {
+  const slices = sliceCount(j), cur = curSlice(j);
+  const bar = el("div", "pbar" + (jobDone(j) ? " done" : ""));
+  bar.dataset.slices = slices;
+  for (let s = 0; s < slices; s++) {
+    if (s) bar.append(el("div", "brk"));
+    const res = trackResult(j, s);
+    const failed = s > 0 && res && !res.ok;      // отказ дорожки не касается остальных
+    const reused = s > 0 && res && res.ok && res.skipped;   // выход уже был на диске
+    opsOf(s).forEach(o => {
+      const seg = el("div", "op");
+      seg.style.setProperty("--w", o.w);
+      const st = opState(j, s, o.op);
+      let tip = (s === 0 ? t("q.reference") : t("q.track_n", {n: s})) + " · " + opName(s, o.op);
+      if (reused) { seg.classList.add("skip"); tip += " — " + t("op.reused"); }
+      else if (failed) { seg.classList.add("err"); tip += " — " + t("d.track_failed"); }
+      else if (st.state === "done") { seg.classList.add("done"); tip += " · " + fmtDur(st.sec); }
+      else if (st.state === "failed") seg.classList.add("err");
+      else if (st.state === "skipped") { seg.classList.add("skip"); tip += " — " + t("op.skipped"); }
+      else if (st.state === "run") {
+        seg.classList.add("run");
+        const f = el("i");
+        f.style.width = Math.round((j.stage_pct || 0) * 100) + "%";
+        seg.append(f);
+      }
+      seg.title = tip;
+      bar.append(seg);
+    });
+  }
+  return bar;
+}
+
+/* Подписи долей. Текст расставляет layoutBar — он один знает, сколько досталось места. */
+function sliceLabels(j) {
+  const slices = sliceCount(j);
+  const row = el("div", "tnums");
+  row.dataset.cur = curSlice(j);
+  for (let s = 0; s < slices; s++) {
+    if (s) row.append(el("i"));
+    const res = trackResult(j, s);
+    const cell = el("span", (curSlice(j) === s) ? "cur" : (s > 0 && res && !res.ok) ? "bad" : "");
+    cell.style.flex = "100 1 0%";
+    cell.title = s === 0 ? t("q.ref_prep") : trackTitle(j, s);
+    row.append(cell);
+  }
+  return row;
+}
+
+/* Чем меньше места на долю, тем короче подпись — иначе при двадцати дорожках
+   ярлыки налезут друг на друга. Решение по ИЗМЕРЕННОЙ ширине, не по ширине окна. */
+function layoutBar(card) {
+  const bar = card.querySelector(".pbar"); if (!bar) return;
+  const slices = +bar.dataset.slices || 1;
+  const per = (bar.clientWidth || 1) / slices;
+  const lvl = per >= 88 ? 1 : per >= 30 ? 2 : per >= 10 ? 3 : 4;
+  const setLvl = n => { n.classList.remove("lvl1", "lvl2", "lvl3", "lvl4"); n.classList.add("lvl" + lvl); };
+  setLvl(bar);
+  const nums = card.querySelector(".tnums"); if (!nums) return;
+  setLvl(nums);
+  const cur = +nums.dataset.cur;
+  const tracks = slices - 1;
+  [...nums.children].filter(n => n.tagName === "SPAN").forEach((cell, s) => {
+    cell.replaceChildren();
+    if (lvl === 1) cell.textContent = s === 0 ? t("q.reference") : t("q.track_n", {n: s});
+    else if (lvl === 2) cell.textContent = s === 0 ? t("q.ref_short") : String(s);
+    else if (cur >= 0 && s === cur) {
+      const tag = el("em", null, s === 0 ? t("q.reference") : t("q.track_of", {i: s, n: tracks}));
+      if (s <= 1) tag.className = "l"; else if (s >= slices - 2) tag.className = "r";
+      cell.append(tag);
     }
   });
 }
 
-function jobCard(j) {
-  const card = el("div", "job");
-  const row = el("div", "jrow");
-  row.append(el("span", "dot " + jobDot(j.status, j.results || [])));
-  row.append(el("span", "jname", j.label || j.id));
-
-  const meta = el("span", "jmeta");
+/* ── одна строка статуса: что идёт, у какой дорожки, сколько потрачено ── */
+function statusLine(j) {
+  const line = el("div", "stat");
+  const tail = el("span", "tm");
   if (j.status === "running") {
-    const bits = [];
-    if (j.stage) bits.push(t("stage." + j.stage));
-    if (j.dub_total) bits.push(t("q.dub_of", {i: j.dub_index, n: j.dub_total}));
-    if (j.cur_dub) bits.push(baseName(j.cur_dub));
-    meta.textContent = bits.join(" · ");
+    const s = j.dub_index || 0;
+    line.append(el("span", "pulse"),
+      el("span", "op", j.stage ? opName(s, j.stage) : "…"),
+      el("span", "of", [s === 0 ? t("q.ref_prep") : t("q.track_of", {i: s, n: trackCount(j)}),
+                        j.detail].filter(Boolean).join(" · ")));
+    const parts = [t("q.elapsed", {v: fmtDur(j.elapsed_s)})];
+    if (j.progress > 0.02 && j.progress < 1) {          // грубая оценка по уже пройденному
+      parts.push("~ " + fmtDur(j.elapsed_s * (1 - j.progress) / j.progress));
+    }
+    tail.textContent = parts.join(" · ");
   } else if (j.status === "done") {
-    const res = j.results || [], ok = res.filter(r => r.ok).length;
-    // задача, где НИ ОДНА озвучка не удалась, не должна выглядеть выполненной:
-    // раньше она подписывалась «готово · 0/1 ok» и читалась как успех
-    const head = res.length && ok === 0 ? t("q.done_failed") : t("q.done");
-    meta.textContent = `${head} · ${Math.round(j.elapsed_s)} ${t("unit.s")} · ${ok}/${res.length} ok`;
-    if (res.length && ok === 0) meta.style.color = "var(--crit)";
+    const res = j.results || [];
+    const bad = res.filter(r => !r.ok).length;
+    const review = res.filter(r => r.ok && (r.suspect || (r.critical || []).length)).length;
+    const extra = [bad ? t("q.with_errors", {n: bad}) : "",
+                   review ? t("q.need_review", {n: review}) : ""].filter(Boolean);
+    if (bad) line.classList.add(bad === res.length ? "crit" : "part");
+    line.append(el("span", "op", bad ? t("q.finished_part") : t("q.finished")),
+      el("span", "of", [t("q.ready_of", {ok: res.length - bad, n: res.length}), ...extra].join(" · ")));
+    tail.textContent = t("q.took", {v: fmtDur(j.elapsed_s)});
   } else if (j.status === "failed") {
-    meta.textContent = t("q.failed") + (j.error ? " · " + j.error.slice(0, 80) : "");
+    line.classList.add("crit");
+    line.append(el("span", "op", j.stage ? t("q.failed_at", {op: opName(j.dub_index || 0, j.stage)})
+                                         : t("q.failed_plain")),
+                el("span", "of", j.error || ""));
+    tail.textContent = t("q.elapsed", {v: fmtDur(j.elapsed_s)});
   } else {
-    meta.textContent = t("q." + j.status) + " · " + (j.dub_total || 0);
+    const head = {queued: "q.in_queue", paused: "q.on_hold", cancelled: "q.was_cancelled"}[j.status];
+    line.append(el("span", "op", t(head || "q.in_queue")),
+      el("span", "of", [t("q.tracks_count", {n: trackCount(j)}),
+                        j.status === "queued" ? t("q.will_start") : ""].filter(Boolean).join(" · ")));
+    if (j.elapsed_s) tail.textContent = t("q.elapsed", {v: fmtDur(j.elapsed_s)});
   }
-  row.append(meta);
+  line.append(tail);
+  return line;
+}
 
-  if (j.status === "running") {
-    const bar = el("span", "bar"); const fill = el("i");
-    fill.style.width = Math.round((j.progress || 0) * 100) + "%";
-    bar.append(fill); row.append(bar);
-    row.append(el("span", "metrics", Math.round((j.progress || 0) * 100) + "%"));
-  }
+/* ── скрываемое: имя, состояние и время КАЖДОЙ операции ── */
+function opsList(j, sliceI) {
+  const grid = el("div", "ops");
+  const res = trackResult(j, sliceI);
+  const reused = sliceI > 0 && res && res.ok && res.skipped;
+  opsOf(sliceI).forEach(o => {
+    const st = reused ? {state: "reused", sec: 0} : opState(j, sliceI, o.op);
+    const mark = {done: "✓", run: "◐", failed: "✕", skipped: "⌀", reused: "⌀", pending: "·"}[st.state];
+    const cls = {done: "ok", run: "run", failed: "err"}[st.state] || "";
+    const nm = o.opt && st.state === "pending" ? t("op.optional", {op: opName(sliceI, o.op)})
+                                               : opName(sliceI, o.op);
+    let val = t("op.pending");
+    if (st.state === "done" || st.state === "failed") val = fmtDur(st.sec);
+    else if (st.state === "skipped") val = t("op.skipped");
+    else if (st.state === "reused") val = t("op.reused");
+    else if (st.state === "run") {
+      val = Math.round((j.stage_pct || 0) * 100) + " %" + (j.detail ? " · " + j.detail : "");
+    }
+    grid.append(el("div", "st " + cls, mark),
+                el("div", "nmc " + (st.state === "run" ? "now" : st.state === "pending" ? "fut" : ""), nm),
+                el("div", "tmc " + (st.state === "run" ? "live" : ""), val));
+  });
+  return grid;
+}
 
-  if (j.status === "paused") row.append(rowBtn("▶", t("q.start"), () => act("start", j.id)));
-  if (j.status === "queued") row.append(rowBtn("⏸", t("q.pause"), () => act("pause", j.id)));
-  row.append(rowBtn("✕", t("q.cancel"), () => act("cancel", j.id)));
-  card.append(row);
+function trackTitle(j, sliceI) {
+  const res = trackResult(j, sliceI);
+  const path = (res && res.dub) || (j.dubs || [])[sliceI - 1] || "";
+  const atr = (j.dub_atracks || [])[sliceI - 1];
+  const num = (atr == null ? 0 : atr) + 1;
+  return t("q.track_n", {n: sliceI}) + " · " + baseName(path) + (num > 1 ? " · #" + num : "");
+}
 
-  if ((j.results || []).length) {
-    const sub = el("div", "subrows");
-    j.results.forEach(r => sub.append(dubRow(j, r)));
-    card.append(sub);
-  }
+function jobCard(j) {
+  const card = el("div", "job" + (j.status === "running" ? " act" : ""));
+  const head = el("div", "head");
+  head.append(el("span", "dot " + jobDot(j.status, j.results || [])),
+              el("span", "nm", j.label || baseName(j.ref) || j.id));
+  head.append(el("span", "pct", j.status === "running" ? Math.round((j.progress || 0) * 100) + " %" : ""));
+
+  const caret = el("button", "caret", openJobs.has(j.id) ? "▾" : "▸");
+  caret.title = t("d.details");
+  head.append(caret);
+  if (j.status === "paused") head.append(rowBtn("▶", t("q.start"), () => act("start", j.id)));
+  if (j.status === "queued") head.append(rowBtn("⏸", t("q.pause"), () => act("pause", j.id)));
+  head.append(rowBtn("✕", t("q.cancel"), () => act("cancel", j.id)));
+
+  card.append(head, sliceLabels(j), progressBar(j), statusLine(j));
+
+  const more = el("div", "more" + (openJobs.has(j.id) ? " on" : ""));
+  const opsSliceOf = jj => { const s = curSlice(jj); return Math.max(0, s >= 0 ? s : (jj.results || []).length); };
+  const opsHead = el("p", "sub");
+  const opsBox = el("div");
+  const fillOps = jj => {
+    const s = opsSliceOf(jj);
+    opsHead.textContent = t("q.ops_of", {who: s === 0 ? t("q.ref_prep") : trackTitle(jj, s)});
+    opsBox.replaceChildren(opsList(jj, s));
+  };
+  fillOps(j);
+  more.append(el("p", "sub", t("q.reference")), el("div", "hint", j.ref), opsHead, opsBox);
+  more.append(el("p", "sub", jobDone(j) ? t("q.results") : t("q.tracks_n", {n: trackCount(j)})));
+  const list = el("div", "trks");
+  for (let i = 1; i <= trackCount(j); i++) list.append(trackRow(j, i));
+  more.append(list);
+
+  // обновление на месте: скелет тот же, меняются только числа и состояния
+  card.update = jj => {
+    card.classList.toggle("act", jj.status === "running");
+    head.querySelector(".pct").textContent =
+      jj.status === "running" ? Math.round((jj.progress || 0) * 100) + " %" : "";
+    card.replaceChild(progressBar(jj), card.querySelector(".pbar"));
+    card.replaceChild(statusLine(jj), card.querySelector(".stat"));
+    layoutBar(card);
+    if (more.classList.contains("on")) fillOps(jj);
+  };
+
+  caret.onclick = () => {
+    const on = more.classList.toggle("on");
+    caret.textContent = on ? "▾" : "▸";
+    on ? openJobs.add(j.id) : openJobs.delete(j.id);
+    if (on) fillOps(j);
+  };
+  card.append(more);
   return card;
 }
 
@@ -295,32 +533,44 @@ function rowBtn(txt, title, fn) {
   return b;
 }
 
-function dubRow(job, r) {
-  const wrap = el("div");
-  const level = (r.critical && r.critical.length) || !r.ok ? "crit" : (r.suspect ? "warn" : "");
-  const row = el("div", "drow " + level);
-  row.append(el("span", "dot " + (level || "ok")));
-  const name = el("span", "name", baseName(r.out_path || r.dub));
-  name.title = r.out_path || r.dub;
-  name.style.cssText = "flex:1;min-width:60px;font-family:Cascadia Mono,Consolas,monospace;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
-  row.append(name);
-  if (r.mode === "audio") row.append(el("span", "tag", t("dub.audio_only")));
-  if (r.skipped) row.append(el("span", "tag", t("d.skipped")));
-  if (r.ok) row.append(el("span", "metrics",
-    t("d.resid", {v: (r.audio_resid_ms || 0).toFixed(1)}) + " · " + t("d.coverage", {v: (r.audio_coverage || 0).toFixed(2)})));
-  if (level === "warn") { const w = el("span", "metrics", t("d.suspect")); w.style.color = "var(--warn)"; w.title = (r.warnings || []).join("\n"); row.append(w); }
-  if (level === "crit") {
-    // ⚠ пустой массив в JS «истинный»: выражение (r.critical || [r.error])[0] брало
-    // ПУСТОЙ critical, давало undefined и роняло отрисовку — а вместе с ней ВЕСЬ список
-    // очереди (контейнер уже очищен). Ломалась ровно та задача, у которой была ошибка.
-    const msg = (r.critical && r.critical.length ? r.critical[0] : r.error) || t("d.failed");
-    const w = el("span", "metrics", String(msg).slice(0, 60));
-    w.style.color = "var(--crit)"; w.title = r.error || String(msg); row.append(w);
-  }
+/* Строка дорожки: два исхода — результат или причина отказа. Дорожка, которой
+   ещё нет в results, показывается ожидающей или обрабатываемой. */
+function trackRow(job, sliceI) {
+  const r = trackResult(job, sliceI);
+  const cur = curSlice(job);
+  const wrap = el("div", "trk");
+  const line = el("div", "tline");
 
-  const key = job.id + "|" + r.dub + "|" + (r.out_path || "");
-  const detail = el("div", "detail" + (openDetails.has(key) ? " on" : ""));
-  if (r.ok) {
+  const failed = r && !r.ok;
+  const review = r && r.ok && (r.suspect || (r.critical || []).length);
+  const dot = failed ? "crit" : review ? "warn" : r ? "ok" : (cur === sliceI ? "run" : "wait");
+  line.append(el("span", "dot " + dot));
+
+  const path = (r && r.dub) || (job.dubs || [])[sliceI - 1] || "";
+  const atr = (job.dub_atracks || [])[sliceI - 1];
+  const who = el("span", "who");
+  who.append(el("b", null, t("q.track_n", {n: sliceI})),
+             el("s", null, " " + baseName(path) + (atr ? " · #" + (atr + 1) : "")));
+  who.title = path;
+  line.append(who);
+
+  if (r && r.ok) {
+    line.append(el("span", "val",
+      t("d.resid", {v: (r.audio_resid_ms || 0).toFixed(1)}) + " · " +
+      t("d.coverage", {v: (r.audio_coverage || 0).toFixed(2)})));
+  } else if (failed) {
+    line.append(el("span", "val bad", t("d.track_failed")));
+  } else {
+    line.append(el("span", "val", cur === sliceI ? t("d.track_running") : t("d.track_waiting")));
+  }
+  if (r && r.mode === "audio") line.append(el("span", "pill", t("dub.audio_only")));
+  if (r && r.skipped) line.append(el("span", "pill", t("d.skipped")));
+
+  const detail = el("div", "detail");
+  if (r && r.ok) {
+    const key = job.id + "|" + r.dub + "|" + (r.out_path || "");
+    if (openDetails.has(key)) detail.classList.add("on");
+    const push = el("span", "push");
     const more = el("button", "link", (openDetails.has(key) ? "▾ " : "▸ ") + t("d.details"));
     more.onclick = () => {
       const on = detail.classList.toggle("on");
@@ -328,15 +578,41 @@ function dubRow(job, r) {
       more.textContent = (on ? "▾ " : "▸ ") + t("d.details");
       if (on && !detail.dataset.built) buildDetail(detail, job, r);
     };
-    row.append(more);
+    push.append(more);
+    if (r.out_path) {
+      const f = el("button", "link", t("d.folder"));
+      f.onclick = () => api("POST", "/ui/reveal", {path: r.out_path}).catch(() => {});
+      push.append(f);
+    }
+    line.append(push);
     if (openDetails.has(key)) buildDetail(detail, job, r);
   }
-  if (r.out_path) {
-    const f = el("button", "link", t("d.folder"));
-    f.onclick = () => api("POST", "/ui/reveal", {path: r.out_path}).catch(() => {});
-    row.append(f);
+  wrap.append(line);
+
+  // причина отказа стоит ПРИ своей дорожке, а не общим журналом внизу
+  if (failed) {
+    // ⚠ пустой массив в JS «истинный»: выражение (r.critical || [r.error])[0] брало
+    // ПУСТОЙ critical, давало undefined и роняло отрисовку — а с ней и весь список.
+    const msg = (r.critical && r.critical.length ? r.critical[0] : r.error) || t("d.failed");
+    wrap.append(el("div", "terr", String(msg)));
   }
-  wrap.append(row, detail);
+  // находки — своей строкой под дорожкой, к которой относятся
+  const pills = [];
+  if (r && r.ok) {
+    if (r.geom_used) pills.push({t: t("f.geom", {sx: (r.geom_sx || 0).toFixed(3)})});
+    if (r.audio_cuts) pills.push({t: t("f.cuts", {n: r.audio_cuts, ms: Math.round(r.audio_max_step_ms)})});
+    if (r.filled_cuts) pills.push({t: t("f.filled", {n: r.filled_cuts})});
+    if (r.blind_zones) pills.push({t: t("f.blind", {n: r.blind_zones}), c: "w"});
+    (r.warnings || []).forEach(w => pills.push({t: w, c: "w"}));
+    (r.critical || []).forEach(w => pills.push({t: w, c: "c"}));
+    if (r.out_path) pills.push({t: baseName(r.out_path)});
+  }
+  if (pills.length) {
+    const box = el("div", "tpills");
+    pills.forEach(p => box.append(el("span", "pill " + (p.c || ""), p.t)));
+    wrap.append(box);
+  }
+  wrap.append(detail);
   return wrap;
 }
 

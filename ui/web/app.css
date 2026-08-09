@@ -149,28 +149,114 @@ select { width:auto; max-width:420px; }
 .num .steps button:hover { background:var(--thumb); color:var(--acc); }
 .num .steps button:active { background:var(--acc); color:var(--acc-ink); }
 
-/* ── очередь ── */
-.qhead { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
-.job { border:1px solid var(--bd); border-radius:var(--r); background:var(--panel); margin-bottom:10px; overflow:hidden; }
-.job > .jrow { display:flex; align-items:center; gap:12px; padding:10px 14px; }
+/* ── очередь ──
+   Задача в свёрнутом виде — ТРИ строки при любом числе дорожек: имя и доля,
+   единый прогресс из операций, одна строка статуса. Подробность скрыта.
+   Колонок нет: тянется только полоса, тексты сжимаются многоточием. */
+.qhead { display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap; }
+.job { border:1px solid var(--bd); border-radius:var(--r); background:var(--panel);
+       margin-bottom:8px; padding:10px 12px; }
+.job.act { border-color:color-mix(in srgb, var(--acc) 45%, var(--bd)); }
+.head { display:flex; align-items:center; gap:8px; min-width:0; }
+.head .nm { font-weight:600; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.head .pct { margin-left:auto; font-size:13px; color:var(--muted); font-variant-numeric:tabular-nums; }
+.caret { width:20px; height:20px; border:none; background:none; color:var(--muted);
+         font-size:11px; padding:0; flex:none; }
 .dot { width:9px; height:9px; border-radius:50%; flex:none; background:var(--muted); }
 .dot.run { background:var(--acc); box-shadow:0 0 0 3px color-mix(in srgb, var(--acc) 25%, transparent); }
 .dot.ok { background:var(--ok); }
 .dot.warn { background:var(--warn); }
 .dot.crit { background:var(--crit); }
-.jname { font-weight:600; max-width:280px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.jmeta { color:var(--muted); font-size:12px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.bar { flex:0 0 190px; height:8px; background:var(--thumb); border:1px solid var(--bd-soft); border-radius:5px; overflow:hidden; }
-.bar > i { display:block; height:100%; background:var(--acc); }
-.subrows { border-top:1px solid var(--bd-soft); background:var(--win); }
-.drow { display:flex; align-items:center; gap:12px; padding:9px 14px 9px 32px; border-bottom:1px solid var(--bd-soft); }
-.drow:last-child { border-bottom:none; }
-.drow.warn { background:var(--warn-bg); border-left:3px solid var(--warn); }
-.drow.crit { background:var(--crit-bg); border-left:3px solid var(--crit); }
+.dot.wait { background:transparent; border:1.5px solid var(--muted); }
+
+/* ЕДИНЫЙ прогресс: доля 0 — референс, далее по доле на дорожку; внутри — операции.
+   Две границы, и путать их нельзя: операция — волосяная линия, дорожка — разрыв полосы. */
+.pbar { display:flex; height:12px; margin:1px 0 5px; border-radius:6px; overflow:hidden;
+        background:var(--bd-soft); }
+.pbar .op { flex:var(--w) 1 0%; min-width:2px; background:var(--thumb); position:relative; }
+.pbar .op + .op { border-left:1px solid color-mix(in srgb, var(--win) 55%, transparent); }
+.pbar .op.done { background:color-mix(in srgb, var(--acc) 78%, var(--panel)); }
+.pbar .op.run { background:color-mix(in srgb, var(--acc) 18%, var(--panel)); }
+.pbar .op.run i { position:absolute; left:0; top:0; bottom:0; background:var(--acc); }
+.pbar .op.skip { background:repeating-linear-gradient(135deg, var(--thumb) 0 3px, var(--bd-soft) 3px 6px); }
+.pbar .op.err { background:var(--crit); }
+.pbar.done .op { background:var(--ok); }
+.pbar.done .op.err { background:var(--crit); }      /* сбойная дорожка среди готовых */
+.pbar .brk { flex:0 0 5px; min-width:5px; background:var(--panel);
+             border-left:1px solid var(--bd); border-right:1px solid var(--bd); }
+/* чем меньше места на долю, тем короче подача — иначе подписи налезут друг на друга */
+.pbar.lvl3 .op, .pbar.lvl4 .op { min-width:0; }
+.pbar.lvl3 .op + .op { border-left-color:color-mix(in srgb, var(--win) 30%, transparent); }
+.pbar.lvl4 .op + .op { border-left:none; }
+.pbar.lvl3 .brk, .pbar.lvl4 .brk { flex:0 0 2px; min-width:2px; border:none; }
+
+.tnums { display:flex; margin-top:7px; height:15px; font-size:10px; color:var(--muted); }
+.tnums span { flex:100 1 0%; min-width:0; text-align:center; white-space:nowrap;
+              overflow:hidden; position:relative; }
+.tnums span.cur { color:var(--acc); font-weight:600; }
+.tnums span.bad { color:var(--crit); }
+.tnums i { flex:0 0 5px; }
+.tnums.lvl3 i, .tnums.lvl4 i { flex:0 0 2px; }
+.tnums.lvl3 span, .tnums.lvl4 span { overflow:visible; }
+.tnums em { position:absolute; bottom:0; left:50%; transform:translateX(-50%); font-style:normal;
+            white-space:nowrap; color:var(--acc); font-weight:600; background:var(--panel); padding:0 3px; }
+.tnums em.l { left:0; transform:none; }
+.tnums em.r { left:auto; right:0; transform:none; }
+
+/* ОДНА строка статуса */
+.stat { display:flex; align-items:baseline; gap:7px; min-width:0; font-size:12px; }
+.stat .op { font-weight:600; white-space:nowrap; }
+.stat .of { color:var(--muted); min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.stat .tm { margin-left:auto; padding-left:8px; color:var(--muted); white-space:nowrap;
+            font-variant-numeric:tabular-nums; }
+.stat.crit .op { color:var(--crit); }
+.stat.part .op { color:var(--warn); }              /* завершена, но дорожка отказала */
+.pulse { width:6px; height:6px; border-radius:50%; background:var(--acc); flex:none;
+         align-self:center; animation:pulse 1.4s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity:.25 } 50% { opacity:1 } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation:none; opacity:.85 } }
+
+/* скрываемая подробность */
+.more { display:none; margin-top:10px; padding-top:10px; border-top:1px solid var(--bd-soft); }
+.more.on { display:block; }
+.sub { font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.04em;
+       margin:14px 0 6px; }
+.more > .sub:first-child { margin-top:0; }
+.ops { display:grid; grid-template-columns:auto 1fr auto; gap:2px 10px; align-items:baseline; font-size:12px; }
+.ops .st { width:1.1em; text-align:center; color:var(--muted); }
+.ops .st.ok { color:var(--ok); } .ops .st.run { color:var(--acc); } .ops .st.err { color:var(--crit); }
+.ops .nmc { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ops .nmc.now { color:var(--acc); font-weight:600; }
+.ops .nmc.fut { color:var(--muted); }
+.ops .tmc { color:var(--muted); font-variant-numeric:tabular-nums; white-space:nowrap; }
+.ops .tmc.live { color:var(--ink); }
+
+.trks { max-height:290px; overflow:auto; }
+.trk { padding:6px 0; font-size:12px; border-bottom:1px solid var(--bd-soft); }
+.trk:last-child { border-bottom:none; }
+.tline { display:flex; align-items:center; gap:8px; min-width:0; }
+/* имя дорожки не должно схлопываться до нуля в узком окне: сжимаются метрики */
+.tline .who { flex:1 1 auto; min-width:6.5em; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.tline .who s { text-decoration:none; color:var(--muted); }
+.tline .val { flex:0 1 auto; min-width:0; color:var(--muted); white-space:nowrap;
+              overflow:hidden; text-overflow:ellipsis; font-variant-numeric:tabular-nums; }
+.tline .val.bad { color:var(--crit); }
+.push { margin-left:auto; display:flex; gap:4px; align-items:center; flex:none; }
+.tpills { display:flex; gap:5px; flex-wrap:wrap; margin-top:4px; padding-left:17px; }
+.pill { display:inline-block; padding:1px 8px; border:1px solid var(--bd-soft); border-radius:11px;
+        background:var(--win); color:var(--muted); font-size:11px; white-space:nowrap; }
+.pill.w { color:var(--warn); background:var(--warn-bg);
+          border-color:color-mix(in srgb, var(--warn) 45%, var(--bd-soft)); }
+.pill.c { color:var(--crit); background:var(--crit-bg);
+          border-color:color-mix(in srgb, var(--crit) 45%, var(--bd-soft)); }
+.terr { margin:4px 0 0 17px; padding:5px 8px; font-size:11px; color:var(--crit);
+        background:var(--crit-bg); border-radius:5px;
+        border:1px solid color-mix(in srgb, var(--crit) 30%, var(--bd-soft)); }
+
 .metrics { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; white-space:nowrap; }
-.link { background:none; border:none; color:var(--acc); font-size:13px; padding:2px 4px; }
+.link { background:none; border:none; color:var(--acc); font-size:12px; padding:2px 4px; white-space:nowrap; }
 .link:hover { text-decoration:underline; }
-.detail { padding:12px 14px 14px 32px; background:var(--win); border-top:1px dashed var(--bd-soft); display:none; }
+.detail { display:none; padding:8px 0 4px 17px; }
 .detail.on { display:block; }
 .mgrid { display:grid; grid-template-columns:repeat(auto-fill, minmax(150px,1fr)); gap:8px 20px; margin-bottom:12px; }
 .mcell b { display:block; font-size:11px; color:var(--muted); font-weight:500; text-transform:uppercase; letter-spacing:.04em; }
