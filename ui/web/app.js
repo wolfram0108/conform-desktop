@@ -234,6 +234,71 @@ const TRACK_OPS = [
 const opsOf = sliceI => (sliceI === 0 ? REF_OPS : TRACK_OPS);
 const opName = (sliceI, op) => t(sliceI === 0 ? "op.ref." + op : "op." + op);
 
+/* Нормативы скорости — ЗАМЕРЫ на двух материалах, см.
+   doc/reports/conform_standalone_build/PROGRESS_metrics_design.md §3.
+   Звуковые операции почти не зависят от материала (с на минуту), декод зависит
+   от разрешения и нормируется на пиксели (с на гигапиксель). */
+const RATE_PER_MIN = {coarse: 0.20, band: 0.70, extract: 0.29, resample: 0.35, audio: 0.43, write: 0.48};
+const decodeRate = h => h >= 1500 ? 0.55 : h >= 900 ? 0.80 : 0.43;   // с / гигапиксель
+const GEOM_SHARE = 0.2;              // геометрия ≈ пятая часть декода (замер: 2:18 против 12:40)
+
+function opCost(op, info, fallback) {
+  const m = ((info && info.duration_s) || (fallback && fallback.duration_s) || 0) / 60;
+  if (op === "decode" || op === "geom") {
+    if (!info || !info.frames || !info.width) return 0;
+    const gpix = info.frames * info.width * info.height / 1e9;
+    const c = gpix * decodeRate(info.height);
+    return op === "geom" ? c * GEOM_SHARE : c;
+  }
+  return (RATE_PER_MIN[op] || 0) * m;
+}
+
+/* Остаток = хвост текущей операции по ЖИВОЙ скорости + оставшиеся операции этой доли
+   + все операции ещё не начатых долей. Живая часть надёжнее таблиц, поэтому она первая. */
+function estimateRemaining(j) {
+  if (j.status !== "running") return null;
+  const ref = j.ref_info || null;
+  const infoOf = s => s === 0 ? ref : ((j.dub_infos || [])[s - 1] || ref);
+  const plannedOps = (s, info) => {
+    if (s === 0) return ["decode", "extract"];
+    if (info && info.has_video === false) return ["extract", "audio", "write"];   // аудио-только
+    return ["decode", "coarse", "band", "extract", "resample", "audio", "write"]; // geom — если понадобится
+  };
+  let left = 0;
+  const cur = j.dub_index || 0;
+
+  const rec = (j.ops || []).find(o => o.state === "run");
+  if (rec && j.stage_pct > 0.02) left += rec.sec * (1 - j.stage_pct) / j.stage_pct;
+
+  const curInfo = infoOf(cur);
+  const done = new Set((j.ops || []).filter(o => o.slice_i === cur).map(o => o.op));
+  plannedOps(cur, curInfo).forEach(op => { if (!done.has(op)) left += opCost(op, curInfo, ref); });
+
+  for (let s = cur + 1; s < sliceCount(j); s++) {
+    const info = infoOf(s);
+    plannedOps(s, info).forEach(op => { left += opCost(op, info, ref); });
+  }
+  return left > 0 ? left : null;
+}
+
+function fmtSize(bytes) {
+  if (!bytes) return "";
+  const mb = bytes / (1024 * 1024);
+  return mb >= 1024 ? (mb / 1024).toFixed(1) + " " + t("unit.gb") : Math.round(mb) + " " + t("unit.mb");
+}
+
+function fmtMedia(info) {          // «7:03 · 1920×1080 · 23.976 к/с · 10 141 кадр»
+  if (!info) return "";
+  const bits = [];
+  if (info.duration_s) bits.push(fmtDur(info.duration_s));
+  if (info.width) bits.push(info.width + "×" + info.height);
+  if (info.fps) bits.push(info.fps.toFixed(3).replace(/\.?0+$/, "") + " " + t("unit.fps"));
+  if (info.frames) bits.push(info.frames.toLocaleString(LANG === "en" ? "en-US" : "ru-RU") +
+                             " " + plural(info.frames, "unit.frames"));
+  if (!info.width) bits.push(t("dub.audio_only"));
+  return bits.join(" · ");
+}
+
 function fmtDur(sec) {
   sec = Math.max(0, Math.round(sec || 0));
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
@@ -409,9 +474,8 @@ function statusLine(j) {
       el("span", "of", [s === 0 ? t("q.ref_prep") : t("q.track_of", {i: s, n: trackCount(j)}),
                         j.detail].filter(Boolean).join(" · ")));
     const parts = [t("q.elapsed", {v: fmtDur(j.elapsed_s)})];
-    if (j.progress > 0.02 && j.progress < 1) {          // грубая оценка по уже пройденному
-      parts.push("~ " + fmtDur(j.elapsed_s * (1 - j.progress) / j.progress));
-    }
+    const left = estimateRemaining(j);                  // по нормативам + живой скорости
+    if (left) parts.push(t("q.left", {v: fmtDur(left)}));
     tail.textContent = parts.join(" · ");
   } else if (j.status === "done") {
     const res = j.results || [];
@@ -499,7 +563,10 @@ function jobCard(j) {
     opsBox.replaceChildren(opsList(jj, s));
   };
   fillOps(j);
-  more.append(el("p", "sub", t("q.reference")), el("div", "hint", j.ref), opsHead, opsBox);
+  more.append(el("p", "sub", t("q.reference")), el("div", "hint", j.ref));
+  const refLine = el("div", "hint", fmtMedia(j.ref_info));
+  const refShow = jj => { refLine.textContent = fmtMedia(jj.ref_info); };  // паспорт приходит на старте
+  more.append(refLine, opsHead, opsBox);
   more.append(el("p", "sub", jobDone(j) ? t("q.results") : t("q.tracks_n", {n: trackCount(j)})));
   const list = el("div", "trks");
   for (let i = 1; i <= trackCount(j); i++) list.append(trackRow(j, i));
@@ -513,7 +580,7 @@ function jobCard(j) {
     card.replaceChild(progressBar(jj), card.querySelector(".pbar"));
     card.replaceChild(statusLine(jj), card.querySelector(".stat"));
     layoutBar(card);
-    if (more.classList.contains("on")) fillOps(jj);
+    if (more.classList.contains("on")) { fillOps(jj); refShow(jj); }
   };
 
   caret.onclick = () => {
@@ -600,12 +667,13 @@ function trackRow(job, sliceI) {
   const pills = [];
   if (r && r.ok) {
     if (r.geom_used) pills.push({t: t("f.geom", {sx: (r.geom_sx || 0).toFixed(3)})});
-    if (r.audio_cuts) pills.push({t: t("f.cuts", {n: r.audio_cuts, ms: Math.round(r.audio_max_step_ms)})});
+    if (r.audio_cuts) pills.push({t: pluralF(r.audio_cuts, "f.cuts",
+                                             {n: r.audio_cuts, ms: Math.round(r.audio_max_step_ms)})});
     if (r.filled_cuts) pills.push({t: t("f.filled", {n: r.filled_cuts})});
     if (r.blind_zones) pills.push({t: t("f.blind", {n: r.blind_zones}), c: "w"});
     (r.warnings || []).forEach(w => pills.push({t: w, c: "w"}));
     (r.critical || []).forEach(w => pills.push({t: w, c: "c"}));
-    if (r.out_path) pills.push({t: baseName(r.out_path)});
+    if (r.out_path) pills.push({t: baseName(r.out_path) + (r.out_size ? " · " + fmtSize(r.out_size) : "")});
   }
   if (pills.length) {
     const box = el("div", "tpills");

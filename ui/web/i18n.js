@@ -110,6 +110,7 @@ const STRINGS = {
   "q.failed_at":     {ru:"Сбой на операции «{op}»", en:"Failed at “{op}”"},
   "q.failed_plain":  {ru:"Сбой задачи", en:"Task failed"},
   "q.elapsed":       {ru:"прошло {v}", en:"elapsed {v}"},
+  "q.left":          {ru:"осталось ~ {v}", en:"~ {v} left"},
   "q.took":          {ru:"заняло {v}", en:"took {v}"},
   "q.tracks_count":  {ru:"дорожек: {n}", en:"tracks: {n}"},
   "q.will_start":    {ru:"старт по освобождении места", en:"starts when a slot frees up"},
@@ -120,16 +121,37 @@ const STRINGS = {
 
   /* находки обработки — стоят при своей дорожке */
   "f.geom":          {ru:"геометрия скорректирована · sx {sx}", en:"geometry corrected · sx {sx}"},
-  "f.cuts":          {ru:"{n} разрыва · макс {ms} мс", en:"{n} discontinuities · max {ms} ms"},
+  "f.cuts":          {ru:"{n} разрывов · макс {ms} мс", en:"{n} discontinuities · max {ms} ms"},
+  "f.cuts.one":      {ru:"{n} разрыв · макс {ms} мс", en:"{n} discontinuity · max {ms} ms"},
+  "f.cuts.few":      {ru:"{n} разрыва · макс {ms} мс", en:"{n} discontinuities · max {ms} ms"},
   "f.filled":        {ru:"заполнено референсом {n} с", en:"filled from reference {n} s"},
   "f.blind":         {ru:"зон без опоры: {n}", en:"unsupported zones: {n}"},
   "theme.tip":       {ru:"Тема: системная / светлая / тёмная", en:"Theme: system / light / dark"},
   "err.api":         {ru:"Ошибка: {e}", en:"Error: {e}"},
   "unit.ms":         {ru:"мс", en:"ms"},
   "unit.s":          {ru:"с", en:"s"},
+  "unit.mb":         {ru:"МБ", en:"MB"},
+  "unit.gb":         {ru:"ГБ", en:"GB"},
+  "unit.fps":        {ru:"к/с", en:"fps"},
+  /* три формы для русского счёта: 1 кадр, 2 кадра, 5 кадров */
+  "unit.frames":     {ru:"кадров", en:"frames"},
+  "unit.frames.one": {ru:"кадр", en:"frame"},
+  "unit.frames.few": {ru:"кадра", en:"frames"},
 };
 
 let LANG = "ru";
+
+/* Русский счёт требует трёх форм. Английский берёт «one» для единицы и общий ключ иначе. */
+function pluralKey(n, key) {
+  n = Math.abs(Math.round(n));
+  if (LANG === "en") return n === 1 ? key + ".one" : key;
+  const d10 = n % 10, d100 = n % 100;
+  if (d10 === 1 && d100 !== 11) return key + ".one";
+  if (d10 >= 2 && d10 <= 4 && (d100 < 12 || d100 > 14)) return key + ".few";
+  return key;
+}
+const plural = (n, key) => t(pluralKey(n, key));
+const pluralF = (n, key, vars) => t(pluralKey(n, key), vars);
 
 function t(key, vars) {
   let s = (STRINGS[key] && STRINGS[key][LANG]) || (STRINGS[key] && STRINGS[key].ru) || key;
