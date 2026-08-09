@@ -14,7 +14,13 @@ method ∈ {band, muq}; apply_cuts:
 Freeze в варпе не применяется: заморозка чинится на уровне зрения (файлы без неё).
 Знак: правее=+; кадр=41.708мс."""
 import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
 import numpy as np, torch
+from loguru import logger
 from scipy.ndimage import gaussian_filter1d
 from .params import T as _DEFT, FRAME, SMAX, STEP, make_T
 from . import detect
@@ -22,6 +28,7 @@ from . import coarse_dtw                       # ГРУБЫЙ детектор �
 from .assemble import apply_warp
 from .maps import band, muq, multispec
 from ..interp_backend import warp_interp        # GPU/CPU блочный linear-interp (варпы аудио)
+from ..memlog import memlog as _memlog          # отметки расхода памяти (CONFORM_MEMLOG=1)
 
 MAP_SR = {"band": 16000, "muq": 24000}
 COARSE_LAG_S = 2.5      # ширина окна грубого прохода band (видит сдвиг опенинга, ±0.7с не достаёт)
@@ -229,26 +236,41 @@ def _robust_drift_curve(o_total, w, cut_times, max_pct_s=1.25, T=_DEFT):
     return cur
 
 
-def _warp_piecewise(dub, wcurve, cut_times, sr, T=_DEFT):
+def _warp_piecewise(dub, wcurve, cut_times, sr, T=_DEFT, dst=None):
     """Варп ПО КУСКАМ между резами: внутри куска — гладкая wcurve (горки), на резе — резкий стык.
-    cut_times=[] → один кусок (непрерывно, ступени пандусом). Тишину в резах ставит вызывающий."""
-    n = len(dub); full = np.arange(n)
+    cut_times=[] → один кусок (непрерывно, ступени пандусом). Тишину в резах ставит вызывающий.
+
+    dst (если задан) — куда писать результат; иначе выделяется новый массив. Передача
+    выходного буфера убирает ВТОРУЮ полную копию дорожки: на фильме 1.5 ч с раскладкой
+    5.1 это 6 ГБ (см. `_source_copy`).
+
+    Память не зависит от длительности: индексы строятся на кусок (`arange(s0, s1)`, а не
+    на всю дорожку — прежний `arange(n)` стоил 2 ГБ индексов), а канал подаётся в
+    интерполятор ОКНОМ, покрывающим запрошенные точки, вместо копии канала целиком.
+    """
+    n = len(dub)
     bnds = [0.0] + sorted(float(t) for t in cut_times) + [n / sr]
-    out = np.empty_like(dub)
+    out = np.empty_like(dub) if dst is None else dst
     for k in range(len(bnds) - 1):
         c0, c1 = bnds[k], bnds[k + 1]
         s0 = int(round(c0 * sr)); s1 = n if k == len(bnds) - 2 else int(round(c1 * sr))
         if s1 <= s0:
             continue
         m = (T >= c0 - 0.6) & (T <= c1 + 0.6)
-        tt = full[s0:s1] / sr
+        tt = np.arange(s0, s1) / sr
         if m.sum() >= 2:
             dlt = np.interp(tt, T[m], wcurve[m]) * FRAME / 1000.0
         else:
             dlt = np.full(s1 - s0, float(np.interp(c0, T, wcurve)) * FRAME / 1000.0)
         src = (tt + dlt) * sr
+        # Окно канала под запрошенные точки. Границы с запасом и клампом к [0, n], как в
+        # блочном ресэмпле conform: интерполятор клампит края так же, как по целому каналу,
+        # поэтому значения совпадают бит-в-бит.
+        a1 = min(max(0, int(np.floor(src.min())) - 1), n - 1)
+        a2 = max(min(n, int(np.ceil(src.max())) + 2), a1 + 2)
+        src_w = src - a1
         for ch in range(dub.shape[1]):
-            out[s0:s1, ch] = warp_interp(dub[:, ch], src)   # full=arange(n) → grid warp_interp; GPU/CPU
+            out[s0:s1, ch] = warp_interp(dub[a1:a2, ch], src_w)
     return out
 
 
@@ -443,6 +465,59 @@ def _shift_channel(x, sr, head_s):
     return np.interp(idx, np.arange(n), x, left=0.0, right=0.0).astype(np.float32)
 
 
+_COPY_BLK = 1 << 22          # 4М кадров за раз: копия идёт кусками, пик не зависит от длительности
+
+
+def _source_copy(out):
+    """Снимок звука ДО варпа. Рядом с `out`, а НЕ в оперативной памяти.
+
+    Прежний код делал `np.stack([out[:, c].copy() …])`: полная копия всей дорожки в
+    памяти, причём вдвое — сначала список поканальных копий, потом `stack`. На фильме
+    1.5 ч с раскладкой 5.1 это 6 ГБ и пик 12 ГБ (замер 2026-08-07: собственная память
+    процесса скакала до 38 ГБ). Закон проекта требует, чтобы расход не рос с
+    длительностью, поэтому снимок кладётся на диск рядом с `out` (он и сам файл),
+    и копируется кусками.
+
+    Если `out` — обычный массив в памяти (путь без выноса на диск), поведение прежнее.
+    Значения идентичны прежним: тот же порядок, тот же тип, копия побайтная.
+    """
+    fn = getattr(out, "filename", None)
+    if fn is None:                            # не файл — старый путь (короткие дорожки, тесты)
+        return np.stack([out[:, c].copy() for c in range(out.shape[1])], axis=1)
+    d = Path(tempfile.mkdtemp(prefix="asrc_", dir=str(Path(fn).parent)))
+    dst = np.memmap(d / "src.f32", dtype=np.float32, mode="w+", shape=out.shape)
+    for s in range(0, out.shape[0], _COPY_BLK):
+        dst[s:s + _COPY_BLK] = out[s:s + _COPY_BLK]
+    dst._conform_tmpdir = str(d)              # каталог удалит вызывающий (audio_anchor)
+    return dst
+
+
+def _map_channels(src_arr, fn):
+    """Применить поканальное преобразование `fn(канал) -> канал` ко всей дорожке.
+
+    Замена связки `np.stack([fn(a[:, c]) for c …], axis=1)`, которая держала в памяти и
+    список поканальных результатов, и итоговый массив — то есть две полных копии дорожки.
+    Здесь результат пишется поканально: рядом с источником, если тот на диске.
+    """
+    fn_path = getattr(src_arr, "filename", None)
+    if fn_path is None:
+        return np.stack([fn(src_arr[:, c]) for c in range(src_arr.shape[1])], axis=1)
+    d = Path(tempfile.mkdtemp(prefix="amap_", dir=str(Path(fn_path).parent)))
+    dst = np.memmap(d / "map.f32", dtype=np.float32, mode="w+", shape=src_arr.shape)
+    for c in range(src_arr.shape[1]):
+        dst[:, c] = fn(src_arr[:, c])
+    dst._conform_tmpdir = str(d)
+    return dst
+
+
+def _drop_tmp(*arrs):
+    """Убрать временные файлы, созданные `_source_copy`/`_map_channels`."""
+    for a in arrs:
+        d = getattr(a, "_conform_tmpdir", None)
+        if d:
+            shutil.rmtree(d, ignore_errors=True)
+
+
 def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
                  sr_audio=44100, drift_speed_pct=1.25, info=None, progress=None,
                  plot_dir=None, plot_stem=None, render_own=True, vision_spans=None, dsp_cache=None):
@@ -456,23 +531,30 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
         progress(0.0, "грубая кривая (band ±2.5с)")
     n_out = out.shape[0]
     T = make_T(n_out / sr_audio)              # сетка от РЕАЛЬНОЙ длины пары (любая длительность)
-    src = np.stack([out[:, c].copy() for c in range(out.shape[1])], axis=1)   # дубль ДО варпа (источник)
+    _memlog('вход аудио-слоя')
+    src = _source_copy(out)                   # дубль ДО варпа (источник), НЕ в оперативной памяти
+    _memlog('снимок дубля')
     # ═══ ШАГ 1 — СОБЫТИЯ (всё, что ВНЕ окна band ±2.5с): prealign → DTW-события → гейт → ступень ═══
     ref16 = _mono_sr(ref_buf, sr_audio, 16000)       # реф@16к ОДИН раз на весь band-путь (дедуп: DTW
     dub16d = _mono_sr(src, sr_audio, 16000)          # + широкий/тонкий проходы + resid); дубль — свой
+    _memlog('моно 16к рефа и дубля')
     # Глобальная пред-синхронизация constant A/V-десинка озвучки (весь звук равномерно съехал
     # относит. своего видео; вне окна ±2.5с — band/dtw не достают). ГЕЙТ строгий → на здоровых no-op
     # (src не трогается) → весь путь ниже БИТ-В-БИТ. ref_dsp=CK4 → benv рефа из кэша (без пересчёта).
     g_head, g_flat = _global_prealign(ref16, dub16d, ref_dsp=dsp_cache)
     if abs(g_head) > _PRE_MIN_S and g_flat > _PRE_FLAT_MIN:
-        src = np.stack([_shift_channel(src[:, c], sr_audio, g_head) for c in range(src.shape[1])], axis=1)
+        prev = src
+        src = _map_channels(src, lambda ch: _shift_channel(ch, sr_audio, g_head))
+        _drop_tmp(prev)
         dub16d = _mono_sr(src, sr_audio, 16000)      # выровненный дубль → coarse_dtw/широкий проход на нём
         if info is not None:
             info["audio_global_offset_ms"] = round(g_head * 1000.0, 1)
     # ГРУБЫЙ детектор СОБЫТИЙ на DTW (вставки/вырезы вне окна band ±2.5, post-vision). Sparse +
     # валидирован (1 реал/0 ложных на 340). НЕТ события (почти вся выборка) → base=src → ВСЯ доводка НИЖЕ
     # идёт БИТ-В-БИТ со старым прод. Событие → пред-коррекция дубля (снять вставку), дальше та же доводка.
+    _memlog('перед детектором событий')
     dres = coarse_dtw.detect(ref16, dub16d, vspans=vision_spans, ref_cache=dsp_cache)
+    _memlog('после детектора событий')
     dtw_ins = dres["events_inserts"]; dtw_cuts = dres["events_cuts"]
     oc = wc = None                                   # широкое измерение band ±2.5 (единожды на дубль)
     if dtw_cuts:                                     # ГЕЙТ band-подтверждения: отсеять ЛОЖНЫЕ ВЫРЕЗЫ (drop-побег)
@@ -480,7 +562,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
         dtw_cuts = [c for c in dtw_cuts if not _band_confirms_sync(oc, wc, T, c[2], c[3])]
     if dtw_ins or dtw_cuts:
         off0_ev = _events_step_curve(dres["curve"], dres["ts"], dtw_cuts, dtw_ins, T=T)
-        base = np.stack([_warp_by_off0(src[:, c], sr_audio, off0_ev, T=T) for c in range(src.shape[1])], axis=1)
+        base = _map_channels(src, lambda ch: _warp_by_off0(ch, sr_audio, off0_ev, T=T))
         dub16b = _mono_sr(base, sr_audio, 16000)     # события сдвинули дубль → mono16 и измерение заново
         oc = wc = None
     else:
@@ -492,6 +574,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
         oc, wc = band.build_arr(ref16, dub16b, T, maxlag=COARSE_LAG_S)
     # off0 = «тропа» для следящего тонкого прохода: чистая статистика поверх (oc, wc).
     # vision_spans (тишина зрения) → веса якорей там зануляются: слух не цепляется за выброшенные зоны.
+    _memlog('после широкого измерения')
     off0 = _coarse_off0(oc, wc, spans=vision_spans, T=T)
     if progress is not None:
         progress(0.25, f"карта {method} (следит за off0)")
@@ -504,12 +587,14 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     ref_map = ref16 if sr_map == 16000 else _mono_sr(ref_buf, sr_audio, sr_map)
     dub_map = dub16b if sr_map == 16000 else _mono_sr(base, sr_audio, sr_map)
     dub_map = _warp_by_off0(dub_map, sr_map, off0, T=T)
+    _memlog('перед тонким проходом')
     want_diag = plot_dir is not None and bool(plot_stem)
     _bm = (band.build_arr if method == "band" else muq.build_arr)(ref_map, dub_map, T, diag=want_diag)
     if want_diag:
         o_res, w, diag = _bm
     else:
         o_res, w, diag = _bm[0], _bm[1], None
+    _memlog('после тонкого прохода')
     w = _zero_w_in_spans(w, T, vision_spans)             # тишина зрения → тонкие якоря не строятся
     o = off0 + o_res                                      # полный сдвиг = грубый off0 + тонкий остаток
     seglines, cuts = detect.detect(o, w, T=T)            # cuts = большие СТУПЕНИ (сдвиг опенинга)
@@ -520,7 +605,9 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     # =False → ТОТ ЖЕ алгоритм, но резы НЕ передаём → ступень станет пандусом ≤SMAX (без тишины).
     cut_times = [float(tc) for tc, _ in det_cuts] if apply_cuts else []
     wcurve = _robust_drift_curve(o, w, cut_times, max_pct_s=drift_speed_pct, T=T)   # R2 робаст-укладка (замена Надарая-Уотсона)
-    warped = _warp_piecewise(base, wcurve, cut_times, sr_audio, T=T)   # base (= src, если события нет)
+    # Пишем СРАЗУ в `out` (источник — отдельный буфер `base`), поэтому промежуточного
+    # массива на всю дорожку больше нет: он стоил ещё одну полную копию звука.
+    warped = _warp_piecewise(base, wcurve, cut_times, sr_audio, T=T, dst=out)
     if apply_cuts:                                        # ТИШИНА в резах: continuous-варп иначе переигрывает звук
         for tc, v in det_cuts:
             jms = v * FRAME
@@ -534,13 +621,15 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
             a2, b2 = int(float(te) * sr_audio), int(float(tn) * sr_audio)
             if b2 > a2:
                 warped[max(0, a2):min(n_out, b2)] = 0.0
-    out[:] = warped
+    _memlog('после варпа')
+    _drop_tmp(src, base)                       # снимок и пред-коррекция больше не нужны
     cuts = det_cuts if apply_cuts else []
     # ЛИНИЯ графика = band-доводка дрейфа (СЛЕДИТ за якорями o). Ступени событий DTW (вставки/вырезы)
     # сняты пред-коррекцией аудио и показываются ОТДЕЛЬНЫМИ МАРКЕРАМИ (dtw_inserts/dtw_cut_zones), НЕ
     # запекаются в линию — иначе линия уходит от якорей на величину события и распирает шкалу.
     wcurve_disp = wcurve
     # остаток независимым мультиспектром (16к) — реф@16к переиспользуем (дедуп), corr@16к свой
+    _memlog('перед замером остатка')
     corr16 = _mono_sr(out, sr_audio, 16000)
     resid = multispec.drift(torch.from_numpy(ref16).to(multispec.DEV),
                             torch.from_numpy(corr16).to(multispec.DEV), T)

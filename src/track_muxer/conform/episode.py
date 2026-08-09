@@ -19,6 +19,8 @@ from pathlib import Path
 from loguru import logger
 
 from track_muxer.conform import cache as cache_mod
+from track_muxer.conform import tmpfiles
+from track_muxer.conform.memlog import memlog
 from track_muxer.conform.align import conform_pair
 from track_muxer.conform.config import FFMPEG
 from track_muxer.conform.decode_backend import decode_backend
@@ -124,6 +126,7 @@ def conform_episode(
                                              progress_meta=(0, total, "реф"), label="аудио рефа (1 раз)")
                 except Exception:  # noqa: BLE001 — нет аудио → пары извлекут сами/откатятся на тишину
                     ref_audio = None
+            memlog('перед парой (после реф-аудио и SRM)')
             meta = (i, total, dub_video.name)
             try:
                 res = conform_pair(ref, dub_video, out_path, ffmpeg=ffmpeg,
@@ -146,8 +149,11 @@ def conform_episode(
 
     ref_audio = None        # освободить реф-аудио из RAM по завершении серии (на диск не пишем)
     if ref_tmp is not None:            # реф-memmap из _tmp (low_mem без кеша) → освободить и удалить
+        # ⚠ Просто rmtree мало: пока файл подключён как память, Windows его не удаляет,
+        # а ignore_errors это молча проглатывает — каталог зрения референса (гигабайты)
+        # оставался после КАЖДОГО прогона (2026-08-07).
+        tmpfiles.drop_dir(ref_tmp, ref)
         del ref
-        shutil.rmtree(ref_tmp, ignore_errors=True)
 
     # Очистка кеша, если НЕ tmp-чекпоинты (и серия не прервана). keep_tmp ⊃ сохранение всего
     # промежуточного (реф SRM + дубль CK1/2/3): tmp ON → кеш остаётся; OFF → чистим после серии.
