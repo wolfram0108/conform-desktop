@@ -30,9 +30,48 @@ def _bands(NB, fmin, fmax, sr, nfft):
     for b in range(NB): BM[b, (fb >= edg[b]) & (fb < edg[b+1])] = 1.0
     return BM.to(DEV)
 
+_ENV_BLK = 1 << 21          # ~2М отсчётов (≈131 с при 16к) на кусок: пик НЕ зависит от длительности
+
+
 def _benv(x, BM, nfft, hop, window):
-    Z = torch.stft(x, nfft, hop, window=window, return_complex=True); P = Z.abs()**2
-    E = torch.einsum("nf,bft->bnt", BM, P); E = torch.log1p(E)
+    """Полосная огибающая [B, NB, кадры] с z-нормировкой по времени.
+
+    ⚠ Считается КУСКАМИ. Прямой `torch.stft` по всей дорожке строит комплексную
+    спектрограмму целиком: на 30 мин это 2.8 ГБ видеопамяти, на полуторачасовом фильме
+    ~8.8 ГБ — расход линеен по длительности, что запрещено (замер 2026-08-07: именно
+    здесь собственная память процесса прыгала на 2.8 ГБ). Полосная свёртка сжимает
+    1025 частот до NB полос сразу, поэтому накапливать можно уже сжатое: результат
+    занимает единицы мегабайт независимо от длины.
+
+    Значения совпадают с расчётом за один проход: куски берутся с ЗАПАСОМ по краям и
+    обрезаются до кадров, опирающихся только на реальные отсчёты, а нормировка
+    (среднее и разброс по времени) применяется в конце — то есть глобально, как раньше.
+    """
+    n = int(x.shape[-1])
+    guard = nfft                                   # запас, покрывающий окно кадра целиком
+    if n <= _ENV_BLK + 2 * guard:                  # короткая дорожка — как было, одним куском
+        Z = torch.stft(x, nfft, hop, window=window, return_complex=True); P = Z.abs()**2
+        E = torch.einsum("nf,bft->bnt", BM, P)
+    else:
+        n_frames = n // hop + 1                    # ровно столько даёт stft с центрированием
+        parts, done = [], 0
+        while done < n_frames:
+            f0 = done
+            f1 = min(n_frames, f0 + _ENV_BLK // hop)
+            s0 = max(0, f0 * hop - guard)          # запас слева/справа: края куска не берём
+            s1 = min(n, (f1 - 1) * hop + guard + 1)
+            seg = x[..., s0:s1]
+            Zs = torch.stft(seg, nfft, hop, window=window, return_complex=True)
+            Ps = Zs.abs()**2
+            Es = torch.einsum("nf,bft->bnt", BM, Ps)
+            del Zs, Ps
+            lo = (f0 * hop - s0) // hop            # кадр f0 внутри куска
+            parts.append(Es[..., lo:lo + (f1 - f0)].clone())
+            del Es
+            done = f1
+        E = torch.cat(parts, dim=2)
+        del parts
+    E = torch.log1p(E)
     E = E - E.mean(2, keepdim=True)
     return E / (E.std(2, keepdim=True) + 1e-6)
 

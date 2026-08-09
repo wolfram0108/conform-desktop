@@ -28,6 +28,8 @@ from scipy.signal import butter, medfilt, resample_poly, sosfiltfilt
 from track_muxer.conform import cache as cache_mod
 from track_muxer.conform.config import FFMPEG, FFPROBE
 from track_muxer.conform import procreg
+from track_muxer.conform import tmpfiles
+from track_muxer.conform.memlog import memlog
 from track_muxer.conform.decode_backend import decode_backend
 from track_muxer.conform.interp_backend import warp_interp        # GPU/CPU варп аудио (ресэмпл на сетку рефа)
 from track_muxer.conform.features import (
@@ -842,6 +844,7 @@ def conform_features(
     n_out = int(dur_ref * SR)
     dub_ch, dub_layout = probe_audio_channels(dub_audio, FFPROBE, atrack=dub_atrack)
     aud_cleanup = out_tmp = ref_tmp = None
+    memlog('перед декодом аудио озвучки')
     if low_mem:
         tmp = Path(dub_audio).parent / "_tmp"; tmp.mkdir(parents=True, exist_ok=True)
         # CK2: аудио дубля из кэша (пропуск декода) или декод ПРЯМО в кэш (режим tmp).
@@ -874,6 +877,7 @@ def conform_features(
             for ch in range(dub_ch):
                 out[s1:s2, ch] = warp_interp(aud[a1:a2, ch], src - a1)   # xp=arange(a1,a2) → сдвиг -a1; GPU/CPU
         del aud
+        memlog('после ресэмпла звука по зрению')
     else:
         aud = _decode_audio(dub_audio, ffmpeg, audio_fix, channels=dub_ch, atrack=dub_atrack,
                            progress=progress, progress_meta=(di, dt, dnm), label="аудио озвучки")
@@ -963,6 +967,7 @@ def conform_features(
     #     аудио источника смещено относительно его видео (студия: оригинал на 1-2с, закадр записан
     #     по картинке) → дефект исходника, дорожка НЕ годится для дальнейшего. Поведение укладки и
     #     band НЕ трогаем — только сигнализируем КРАСНЫМ.
+    memlog('перед буфером рефа')
     av_critical: list[str] = []
     if ref_buf is not None:
         try:
@@ -978,6 +983,7 @@ def conform_features(
 
     # --- НОВЫЙ аудио-слой (Band/MuQ) — ПОСЛЕ заливки вырезов: видит реф/тишину в вырезе (как
     #     боевой off, на чём валидирован), а не сырой дубль → без ложного краевого реза. Варпит out.
+    memlog('перед аудио-слоем')
     if anchor_on:
         from .anchor import apply as _anchor          # ленивый импорт: GPU+опц. transformers только при выборе
         if progress is not None:
@@ -995,6 +1001,7 @@ def conform_features(
     # --- ФИНАЛЬНОЕ заполнение ТИШИНЫ озвучки рефом: ТОЛЬКО ПОСЛЕ band/muq (дорожка синхронна
     #     рефу). В дырах озвучки (резы, вырезы, края), где реф звучит, подставляем синхронный
     #     реф. На несинхронной дорожке (аудио off) НЕ делаем — там вставка плодит рассинхрон. ---
+    memlog('после аудио-слоя')
     ref_filled_s = 0.0
     if fill_silence and anchor_on and ref_buf is not None:
         ref_filled_s = _fill_silence_from_ref(out, ref_buf)
@@ -1081,15 +1088,20 @@ def conform_features(
               if progress is not None else None)
     if progress is not None:
         progress(Progress("write", 0.0, out_path.name, di, dt, dnm))
-    _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_wprog)  # FLAC, раскладка дубля
-    if low_mem:                                          # очистка memmap-временных (out/ref_buf/дубль-аудио)
-        del out
-        if ref_buf is not None:
-            del ref_buf
-        for d in (out_tmp.parent if out_tmp else None,
-                  ref_tmp.parent if ref_tmp else None, aud_cleanup):
-            if d is not None:
-                shutil.rmtree(d, ignore_errors=True)
+    memlog('перед записью файла')
+    try:
+        _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_wprog)  # FLAC, раскладка дубля
+    finally:
+        # ⚠ Уборка ОБЯЗАНА идти при любом исходе. Раньше она стояла просто после записи:
+        # запись падала — и десятки гигабайт промежуточных файлов оставались лежать
+        # (случай 2026-08-07: 34.6 ГБ на сетевом диске от двух оборванных прогонов).
+        if low_mem:                                      # очистка memmap-временных (out/ref_buf/дубль-аудио)
+            del out
+            if ref_buf is not None:
+                del ref_buf
+            for d in (out_tmp.parent if out_tmp else None,
+                      ref_tmp.parent if ref_tmp else None, aud_cleanup):
+                tmpfiles.drop_dir(d)          # подключения закрыты выше (del), проверка внутри
 
     # --- паспорт качества + предупреждения (read-only, на wav не влияет) ---
     metrics = _metrics(syn, refv, pred, asg, fps_ref, fps_tst, free_start)
@@ -1340,15 +1352,16 @@ def _align_audio_only(
               if progress is not None else None)
     if progress is not None:
         progress(Progress("write", 0.0, out_path.name, di, dt, dnm))
-    _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_wprog)
-    if low_mem:
-        del out
-        if ref_buf is not None:
-            del ref_buf
-        for d in (out_tmp.parent if out_tmp else None,
-                  ref_tmp.parent if ref_tmp else None, aud_cleanup):
-            if d is not None:
-                shutil.rmtree(d, ignore_errors=True)
+    try:
+        _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_wprog)
+    finally:
+        if low_mem:                                      # уборка при любом исходе (см. видео-путь)
+            del out
+            if ref_buf is not None:
+                del ref_buf
+            for d in (out_tmp.parent if out_tmp else None,
+                      ref_tmp.parent if ref_tmp else None, aud_cleanup):
+                tmpfiles.drop_dir(d)          # подключения закрыты выше (del), проверка внутри
 
     return PairResult(
         dub=name, out_path=out_path, ok=True, mode="audio",

@@ -58,6 +58,20 @@ class PlotRef(BaseModel):
     v_ms: float | None = None       # величина реза, мс (для kind=cut)
 
 
+class JobOp(BaseModel):
+    """Одна ВЫПОЛНЕННАЯ или идущая операция задачи — для показа хода работы.
+
+    Порядок операций детерминирован, поэтому панели достаточно знать, какие
+    из них уже пройдены и сколько заняли. `slice_i` = 0 — подготовка референса
+    (общая на всю задачу), 1..N — соответствующая аудиодорожка.
+    """
+
+    slice_i: int                     # 0 = референс, иначе номер дорожки (1-based)
+    op: str                          # код операции: decode/extract/coarse/geom/band/resample/audio/write
+    sec: float = 0.0                 # фактическая длительность; для идущей — сколько уже идёт
+    state: str = "run"               # "run" | "done" | "failed"
+
+
 class DubResult(BaseModel):
     """Паспорт одной озвучки (снимок для API)."""
 
@@ -126,6 +140,7 @@ class ConformJob(BaseModel):
     dub_index: int = 0
     dub_total: int = 0
     cur_dub: str = ""
+    ops: list[JobOp] = Field(default_factory=list)   # журнал операций: что пройдено и за сколько
     results: list[DubResult] = Field(default_factory=list)
     error: str | None = None
     elapsed_s: float = 0.0
@@ -324,6 +339,7 @@ class ConformQueue:
                 return False
             j.error = None
             j.results = []
+            j.ops = []
             j.progress = 0.0
             j.stage = ""
             j.dub_index = 0
@@ -397,11 +413,34 @@ class ConformQueue:
             self._groups[jid] = group
         procreg.bind(group)                      # потоко-локально: чужие задачи не задеты
 
+        op_t0 = [time.perf_counter()]      # момент начала текущей операции
+
+        def _op_mark(jj: ConformJob, slice_i: int, op: str) -> None:
+            """Отметить, какая операция идёт сейчас, и закрыть предыдущую по времени.
+
+            Панель показывает имя, состояние и длительность КАЖДОЙ операции; вывести
+            их постфактум неоткуда — фиксируем по ходу, на переходах.
+            """
+            if not op:
+                return
+            now = time.perf_counter()
+            last = jj.ops[-1] if jj.ops else None
+            if last is not None and last.slice_i == slice_i and last.op == op:
+                last.sec = now - op_t0[0]          # та же операция — уточняем, сколько идёт
+                return
+            if last is not None:
+                last.sec = now - op_t0[0]
+                if last.state == "run":
+                    last.state = "done"
+            op_t0[0] = now
+            jj.ops.append(JobOp(slice_i=slice_i, op=op))
+
         def progress(p) -> None:
             with self._lock:
                 jj = self._items.get(jid)
                 if jj is None:
                     return
+                _op_mark(jj, p.dub_index, p.stage)
                 jj.stage = p.stage
                 jj.stage_pct = p.pct
                 jj.detail = p.detail
@@ -427,6 +466,7 @@ class ConformQueue:
                               "write":    (0.97, 1.00)}.get(p.stage, (0.62, 0.78))
                 intra = lo + (hi - lo) * min(1.0, max(0.0, p.pct))
                 jj.progress = min(0.999, (p.dub_index + intra) / slices)
+                jj.elapsed_s = time.perf_counter() - t0   # растёт ПО ХОДУ, а не только в финале
                 jj.updated_at = _now()
 
         def on_pair(res: PairResult) -> None:
@@ -441,6 +481,10 @@ class ConformQueue:
                 jj = self._items.get(jid)
                 if jj is None:
                     return
+                if jj.ops:                      # дорожка закончилась — закрыть её последнюю операцию
+                    jj.ops[-1].sec = time.perf_counter() - op_t0[0]
+                    jj.ops[-1].state = "done" if res.ok else "failed"
+                    op_t0[0] = time.perf_counter()
                 jj.results.append(DubResult(
                     dub=res.dub, ok=res.ok, mode=getattr(res, "mode", "av"), skipped=res.skipped,
                     out_path=(str(res.out_path) if res.out_path else None),
@@ -537,6 +581,7 @@ class ConformQueue:
                     job.dub_index = 0
                     job.cur_dub = ""
                     job.results = []
+                    job.ops = []
                 self._items[job.id] = job
                 self._stops[job.id] = threading.Event()
                 maxseq = max(maxseq, job.seq)
