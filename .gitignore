@@ -18,3 +18,10 @@ CLAUDE.md
 .claude/
 run_ui.bat
 appdata/
+
+# сборка загрузчика и подготовленные компоненты (артефакты выпуска, не исходники)
+_work_setup/
+dist_setup/
+installer/packages/
+installer/_check_out*/
+installer/selfcheck.json
