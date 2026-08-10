@@ -1,0 +1,112 @@
+# Быстрые проверки на каждое изменение: то, что стоит секунды и ловит поломки рано.
+# Тяжёлая сборка дистрибутива сюда НЕ входит — она в release.yml по тегу.
+name: Проверки
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  syntax:
+    name: Синтаксис и связность
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Компиляция всех модулей
+        run: python -m compileall -q src server ui installer build
+
+      - name: Ключи перевода на месте
+        # интерфейс обращается к ключам через t("…"); отсутствующий ключ виден
+        # только глазами в работающем окне, поэтому сверяем список автоматически
+        run: |
+          python - <<'PY'
+          import re, pathlib, sys
+          js = pathlib.Path("ui/web/app.js").read_text(encoding="utf-8")
+          i18n = pathlib.Path("ui/web/i18n.js").read_text(encoding="utf-8")
+          used = set(re.findall(r'\bt\(\s*"([^"]+)"', js))
+          used |= set(re.findall(r'pluralF?\([^,]+,\s*"([^"]+)"', js))
+          have = set(re.findall(r'^\s*"([^"]+)":\s*\{', i18n, re.M))
+          # у форм множественного числа ключи достраиваются суффиксами
+          have |= {k.rsplit(".", 1)[0] for k in have if k.endswith((".one", ".few"))}
+          missing = sorted(k for k in used if k not in have and not k.startswith("op.ref."))
+          if missing:
+              print("НЕТ ПЕРЕВОДА для ключей:", *missing, sep="\n  ")
+              sys.exit(1)
+          print(f"ключей в интерфейсе: {len(used)}, все найдены")
+          PY
+
+      - name: Термины словаря не нарушены
+        # жаргон в интерфейсе — повторная ошибка, поэтому проверяется машиной
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          BAN = ["укладка", "укладку", "доводка", "доводку", "ресэмпл", "озвучка",
+                 "озвучки", "дубль", "дубля", "реф ", "рез ", "резы", "Drop-DTW"]
+          bad = []
+          for f in ["ui/web/i18n.js"]:
+              text = pathlib.Path(f).read_text(encoding="utf-8")
+              for line in text.splitlines():
+                  if line.strip().startswith("//") or line.strip().startswith("/*"):
+                      continue
+                  for w in BAN:
+                      if w.lower() in line.lower():
+                          bad.append(f"{f}: {line.strip()[:90]}  ← «{w}»")
+          if bad:
+              print("ЖАРГОН в строках интерфейса:", *dict.fromkeys(bad), sep="\n  ")
+              sys.exit(1)
+          print("жаргона в строках интерфейса нет")
+          PY
+
+  launcher:
+    name: Сборка тонкого загрузчика
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Установка сборщика
+        run: pip install --quiet pyinstaller
+
+      - name: Заглушки ресурсов
+        # 7-Zip на раннере уже есть; контрольный материал лежит в репозитории
+        shell: bash
+        run: |
+          echo "https://github.com/${{ github.repository }}/releases/latest/download/manifest.json" \
+            > installer/manifest_url.txt
+          python - <<'PY'
+          import json, pathlib
+          ref = json.loads(pathlib.Path("installer/selfcheck/reference.json").read_text(encoding="utf-8"))
+          pathlib.Path("installer/selfcheck.json").write_text(json.dumps(
+              {"ref": "ref_check.mkv", "dub": "dub_check.mkv",
+               "sha256": ref["sha256"], "port": 8799, "timeout_s": 600},
+              ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+
+      - name: Сборка
+        working-directory: installer
+        run: python -m PyInstaller launcher.spec --noconfirm --workpath ../_work_setup --distpath ../dist_setup
+
+      - name: Загрузчик запускается и сообщает о нехватке файлов
+        shell: bash
+        run: |
+          cd dist_setup
+          ./conform-setup.exe --check --offline > out.txt 2>&1 && code=0 || code=$?
+          cat out.txt
+          # без файлов установка обязана завершиться отказом, а не «успехом»
+          [ "$code" = "1" ] || { echo "ожидался код 1, получен $code"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: conform-setup
+          path: dist_setup/conform-setup.exe
+          retention-days: 14

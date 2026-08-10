@@ -1,0 +1,142 @@
+# Выпуск: полная сборка дистрибутива, нарезка на компоненты и публикация.
+#
+# Запускается по тегу вида v2026.08.10 либо вручную. Результат выпуска:
+#   conform-setup.exe          тонкий загрузчик (13 МБ) — единственное, что качает человек
+#   manifest.json              состав выпуска: имена файлов и контрольные суммы
+#   conform-runtime-*.7z       torch с CUDA           (~1.2 ГБ)
+#   conform-ffmpeg-*.7z        декодер медиафайлов    (~110 МБ)
+#   conform-app-*.7z           приложение и ядро      (~254 МБ)
+#
+# ⚠ Место на раннере ограничено (~14 ГБ на диске C), а торч с CUDA занимает половину.
+# Поэтому промежуточные каталоги сборки чистятся сразу, как только перестают быть нужны,
+# и упаковка идёт покомпонентно, а не одним архивом.
+name: Выпуск
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия выпуска (по умолчанию — дата)"
+        required: false
+
+permissions:
+  contents: write        # нужно для создания релиза и загрузки файлов
+
+jobs:
+  build:
+    name: Сборка дистрибутива (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Версия выпуска
+        id: ver
+        shell: bash
+        run: |
+          v="${{ inputs.version }}"
+          [ -z "$v" ] && v="${GITHUB_REF_NAME#v}"
+          [ -z "$v" ] && v="$(date +%Y.%m.%d)"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "версия выпуска: $v"
+
+      - name: Свободное место до установки
+        shell: bash
+        run: df -h /c /d 2>/dev/null || true
+
+      - name: Зависимости
+        shell: bash
+        run: |
+          python -m pip install --quiet --upgrade pip
+          # торч с CUDA — половина веса дистрибутива; ставится с индекса pytorch
+          pip install --quiet -r requirements.txt
+          pip install --quiet pyinstaller
+
+      - name: ffmpeg и ffprobe
+        shell: bash
+        run: |
+          mkdir -p ffbin && cd ffbin
+          curl -sL -o ff.7z https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z
+          7z x -y ff.7z > /dev/null
+          find . -name ffmpeg.exe -exec cp {} . \;
+          find . -path ./ffprobe.exe -prune -o -name ffprobe.exe -exec cp {} . \;
+          rm -rf ff.7z ffmpeg-*-full_build
+          ls -la ffmpeg.exe ffprobe.exe
+          ./ffmpeg.exe -version | head -1
+
+      - name: Сборка приложения
+        shell: bash
+        working-directory: build
+        run: |
+          FFMPEG_DIR="$GITHUB_WORKSPACE/ffbin" \
+            python -m PyInstaller conform-desktop.spec --noconfirm \
+              --workpath ../_work --distpath ../dist
+          rm -rf ../_work            # промежуточное больше не нужно, а места мало
+
+      - name: Снятие лишнего с дистрибутива
+        shell: bash
+        working-directory: build
+        run: python prune_dist.py --dist ../dist/conform-desktop --apply
+
+      - name: Нарезка на компоненты и манифест
+        shell: bash
+        run: |
+          python installer/split_dist.py \
+            --dist dist/conform-desktop \
+            --out installer/packages \
+            --version "${{ steps.ver.outputs.version }}" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}"
+          rm -rf dist                 # распакованный дистрибутив больше не нужен
+          ls -la installer/packages
+
+      - name: Сборка тонкого загрузчика
+        shell: bash
+        run: |
+          echo "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/manifest.json" \
+            > installer/manifest_url.txt
+          python - <<'PY'
+          import json, pathlib
+          ref = json.loads(pathlib.Path("installer/selfcheck/reference.json").read_text(encoding="utf-8"))
+          pathlib.Path("installer/selfcheck.json").write_text(json.dumps(
+              {"ref": "ref_check.mkv", "dub": "dub_check.mkv",
+               "sha256": ref["sha256"], "port": 8799, "timeout_s": 600},
+              ensure_ascii=False, indent=2), encoding="utf-8")
+          PY
+          cd installer
+          python -m PyInstaller launcher.spec --noconfirm --workpath ../_work_setup --distpath ../dist_setup
+          rm -rf ../_work_setup
+
+      - name: Свободное место после сборки
+        shell: bash
+        run: df -h /c /d 2>/dev/null || true
+
+      - name: Публикация выпуска
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: conform-desktop ${{ steps.ver.outputs.version }}
+          body: |
+            Скачайте `conform-setup.exe` и запустите — он получит остальное сам.
+
+            Если сеть недоступна или скачивать удобнее заранее: положите файлы
+            компонентов и `manifest.json` рядом с загрузчиком (или в подкаталог
+            `packages`) — загрузчик найдёт их сам, сверит контрольные суммы и
+            установит без сети. Проверка установки выполняется обработкой
+            контрольного материала, а не сверкой наличия файлов.
+
+            | Компонент | Размер | Когда обновляется |
+            |---|---|---|
+            | `conform-runtime-*.7z` | ~1.2 ГБ | редко (torch, CUDA) |
+            | `conform-ffmpeg-*.7z` | ~110 МБ | почти никогда |
+            | `conform-app-*.7z` | ~254 МБ | каждый выпуск |
+          files: |
+            dist_setup/conform-setup.exe
+            installer/packages/manifest.json
+            installer/packages/*.7z
+          fail_on_unmatched_files: true
