@@ -39,7 +39,9 @@ APP_DIR_NAME = "app"            # каталог развёрнутого дис
 PACKAGES_DIR_NAME = "packages"  # каталог с файлами установки
 STATE_FILE = "installed.json"
 MANIFEST = "manifest.json"
-EXE_NAME = "conform-desktop.exe"
+IS_WINDOWS = os.name == "nt"
+EXE_NAME = "conform-desktop.exe" if IS_WINDOWS else "conform-desktop"
+NO_WINDOW = subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0   # флага нет вне Windows
 
 
 def base_dir() -> Path:
@@ -188,13 +190,29 @@ class Installer:
         part.replace(dest)
         return True
 
+    def unpack_tool(self) -> str:
+        """Распаковщик: на Windows вложен в загрузчик, на прочих системах берётся из
+        системы (7zz / 7za / 7z из p7zip). Проверка наличия — до начала установки."""
+        if IS_WINDOWS:
+            return str(res_dir() / "7z.exe")
+        local = res_dir() / "7zz"
+        if local.is_file():
+            return str(local)
+        for name in ("7zz", "7za", "7z"):
+            found = shutil.which(name)
+            if found:
+                return found
+        return ""
+
     def unpack(self, archive: Path) -> bool:
-        exe = res_dir() / "7z.exe"
+        exe = self.unpack_tool()
+        if not exe:
+            self.log("  Распаковщик не найден. Установите p7zip (пакет p7zip-full).")
+            return False
         self.app_dir.mkdir(parents=True, exist_ok=True)
         self.log(f"Распаковка: {archive.name}")
-        r = subprocess.run([str(exe), "x", "-y", f"-o{self.app_dir}", str(archive)],
-                           capture_output=True, text=True,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        r = subprocess.run([exe, "x", "-y", f"-o{self.app_dir}", str(archive)],
+                           capture_output=True, text=True, creationflags=NO_WINDOW)
         if r.returncode != 0:
             self.log(f"  Ошибка распаковки: {(r.stdout or r.stderr or '')[-300:]}")
             return False
@@ -255,8 +273,7 @@ class Installer:
         dub = res_dir() / spec["dub"]
 
         self.log("Проверка установки: обработка контрольного материала")
-        proc = subprocess.Popen([str(exe)], cwd=str(self.app_dir),
-                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc = subprocess.Popen([str(exe)], cwd=str(self.app_dir), creationflags=NO_WINDOW)
         try:
             port = spec.get("port", 8799)
             api = f"http://127.0.0.1:{port}"
