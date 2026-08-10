@@ -1,1 +1,1 @@
-http://127.0.0.1:8123/manifest.json
+https://github.com/wolfram0108/conform-desktop/releases/download/v2026.08.10/manifest.json

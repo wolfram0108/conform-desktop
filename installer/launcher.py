@@ -225,6 +225,11 @@ class Installer:
                 if state.get(c["name"]) != c["sha256"]]
 
     def install(self, want_download: bool = True) -> bool:
+        if not self.manifest.get("components"):
+            # пустой состав — это не «всё готово», а отсутствие сведений о выпуске
+            self.log("Состав выпуска неизвестен: manifest.json не найден и не получен из "
+                     "сети. Разместите файлы установки в каталоге установки.")
+            return False
         comps = self.missing()
         if not comps:
             self.log("Все компоненты установлены.")
@@ -505,6 +510,14 @@ class Window:
         self.root.mainloop()
 
 
+def _console_log(msg: str) -> None:
+    """Печать, переживающая оконный режим: там стандартного вывода нет вовсе."""
+    if sys.stdout is not None:
+        print(msg, flush=True)
+    with (base_dir() / "setup.log").open("a", encoding="utf-8") as f:
+        f.write(msg + chr(10))
+
+
 def main() -> int:
     if "--ui-selftest" in sys.argv:
         # Проверка окна: создаём его по-настоящему и нажимаем основную кнопку кодом.
@@ -527,7 +540,7 @@ def main() -> int:
 
     if "--check" in sys.argv:            # режим без интерфейса, для стенда
         offline = "--offline" in sys.argv    # запретить сеть: только принесённые файлы
-        inst = Installer(base_dir())
+        inst = Installer(base_dir(), log=_console_log)
         if not inst.manifest and not offline:
             inst.fetch_manifest()
         ok = inst.install(want_download=not offline) and inst.selfcheck()

@@ -116,7 +116,20 @@ jobs:
         shell: bash
         run: df -h /c /d 2>/dev/null || true
 
+      # Ручной запуск — только проверка сборки: артефакты остаются в задании,
+      # публикуется исключительно то, что помечено тегом.
+      - name: Артефакты проверочной сборки
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: conform-desktop-packages
+          path: |
+            dist_setup/conform-setup.exe
+            installer/packages/manifest.json
+          retention-days: 7
+
       - name: Публикация выпуска
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}

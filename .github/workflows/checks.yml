@@ -92,17 +92,21 @@ jobs:
               ensure_ascii=False, indent=2), encoding="utf-8")
           PY
 
-      - name: Сборка
+      - name: Сборка (консольный вариант — у оконного нет стандартного вывода)
         working-directory: installer
+        env:
+          LAUNCHER_CONSOLE: "1"
         run: python -m PyInstaller launcher.spec --noconfirm --workpath ../_work_setup --distpath ../dist_setup
 
       - name: Загрузчик запускается и сообщает о нехватке файлов
         shell: bash
+        timeout-minutes: 5
         run: |
           cd dist_setup
-          ./conform-setup.exe --check --offline > out.txt 2>&1 && code=0 || code=$?
-          cat out.txt
-          # без файлов установка обязана завершиться отказом, а не «успехом»
+          # без файлов установка обязана завершиться отказом, а не «успехом»;
+          # таймаут ловит зависание — оно уже случалось на оконной сборке
+          timeout 120 ./conform-setup.exe --check --offline > out.txt 2>&1 && code=0 || code=$?
+          cat out.txt setup.log 2>/dev/null
           [ "$code" = "1" ] || { echo "ожидался код 1, получен $code"; exit 1; }
 
       - uses: actions/upload-artifact@v4

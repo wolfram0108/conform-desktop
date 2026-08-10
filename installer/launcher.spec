@@ -1,6 +1,7 @@
 # Сборка тонкого загрузчика. Он намеренно лёгкий: ни torch, ни Qt, ни ядра conform —
 # только окно (tkinter входит в состав Python), распаковщик 7-Zip и материал самопроверки.
 # Тяжёлые части приезжают отдельными архивами и проверяются по контрольной сумме.
+import os
 from pathlib import Path
 
 ROOT = Path(SPECPATH)
@@ -36,7 +37,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz, a.scripts, a.binaries, a.datas, [],
     name="conform-setup",
-    console=False,          # окно, а не консоль
+    # Оконный вариант — для людей; консольный (LAUNCHER_CONSOLE=1) нужен проверкам:
+    # у оконного нет стандартного вывода, и режим --check из консоли не отвечает.
+    console=bool(os.environ.get("LAUNCHER_CONSOLE")),
     upx=False,
     icon=None,
 )

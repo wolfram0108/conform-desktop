@@ -25,3 +25,7 @@ dist_setup/
 installer/packages/
 installer/_check_out*/
 installer/selfcheck.json
+
+# сборка загрузчика и подготовленные компоненты
+dist_setup/
+_dist_console/
