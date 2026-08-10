@@ -14,6 +14,13 @@ datas = [
     (str(ROOT / "selfcheck" / "dub_check.mkv"), "."),
 ]
 
+# Адрес состава выпуска: с ним загрузчику достаточно самого себя — файлы он найдёт сам.
+# Задаётся переменной окружения MANIFEST_URL при сборке; без неё работает только
+# установка из принесённых файлов.
+_url = ROOT / "manifest_url.txt"
+if _url.is_file():
+    datas.append((str(_url), "."))
+
 a = Analysis(
     [str(ROOT / "launcher.py")],
     pathex=[str(ROOT)],

@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
@@ -85,6 +86,12 @@ class Installer:
         self.manifest = self._load_manifest()
 
     # ── манифест ──
+    def manifest_url(self) -> str:
+        """Адрес состава выпуска задаётся при сборке (`manifest_url.txt`). Нужен для случая,
+        когда у пользователя есть только загрузчик и ничего больше."""
+        p = res_dir() / "manifest_url.txt"
+        return p.read_text(encoding="utf-8").strip() if p.is_file() else ""
+
     def _load_manifest(self) -> dict:
         for p in [self.root / MANIFEST, *[d / MANIFEST for d in self.pkg_dirs], res_dir() / MANIFEST]:
             if p.is_file():
@@ -93,6 +100,29 @@ class Installer:
                 except json.JSONDecodeError:
                     self.log(f"Манифест повреждён: {p}")
         return {}
+
+    def fetch_manifest(self) -> bool:
+        """Получить состав выпуска из сети и сохранить рядом: дальше он доступен и офлайн."""
+        url = self.manifest_url()
+        if not url:
+            return False
+        try:
+            with urllib.request.urlopen(url, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as e:
+            self.log(f"Не удалось получить состав выпуска: {e}")
+            return False
+        base = url.rsplit("/", 1)[0]
+        for c in data.get("components", []):
+            if not c.get("url"):                    # адреса компонентов — рядом с манифестом
+                c["url"] = f"{base}/{c['file']}"
+        (self.root / PACKAGES_DIR_NAME).mkdir(exist_ok=True)
+        (self.root / PACKAGES_DIR_NAME / MANIFEST).write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.manifest = data
+        self.log(f"Состав выпуска получен: версия {data.get('version', '—')}, "
+                 f"компонентов {len(data.get('components', []))}")
+        return True
 
     def installed(self) -> dict:
         p = self.app_dir / STATE_FILE
@@ -296,10 +326,31 @@ class Window:
         self.root.title("conform-desktop — установка")
         self.root.geometry("760x520")
         self.root.minsize(620, 420)
+        self.events: queue.Queue = queue.Queue()
+        self.pending_refresh = False
         self.inst = Installer(base_dir(), log=self.log, progress=self.on_progress)
         self.busy = False
         self._build()
-        self.refresh()
+        self._pump()
+        # У пользователя может не быть ничего, кроме загрузчика: тогда состав выпуска
+        # запрашивается из сети. Запрос идёт ДО первой отрисовки состава — иначе окно
+        # успевает сообщить «манифест не найден» о том, что уже загружается.
+        self.fetching = False
+        if not self.inst.manifest and self.inst.manifest_url():
+            self._fetch_then_refresh()
+        else:
+            self.refresh()
+
+    def _fetch_then_refresh(self) -> None:
+        self.fetching = True
+        self.state_lbl["text"] = "запрос состава выпуска…"
+        self.log("Запрос состава выпуска…")
+        self.root.update_idletasks()
+        try:
+            self.inst.fetch_manifest()
+        finally:
+            self.fetching = False
+            self.refresh()
 
     def _build(self) -> None:
         pad = {"padx": 14, "pady": 6}
@@ -332,16 +383,40 @@ class Window:
         ttk.Button(row, text="Выбрать каталог с файлами установки…", command=self.pick_dir).pack(side="left")
 
     # ── вывод ──
+    # Установка идёт в отдельном потоке, а виджеты Tk можно трогать только из главного:
+    # сообщения складываются в очередь, а забирает их таймер главного потока.
     def log(self, msg: str) -> None:
-        self.text.insert("end", msg + "\n")
-        self.text.see("end")
-        self.root.update_idletasks()
+        self.events.put(("log", msg))
+        if threading.current_thread() is threading.main_thread():
+            self._drain()
 
     def on_progress(self, frac: float, text: str = "") -> None:
-        self.bar["value"] = max(0, min(1000, int(frac * 1000)))
-        if text:
-            self.bar_lbl["text"] = text
+        self.events.put(("progress", (frac, text)))
+        if threading.current_thread() is threading.main_thread():
+            self._drain()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                kind, payload = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self.text.insert("end", payload + "\n")
+                self.text.see("end")
+            else:
+                frac, text = payload
+                self.bar["value"] = max(0, min(1000, int(frac * 1000)))
+                if text:
+                    self.bar_lbl["text"] = text
         self.root.update_idletasks()
+
+    def _pump(self) -> None:
+        self._drain()
+        if self.pending_refresh:
+            self.pending_refresh = False
+            self.refresh()
+        self.root.after(120, self._pump)
 
     def pick_dir(self) -> None:
         d = filedialog.askdirectory(title="Каталог с файлами установки")
@@ -355,10 +430,11 @@ class Window:
         self.tree.delete(*self.tree.get_children())
         comps = self.inst.manifest.get("components", [])
         if not comps:
-            self.state_lbl["text"] = "манифест не найден"
-            self.log("Файл manifest.json не найден. Разместите его в каталоге установки "
-                     "или укажите каталог с файлами установки.")
-            self.btn["state"] = "disabled"
+            self.state_lbl["text"] = "состав выпуска недоступен"
+            self.log("Состав выпуска не получен. Разместите manifest.json и файлы "
+                     "компонентов в каталоге установки либо укажите каталог с ними.")
+            self.btn["text"] = "Повторить запрос"
+            self.btn["state"] = "normal" if self.inst.manifest_url() else "disabled"
             return
         state = self.inst.installed()
         need = 0
@@ -378,7 +454,10 @@ class Window:
 
     # ── главная кнопка ──
     def on_main(self) -> None:
-        if self.busy:
+        if self.busy or self.fetching:
+            return
+        if not self.inst.manifest:                 # состава ещё нет — сначала получить его
+            self._fetch_then_refresh()
             return
         if not self.inst.missing():
             self.log("Запуск приложения")
@@ -402,18 +481,39 @@ class Window:
             self.log(f"Ошибка установки: {e}")
         finally:
             self.busy = False
-            self.btn["state"] = "normal"
             self.on_progress(0, "")
-            self.refresh()
+            self.pending_refresh = True     # перерисовку делает главный поток
 
     def run(self) -> None:
         self.root.mainloop()
 
 
 def main() -> int:
-    if "--check" in sys.argv:            # проверка без окна, для стенда
+    if "--ui-selftest" in sys.argv:
+        # Проверка окна: создаём его по-настоящему и нажимаем основную кнопку кодом.
+        # Проверяются те же обработчики, что и при нажатии мышью, — но без участия человека.
+        w = Window()
+        w.root.update()
+        rows = [w.tree.item(i)["values"] for i in w.tree.get_children()]
+        print("состав в окне:", rows, flush=True)
+        print("кнопка:", w.btn["text"], "| состояние:", w.state_lbl["text"], flush=True)
+        w.btn.invoke()
+        t0 = time.time()
+        while (w.busy or time.time() - t0 < 3) and time.time() - t0 < 1800:
+            w.root.update()
+            time.sleep(0.2)
+        print("после нажатия:", w.state_lbl["text"], "| кнопка:", w.btn["text"], flush=True)
+        print("журнал:\n" + w.text.get("1.0", "end").strip(), flush=True)
+        ok = not w.inst.missing()
+        w.root.destroy()
+        return 0 if ok else 1
+
+    if "--check" in sys.argv:            # режим без интерфейса, для стенда
+        offline = "--offline" in sys.argv    # запретить сеть: только принесённые файлы
         inst = Installer(base_dir())
-        ok = inst.install(want_download=False) and inst.selfcheck()
+        if not inst.manifest and not offline:
+            inst.fetch_manifest()
+        ok = inst.install(want_download=not offline) and inst.selfcheck()
         return 0 if ok else 1
     Window().run()
     return 0
