@@ -35,6 +35,15 @@ import urllib.request
 from pathlib import Path
 from tkinter import filedialog, ttk
 
+# Консоль Windows может быть в однобайтовой кодировке (на англоязычной системе — cp1252),
+# и печать русского текста роняет программу с UnicodeEncodeError. Переводим вывод в UTF-8
+# с заменой непредставимых знаков: сообщение важнее, чем точность отдельного символа.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 APP_DIR_NAME = "app"            # каталог развёрнутого дистрибутива
 PACKAGES_DIR_NAME = "packages"  # каталог с файлами установки
 STATE_FILE = "installed.json"
