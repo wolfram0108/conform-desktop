@@ -1,8 +1,8 @@
-"""Запуск приложения: `python -m ui` (dev) или frozen conform-desktop.exe.
+"""Application entry: `python -m ui` (dev) or the frozen conform-desktop.exe.
 
-Поднимает embedded API (uvicorn) фоновым потоком ЭТОГО ЖЕ процесса на
-127.0.0.1:<порт> и открывает Qt-окно. Если порт уже отвечает нашим /health —
-переиспользуем живой сервер (второй экземпляр приложения).
+Starts the embedded API (uvicorn) in a background thread of this process on
+127.0.0.1:<port> and opens the Qt window. If the port already answers our /health,
+that live server is reused (second instance of the application).
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ _FROZEN = bool(getattr(sys, "frozen", False))
 _HOME = (Path(sys.executable).resolve().parent if _FROZEN
          else Path(__file__).resolve().parent.parent)     # exe dir or repository root
 
-# ── frozen-бутстрап ДО импорта conform (config.py резолвит ffmpeg при импорте) ──
+# Frozen bootstrap before importing conform: config.py resolves ffmpeg at import time.
 if _FROZEN:
     for _c in (_HOME / "_internal", _HOME):
         if (_c / "ffmpeg.exe").exists():
@@ -27,8 +27,7 @@ if _FROZEN:
             break
 
 # Any windowed launch (frozen exe or pythonw) has stdout/stderr = None: loguru, uvicorn's
-# logging setup (sys.stdout.isatty()) and tracebacks then kill threads silently. Redirect both
-# to a file before importing anything.
+# logging setup (sys.stdout.isatty()) and tracebacks then kill threads silently.
 if sys.stdout is None or sys.stderr is None:
     _log_dir = _HOME / "appdata"
     _log_dir.mkdir(parents=True, exist_ok=True)
@@ -38,18 +37,15 @@ if sys.stdout is None or sys.stderr is None:
     if sys.stderr is None:
         sys.stderr = _log
 
-# ── ГАРАНТИЯ: ни одного консольного окна из ЛЮБОГО кода процесса ──
-# Точечных флагов в ядре мало: окно может открыть сторонняя библиотека, служебный
-# taskkill или любой будущий вызов. Патчим subprocess на уровне процесса ДО импорта
-# ядра — каждый дочерний процесс стартует скрытым и без консоли, поэтому фокус
-# никогда не уходит из окна приложения.
+# No console window from any code of this process: a library, a service taskkill or any
+# future call could open one, so subprocess is patched process-wide before the core loads.
 if os.name == "nt":
     import subprocess as _sp
 
     _CREATE_NO_WINDOW = 0x08000000
     _orig_popen = _sp.Popen
 
-    class _HiddenPopen(_orig_popen):          # noqa: D101 — техническая обёртка
+    class _HiddenPopen(_orig_popen):          # noqa: D101 — technical wrapper
         def __init__(self, *a, **kw):
             kw["creationflags"] = kw.get("creationflags", 0) | _CREATE_NO_WINDOW
             si = kw.get("startupinfo") or _sp.STARTUPINFO()
@@ -73,23 +69,17 @@ PORT = int(os.environ.get("CONFORM_PORT", "8799"))
 
 
 def _setup_log() -> Path:
-    """Журнал работы рядом с приложением: `appdata/conform.log`.
+    """Core log next to the application: `appdata/conform.log`.
 
-    Зачем отдельный файл, если есть `ui.log`. В `ui.log` попадает лишь то, что пишут
-    в стандартный вывод сторонние библиотеки; сообщения ядра туда не доходят, а в
-    windowed-сборке стандартного вывода вообще нет. Из-за этого разбор отказа
-    приходилось вести по обрывкам: прогон длиной в полтора часа заканчивался строкой
-    «Broken pipe» без единой записи о том, на чём он споткнулся.
-
-    Пишем всё, что идёт через журнал ядра: этапы задач, ошибки с трассой, вывод
-    упавших внешних процессов. Ротация — чтобы файл не рос бесконечно.
+    `ui.log` only receives what libraries write to the standard streams; core messages
+    (job stages, errors with traces, output of failed external processes) need their own
+    file, otherwise a failed hour-long run leaves nothing but a bare "Broken pipe".
     """
-    log_dir = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
-               else Path(__file__).resolve().parent.parent) / "appdata"
+    log_dir = _HOME / "appdata"
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / "conform.log"
     logger.add(str(path), rotation="10 MB", retention=5, encoding="utf-8",
-               enqueue=True,          # задачи идут в потоках — записи не должны рваться
+               enqueue=True,          # jobs run in threads: records must not interleave
                backtrace=True, diagnose=False, level="INFO",
                format="{time:YYYY-MM-DD HH:mm:ss} | {level: <7} | {message}")
     logger.info("conform-desktop запущен (порт {}), журнал: {}", PORT, path)
@@ -104,38 +94,38 @@ def _health_ok(base: str) -> bool:
         return False
 
 
-_APP = None                       # FastAPI-приложение процесса (ядро + мост оболочки)
+_APP = None                       # FastAPI application of this process (core + shell bridge)
 
 
 def _start_server() -> None:
     import uvicorn
     cfg = uvicorn.Config(_APP, host="127.0.0.1", port=PORT, log_level="warning")
-    uvicorn.Server(cfg).run()      # в не-главном потоке uvicorn сам пропускает signal-handlers
+    uvicorn.Server(cfg).run()      # off the main thread uvicorn skips signal handlers itself
 
 
 def main() -> int:
     global _APP
-    # Рубеж №1 (страховка ОС): все потомки умрут вместе с процессом ЛЮБЫМ способом —
-    # включая taskkill /F и падение, когда наш код выхода отработать не успевает.
+    # OS-level guard: every child dies with this process however it ends, including
+    # taskkill /F and crashes, when our own exit code never gets to run.
     winjob.enable_kill_on_close()
-    _setup_log()                   # журнал — до всего остального, иначе ранние отказы немы
-    enable_debug_port()            # порт отладки страницы — до создания QApplication
+    _setup_log()                   # first, so early failures are not mute
+    enable_debug_port()            # page debug port must precede QApplication
 
     app = QApplication(sys.argv)
     app.setApplicationName("conform-desktop")
 
     base = f"http://127.0.0.1:{PORT}"
     if not _health_ok(base):
-        bridge = create_bridge(app)               # диалоги файлов выполняются в GUI-потоке
+        bridge = create_bridge(app)               # file dialogs run in the GUI thread
         _APP = create_app()
         _APP.include_router(make_shell_router(bridge))
-        # Страница отдаётся ТЕМ ЖЕ сервером: одинаковый источник → браузер не блокирует
-        # запросы к API (при загрузке с file:// они запрещены политикой безопасности).
+        # The page is served by the same server: same origin, so the browser allows API
+        # calls (they are blocked by the security policy when loaded from file://).
         from fastapi.staticfiles import StaticFiles
         _APP.mount("/app", StaticFiles(directory=str(web_dir()), html=True), name="ui")
         api = threading.Thread(target=_start_server, daemon=True, name="api")
         api.start()
-        for _ in range(150):                      # ждём готовности (torch-импорты небыстрые)
+        for _ in range(150):                      # readiness wait: torch imports are slow
             if _health_ok(base):
                 break
             if not api.is_alive():                # a dead server must be named, not waited for
@@ -148,30 +138,30 @@ def main() -> int:
     win.show()
     rc = app.exec()
     _shutdown()
-    # Жёсткий выход: ConformQueue держит non-daemon ThreadPoolExecutor — обычный
-    # возврат оставил бы процесс висеть после закрытия окна.
+    # Hard exit: ConformQueue holds a non-daemon ThreadPoolExecutor, a plain return
+    # would leave the process alive after the window closes.
     os._exit(rc)
 
 
 def _shutdown() -> None:
-    """Закрытие окна = конец работы: гасим задачи и НЕ оставляем ffmpeg-сирот.
+    """Closing the window ends the work: stop jobs and leave no orphaned ffmpeg.
 
-    Рубежи: (2) очередь убивает подпроцессы своих задач штатно; (3) контрольный kill
-    дерева ЭТОГО процесса — на случай процессов в обход реестра, потому что os._exit
-    детей не забирает. Рубеж (1) — job object ОС, включён в main().
+    The queue kills its jobs' subprocesses; then the tree of this process is killed as a
+    backstop for processes outside the registry, because os._exit does not reap children.
+    The OS job object enabled in main() is the last line.
     """
     try:
         q = get_queue()
         if q is not None:
             q.shutdown()
-    except Exception:  # noqa: BLE001 — выход не должен падать
+    except Exception:  # noqa: BLE001 — exit must not fail
         pass
     if os.name == "nt":
         try:
             import subprocess
             subprocess.run(["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
                            capture_output=True, check=False,
-                           creationflags=0x08000000)     # без консольного окна
+                           creationflags=0x08000000)     # no console window
         except Exception:  # noqa: BLE001
             pass
 
