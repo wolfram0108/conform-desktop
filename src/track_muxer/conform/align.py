@@ -31,7 +31,7 @@ from track_muxer.conform import procreg
 from track_muxer.conform import tmpfiles
 from track_muxer.conform.memlog import memlog
 from track_muxer.conform.decode_backend import decode_backend
-from track_muxer.conform.interp_backend import warp_interp        # GPU/CPU варп аудио (ресэмпл на сетку рефа)
+from track_muxer.conform.interp_backend import warp_interp        # GPU/CPU audio warp (resample onto the reference grid)
 from track_muxer.conform.features import (
     build_srm,
     probe_audio_channels,
@@ -44,34 +44,28 @@ from track_muxer.conform.kernel.coarse import coarse_robust, coarse_windowed
 from track_muxer.conform.models import PairResult, SrmFeatures
 from track_muxer.conform.progress import Reporter, part
 from track_muxer.conform.vision_detect import build_map as _vision_build_map, global_trend as _vision_global_trend, vision_ow as _vision_ow, detelecine as _detelecine, is_baked_telecine as _is_telecine
-from track_muxer.conform.anchor.params import FRAME as VFRAME, T as VGT, make_T as _make_T  # мс/кадр + сетка T (тишина в резах + единый график)
+from track_muxer.conform.anchor.params import FRAME as VFRAME, T as VGT, make_T as _make_T  # ms per frame + anchor grid T (cut silence, unified plot)
 
-# Константы conform v8 (НЕ менять — калибровка алгоритма)
+# conform v8 constants: algorithm calibration, do not change
 SR = 44100
 DT = 0.005
-ABORT_ASSIGNED_PCT = 60.0  # назн% видео ниже → это ЧУЖОЕ видео (озвучка не от той серии): валим
-                           # пару СРАЗУ после матчинга, до ресэмпла и GPU-аудио (fail-fast)
-GEOM_GATE = 50             # грубый проход дал < N якорей → зрение СЛЕПНЕТ (геом-рассинхрон:
-                           # кроп/зум/анаморф/полосы) → геом-разбор ДО отсечки «чужое видео».
-                           # Здоровые пары: n_keep сотни-тысячи → геом не вызывается (бит-в-бит).
-COARSE_SAME_MIN_FRAC = 0.10  # доля прорежённых (K=8) кадров в МОНОТОННОЙ цепочке якорей грубого
-                           # прохода (n_keep), выше которой контент считается ТОЙ ЖЕ серией даже
-                           # при низком назн% (низко-косинусный энкод чужого мастер-источника).
-                           # Тогда отсечка «чужое видео» НЕ применяется (см. гейт ниже).
-                           # ⚠ ПОРОГ ВЗЯТ С ЗАПАСОМ и на реальном «чужом» контенте НЕ калиброван —
-                           # СЛЕДИТЬ (прецедент hon-kon_studio, doc/reports/geom_align/). Реально
-                           # чужое видео даёт ~1-3% (десятки якорей, как GEOM_GATE), «та серия» ≥58%.
-CUT_MIN_S = 0.3          # вырез > 0.3с
+ABORT_ASSIGNED_PCT = 60.0  # assigned% below this means a foreign video (dub of another episode):
+                           # fail the pair right after matching, before resampling and GPU audio
+GEOM_GATE = 50             # coarse pass found < N anchors: vision is blind (crop/zoom/anamorph/bars),
+                           # so run the geometry pass before the foreign-video cutoff
+COARSE_SAME_MIN_FRAC = 0.10  # share of thinned (K=8) frames in the monotone coarse chain that still
+                           # means the same episode despite low assigned%; see doc/reports/geom_align/
+CUT_MIN_S = 0.3          # a cut is longer than 0.3 s
 FADE = int(0.010 * SR)
-FILL_MIN_S = 1.0         # вырез > 1с → заполнять оригиналом рефа (короче — тишина)
-XFADE = int(0.030 * SR)  # кроссфейд дубляж↔оригинал на стыках заполнения (30 мс)
-# Финальное заполнение ТИШИНЫ озвучки рефом (ПОСЛЕ band/muq, когда дорожка синхронна):
-SIL_FILL_DB = -90.0      # порог тишины озвучки, dBFS (измерено: ниже −80 — плато настоящих дыр,
-                         # выше — тихий КОНТЕНТ; −90 в центре плато, далеко от обрыва −40…−60)
-SIL_FILL_WIN_S = 0.02    # окно RMS (20 мс)
-SIL_FILL_MIN_S = 0.15    # мин длина зоны тишины (короче — микро-провал, не трогаем)
-EDGE_MIN_FR = 24         # доп-проход на краю: только если выкинуто/непокрыто > ~1с
-EDGE_COS_MIN = 0.5       # вписываем вернувшийся матч только при cos выше этого
+FILL_MIN_S = 1.0         # cuts longer than 1 s are filled with the reference, shorter ones get silence
+XFADE = int(0.030 * SR)  # crossfade dub<->original at fill seams (30 ms)
+# Final fill of dub silence with the reference (after band/muq, once the track is in sync):
+SIL_FILL_DB = -90.0      # dub silence threshold, dBFS: below -80 is the plateau of real gaps, above is
+                         # quiet content; -90 sits mid-plateau, far from the -40..-60 edge
+SIL_FILL_WIN_S = 0.02    # RMS window (20 ms)
+SIL_FILL_MIN_S = 0.15    # shortest silence zone; shorter dips are left alone
+EDGE_MIN_FR = 24         # edge re-pass only if more than ~1 s is dropped or uncovered
+EDGE_COS_MIN = 0.5       # a recovered edge match is kept only above this cosine
 DSYN = 0.30
 MATCH_THR = 0.30
 # Новый слой решения level_edits (разбор правок по СДВИГУ УРОВНЯ offset вместо restore_blind+R)
