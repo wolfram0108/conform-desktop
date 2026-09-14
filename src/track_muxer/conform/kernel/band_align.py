@@ -114,7 +114,7 @@ def band_align(syn, ref, off, affine=False, OPEN=0.20, EXT=0.02, DSYN=0.20, MATC
     nst = max(1, len(starts))
     for ist, a in enumerate(starts):
         if on_prog is not None:
-            on_prog((ist + 1) / nst)
+            on_prog(ist / nst)
         b = min(a + CHUNK - 1, N - 1)
         ks = np.arange(a, b + 1)
         refk = ks + off[ks]
@@ -140,6 +140,8 @@ def band_align(syn, ref, off, affine=False, OPEN=0.20, EXT=0.02, DSYN=0.20, MATC
             if q > quality[kk]:
                 quality[kk] = q; pred_full[kk] = pred[idx]
         if b == N - 1: break
+    if on_prog is not None:
+        on_prog(1.0)
     return pred_full
 
 

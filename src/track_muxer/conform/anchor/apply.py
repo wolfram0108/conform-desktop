@@ -28,7 +28,8 @@ from . import coarse_dtw                       # ГРУБЫЙ детектор �
 from .assemble import apply_warp
 from .maps import band, muq, multispec
 from ..interp_backend import warp_interp        # GPU/CPU блочный linear-interp (варпы аудио)
-from ..memlog import memlog as _memlog          # отметки расхода памяти (CONFORM_MEMLOG=1)
+from ..memlog import memlog as _memlog
+from ..progress import part          # отметки расхода памяти (CONFORM_MEMLOG=1)
 
 MAP_SR = {"band": 16000, "muq": 24000}
 COARSE_LAG_S = 2.5      # ширина окна грубого прохода band (видит сдвиг опенинга, ±0.7с не достаёт)
@@ -236,7 +237,7 @@ def _robust_drift_curve(o_total, w, cut_times, max_pct_s=1.25, T=_DEFT):
     return cur
 
 
-def _warp_piecewise(dub, wcurve, cut_times, sr, T=_DEFT, dst=None):
+def _warp_piecewise(dub, wcurve, cut_times, sr, T=_DEFT, dst=None, on_prog=None):
     """Варп ПО КУСКАМ между резами: внутри куска — гладкая wcurve (горки), на резе — резкий стык.
     cut_times=[] → один кусок (непрерывно, ступени пандусом). Тишину в резах ставит вызывающий.
 
@@ -251,9 +252,13 @@ def _warp_piecewise(dub, wcurve, cut_times, sr, T=_DEFT, dst=None):
     n = len(dub)
     bnds = [0.0] + sorted(float(t) for t in cut_times) + [n / sr]
     out = np.empty_like(dub) if dst is None else dst
-    for k in range(len(bnds) - 1):
+    # A piece spans up to the whole track; blocks keep index arrays bounded and let progress move.
+    blocks = [(k, s) for k in range(len(bnds) - 1)
+              for s in range(int(round(bnds[k] * sr)),
+                             n if k == len(bnds) - 2 else int(round(bnds[k + 1] * sr)), _WARP_BLK)]
+    for ib, (k, s0) in enumerate(blocks):
         c0, c1 = bnds[k], bnds[k + 1]
-        s0 = int(round(c0 * sr)); s1 = n if k == len(bnds) - 2 else int(round(c1 * sr))
+        s1 = min(s0 + _WARP_BLK, n if k == len(bnds) - 2 else int(round(c1 * sr)))
         if s1 <= s0:
             continue
         m = (T >= c0 - 0.6) & (T <= c1 + 0.6)
@@ -271,8 +276,12 @@ def _warp_piecewise(dub, wcurve, cut_times, sr, T=_DEFT, dst=None):
         src_w = src - a1
         for ch in range(dub.shape[1]):
             out[s0:s1, ch] = warp_interp(dub[a1:a2, ch], src_w)
+        if on_prog is not None:
+            on_prog((ib + 1) / len(blocks))
     return out
 
+
+_WARP_BLK = 60 * 44100   # one minute of audio per warp block
 
 PCM_FS = 32768.0          # полная шкала int16: фиксированная конверсия PCM→[-1,1] (как ffmpeg s16→f32le)
 
@@ -528,19 +537,23 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     plot_dir+plot_stem (если заданы) → сырьё (npz+json). render_own=True → ещё и СВОЙ PNG/HTML
     графика band; render_own=False → conform рисует ЕДИНЫЙ график (зрение+аудио), band свой не рисует."""
     if progress is not None:
-        progress(0.0, "широкое измерение сдвига")
+        progress.mark(0.0, "снимок дубля")
     n_out = out.shape[0]
     T = make_T(n_out / sr_audio)              # сетка от РЕАЛЬНОЙ длины пары (любая длительность)
     _memlog('вход аудио-слоя')
     src = _source_copy(out)                   # дубль ДО варпа (источник), НЕ в оперативной памяти
     _memlog('снимок дубля')
     # ═══ ШАГ 1 — СОБЫТИЯ (всё, что ВНЕ окна band ±2.5с): prealign → DTW-события → гейт → ступень ═══
+    if progress is not None:
+        progress.mark(0.08, "приведение к моно 16 кГц")
     ref16 = _mono_sr(ref_buf, sr_audio, 16000)       # реф@16к ОДИН раз на весь band-путь (дедуп: DTW
     dub16d = _mono_sr(src, sr_audio, 16000)          # + широкий/тонкий проходы + resid); дубль — свой
     _memlog('моно 16к рефа и дубля')
     # Глобальная пред-синхронизация constant A/V-десинка озвучки (весь звук равномерно съехал
     # относит. своего видео; вне окна ±2.5с — band/dtw не достают). ГЕЙТ строгий → на здоровых no-op
     # (src не трогается) → весь путь ниже БИТ-В-БИТ. ref_dsp=CK4 → benv рефа из кэша (без пересчёта).
+    if progress is not None:
+        progress.mark(0.16, "предварительная синхронизация")
     g_head, g_flat = _global_prealign(ref16, dub16d, ref_dsp=dsp_cache)
     if abs(g_head) > _PRE_MIN_S and g_flat > _PRE_FLAT_MIN:
         prev = src
@@ -553,12 +566,16 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     # валидирован (1 реал/0 ложных на 340). НЕТ события (почти вся выборка) → base=src → ВСЯ доводка НИЖЕ
     # идёт БИТ-В-БИТ со старым прод. Событие → пред-коррекция дубля (снять вставку), дальше та же доводка.
     _memlog('перед детектором событий')
-    dres = coarse_dtw.detect(ref16, dub16d, vspans=vision_spans, ref_cache=dsp_cache)
+    if progress is not None:
+        progress.mark(0.24, "поиск вставок и вырезов")
+    dres = coarse_dtw.detect(ref16, dub16d, vspans=vision_spans, ref_cache=dsp_cache,
+                             on_prog=part(progress, 0.24, 0.56))
     _memlog('после детектора событий')
     dtw_ins = dres["events_inserts"]; dtw_cuts = dres["events_cuts"]
     oc = wc = None                                   # широкое измерение band ±2.5 (единожды на дубль)
     if dtw_cuts:                                     # ГЕЙТ band-подтверждения: отсеять ЛОЖНЫЕ ВЫРЕЗЫ (drop-побег)
-        oc, wc = band.build_arr(ref16, dub16d, T, maxlag=COARSE_LAG_S)   # band на pre-DTW дубле (сетка T)
+        oc, wc = band.build_arr(ref16, dub16d, T, maxlag=COARSE_LAG_S,
+                                on_prog=part(progress, 0.56, 0.60))   # band на pre-DTW дубле (сетка T)
         dtw_cuts = [c for c in dtw_cuts if not _band_confirms_sync(oc, wc, T, c[2], c[3])]
     if dtw_ins or dtw_cuts:
         off0_ev = _events_step_curve(dres["curve"], dres["ts"], dtw_cuts, dtw_ins, T=T)
@@ -570,14 +587,17 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     # ═══ ШАГ 2 — ЛИНИЯ (всё В ПРЕДЕЛАХ ±2.5с): широкий проход → тонкий на mono-варпе → детект → R2 ═══
     # Широкое измерение band ±2.5с (толерантно к голосу) — ЕДИНСТВЕННОЕ на дубль: гейт выше
     # переиспользует его же (дубль без событий → вход тот же → бит-в-бит).
+    if progress is not None:
+        progress.mark(0.56, "широкое измерение сдвига")
     if oc is None:
-        oc, wc = band.build_arr(ref16, dub16b, T, maxlag=COARSE_LAG_S)
+        oc, wc = band.build_arr(ref16, dub16b, T, maxlag=COARSE_LAG_S,
+                                on_prog=part(progress, 0.56, 0.60))
     # off0 = «тропа» для следящего тонкого прохода: чистая статистика поверх (oc, wc).
     # vision_spans (тишина зрения) → веса якорей там зануляются: слух не цепляется за выброшенные зоны.
     _memlog('после широкого измерения')
     off0 = _coarse_off0(oc, wc, spans=vision_spans, T=T)
     if progress is not None:
-        progress(0.25, "измерение сдвига по частотным полосам" if method == "band"
+        progress.mark(0.60, "измерение сдвига по частотным полосам" if method == "band"
                        else "измерение сдвига моделью MuQ")
     # Тонкий проход (±0.7с) СЛЕДИТ за off0 — ПЕРЕИЗМЕРЯЕТ остаток на пред-варпленном дубле. Детектор
     # резов со-адаптирован с этим переизмерением (o И w) — статистикой поверх широкого прохода оно НЕ
@@ -590,7 +610,8 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     dub_map = _warp_by_off0(dub_map, sr_map, off0, T=T)
     _memlog('перед тонким проходом')
     want_diag = plot_dir is not None and bool(plot_stem)
-    _bm = (band.build_arr if method == "band" else muq.build_arr)(ref_map, dub_map, T, diag=want_diag)
+    _bm = (band.build_arr(ref_map, dub_map, T, diag=want_diag, on_prog=part(progress, 0.60, 0.69))
+           if method == "band" else muq.build_arr(ref_map, dub_map, T, diag=want_diag))
     if want_diag:
         o_res, w, diag = _bm
     else:
@@ -601,14 +622,17 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     seglines, cuts = detect.detect(o, w, T=T)            # cuts = большие СТУПЕНИ (сдвиг опенинга)
     det_cuts = list(cuts)
     if progress is not None:
-        progress(0.65, "построение кривой сдвига")
+        progress.mark(0.69, "построение кривой сдвига")
     # Кривая дрейфа (ГОРКИ) + варп. apply_cuts=True → разрыв+тишина в резах;
     # =False → ТОТ ЖЕ алгоритм, но резы НЕ передаём → ступень станет пандусом ≤SMAX (без тишины).
     cut_times = [float(tc) for tc, _ in det_cuts] if apply_cuts else []
     wcurve = _robust_drift_curve(o, w, cut_times, max_pct_s=drift_speed_pct, T=T)   # R2 робаст-укладка (замена Надарая-Уотсона)
     # Пишем СРАЗУ в `out` (источник — отдельный буфер `base`), поэтому промежуточного
     # массива на всю дорожку больше нет: он стоил ещё одну полную копию звука.
-    warped = _warp_piecewise(base, wcurve, cut_times, sr_audio, T=T, dst=out)
+    if progress is not None:
+        progress.mark(0.70, "перекладка звука по кривой")
+    warped = _warp_piecewise(base, wcurve, cut_times, sr_audio, T=T, dst=out,
+                             on_prog=part(progress, 0.70, 0.86))
     if apply_cuts:                                        # ТИШИНА в резах: continuous-варп иначе переигрывает звук
         for tc, v in det_cuts:
             jms = v * FRAME
@@ -631,11 +655,16 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     wcurve_disp = wcurve
     # остаток независимым мультиспектром (16к) — реф@16к переиспользуем (дедуп), corr@16к свой
     _memlog('перед замером остатка')
+    if progress is not None:
+        progress.mark(0.86, "замер остатка")
     corr16 = _mono_sr(out, sr_audio, 16000)
     resid = multispec.drift(torch.from_numpy(ref16).to(multispec.DEV),
-                            torch.from_numpy(corr16).to(multispec.DEV), T)
+                            torch.from_numpy(corr16).to(multispec.DEV), T,
+                            on_prog=part(progress, 0.86, 0.94))
     m = (T >= 30); resid_fr = float(np.median(np.abs(resid[m])))   # без верхнего хардкода — вся длина
 
+    if progress is not None:
+        progress.mark(0.94, "графики и сырьё")
     # --- метрики укладки (из найденных резов и ломаной) ---
     sm = _eval_seglines(seglines, T=T)                   # денойзенная кривая сдвига на сетке T
     span_ms = float((sm.max() - sm.min()) * FRAME) if len(sm) else 0.0
@@ -758,7 +787,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
         info["n_segments"] = len(seglines)
         info["plots"] = plots
     if progress is not None:
-        progress(1.0, "готово")
+        progress.mark(1.0, "готово")
     return resid_fr * FRAME
 
 

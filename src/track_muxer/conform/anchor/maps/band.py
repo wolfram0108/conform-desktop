@@ -77,7 +77,7 @@ def _benv(x, BM, nfft, hop, window):
 
 @torch.no_grad()
 def _om_core(refz, dubz, T, *, sr, NB, fmin, fmax, nfft, hop, win, agg, quality, promp, tol,
-             diag=False, maxlag=None):
+             diag=False, maxlag=None, on_prog=None):
     """Ядро: refz/dubz — тензоры mono @ sr на DEV. -> (o кадры, q качество норм.).
     diag=True → доп. третий возврат: сырьё под графики/расследование (поверхность время×лаг,
     по-полосный сдвиг/выраженность). Знак surf/lags как у o (Ed·conj(Er): правее=+).
@@ -139,6 +139,8 @@ def _om_core(refz, dubz, T, *, sr, NB, fmin, fmax, nfft, hop, win, agg, quality,
         sh = shift.cpu().numpy(); ql = qual.cpu().numpy()
         sh[~inb] = np.nan; ql[~inb] = 0.0                # узлы за концом дорожки — без влияния
         o[i:i+len(idx)] = sh; q[i:i+len(idx)] = ql
+        if on_prog is not None:
+            on_prog((i + 128) / len(T))
         if diag:
             bkd = torch.argmax(cc, 2)                          # по-полосный аргмакс-лаг
             _surf.append(cc.sum(1).cpu().numpy().astype(np.float32))            # поверхность (сумма полос)
@@ -165,13 +167,13 @@ def build(ref, dub, T, diag=False, maxlag=None):
     return _om_core(refz, dubz, T, **NB48, diag=diag, maxlag=maxlag)
 
 
-def build_arr(ref_mono, dub_mono, T, diag=False, maxlag=None):
+def build_arr(ref_mono, dub_mono, T, diag=False, maxlag=None, on_prog=None):
     """По in-memory mono @16к (float32). Для прод-врезки из conform (без перечтения файлов).
     diag=True → (o, w, D) с поверхностью/по-полосным сырьём (см. _om_core).
     maxlag (с) — ширина окна лага; None → 0.7. Грубый проход зовёт с 2.5с."""
     refz = torch.from_numpy(np.ascontiguousarray(ref_mono, dtype=np.float32)).to(DEV)
     dubz = torch.from_numpy(np.ascontiguousarray(dub_mono, dtype=np.float32)).to(DEV)
-    return _om_core(refz, dubz, T, **NB48, diag=diag, maxlag=maxlag)
+    return _om_core(refz, dubz, T, **NB48, diag=diag, maxlag=maxlag, on_prog=on_prog)
 
 
 def band_edges():
