@@ -68,12 +68,12 @@ EDGE_MIN_FR = 24         # edge re-pass only if more than ~1 s is dropped or unc
 EDGE_COS_MIN = 0.5       # a recovered edge match is kept only above this cosine
 DSYN = 0.30
 MATCH_THR = 0.30
-# Новый слой решения level_edits (разбор правок по СДВИГУ УРОВНЯ offset вместо restore_blind+R)
-LEVEL_EDIT_S = 1.0       # сдвиг уровня offset > этого = реальная правка (иначе слепая зона)
-LEVEL_MIN_INS_S = 2.0    # вставка = сплошной блок дубляжа длиннее этого (короче = дрожь)
-LEVEL_WIN_S = 4.0        # окно медианы уровня offset до/после выброшенного прогона
-# Level-aware детекция вырезов (фикс «пилы»: временный выброс offset на статике ≠ вырез)
-LEVEL_CUT_COALESCE_S = 3.0  # склеивать соседние пробелы рефа ближе этого — в один кластер
+# level_edits layer: edits are decided by the offset LEVEL shift instead of restore_blind+R
+LEVEL_EDIT_S = 1.0       # offset level shift above this is a real edit, otherwise a blind zone
+LEVEL_MIN_INS_S = 2.0    # an insert is a solid dub block longer than this, shorter is jitter
+LEVEL_WIN_S = 4.0        # median window of the offset level before/after a dropped run
+# Level-aware cut detection: a transient offset outlier on static content is not a cut
+LEVEL_CUT_COALESCE_S = 3.0  # reference gaps closer than this merge into one cluster
 LEVEL_CUT_RECOVER_S = 8.0   # в пределах этого ищем ВОЗВРАТ уровня (выброс-пила) vs устойчивый сдвиг (реальный вырез)
 # Детектор «налипания» (кейс case/04): зона ПРИСВОЕННЫХ кадров, чужих рефу по содержимому.
 # Пороги по разделимости (8 пар, bench/_creep_survey.log): здоровые зоны — cos≥0.22 и ≤1.0с,
