@@ -41,7 +41,8 @@ from track_muxer.conform.features import (
 )
 from track_muxer.conform.kernel.band_align import band_align
 from track_muxer.conform.kernel.coarse import coarse_robust, coarse_windowed
-from track_muxer.conform.models import PairResult, Progress, SrmFeatures
+from track_muxer.conform.models import PairResult, SrmFeatures
+from track_muxer.conform.progress import Reporter, part
 from track_muxer.conform.vision_detect import build_map as _vision_build_map, global_trend as _vision_global_trend, vision_ow as _vision_ow, detelecine as _detelecine, is_baked_telecine as _is_telecine
 from track_muxer.conform.anchor.params import FRAME as VFRAME, T as VGT, make_T as _make_T  # мс/кадр + сетка T (тишина в резах + единый график)
 
@@ -117,37 +118,30 @@ def _extract_base(video: Path, ffmpeg: str, audio_fix: bool = True, channels: in
             "-ac", str(channels), "-ar", str(SR), "-f", "s16le"]
 
 
-def _pump_progress(stream, dur, progress, meta, label) -> None:
-    """Парсить ffmpeg `-progress` (out_time_us) из потока в Progress; иначе просто дренит
-    поток (чтобы пайп не переполнился и ffmpeg не заблокировался). Терпит bytes и str."""
-    di, dt, dname = meta
-    last = 0.0
+def _pump_progress(stream, dur, reporter) -> None:
+    """Feed ffmpeg `-progress` lines (out_time_us) into the stage reporter; with no reporter
+    just drain the pipe so ffmpeg never blocks on a full buffer. Accepts bytes and str."""
     for raw in stream:
         line = raw.decode("utf-8", "replace") if isinstance(raw, (bytes, bytearray)) else raw
-        if progress is not None and dur > 0 and line.startswith("out_time_us="):
+        if reporter is not None and dur > 0 and line.startswith("out_time_us="):
             try:
                 us = int(line.split("=", 1)[1])
             except ValueError:
                 continue
-            now = time.perf_counter()
-            if now - last >= 0.5:
-                progress(Progress("extract", min(us / 1e6 / dur, 0.999), label, di, dt, dname))
-                last = now
+            reporter(min(us / 1e6 / dur, 0.999))
 
 
 def _decode_audio(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 2,
-                 atrack: int = 0,
-                 progress=None, progress_meta=(0, 0, ""), label="аудио") -> np.ndarray:
+                 atrack: int = 0, reporter: Reporter | None = None) -> np.ndarray:
     """Декод аудио (`channels` каналов) в float32 (ЦЕЛИКОМ в RAM) ПРЯМО из пайпа ffmpeg — без
     временного файла на диске. PCM s16le → stdout; прогресс — со stderr (`-progress pipe:2`),
     читается в отдельном потоке (иначе блокировка при заполнении любого из пайпов).
     Возврат (N, channels) float32 (int16-размах)."""
-    dur = (probe_duration(video, FFPROBE) or 0.0) if progress is not None else 0.0
+    dur = (probe_duration(video, FFPROBE) or 0.0) if reporter is not None else 0.0
     cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack),
            "-progress", "pipe:2", "-nostats", "pipe:1"]
     proc = procreg.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    th = threading.Thread(target=_pump_progress,
-                          args=(proc.stderr, dur, progress, progress_meta, label), daemon=True)
+    th = threading.Thread(target=_pump_progress, args=(proc.stderr, dur, reporter), daemon=True)
     th.start()
     buf = proc.stdout.read()
     proc.wait(); procreg.done(proc); th.join(timeout=2)
@@ -158,8 +152,7 @@ def _decode_audio(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 
 
 
 def _decode_audio_mmap(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 2,
-                      atrack: int = 0,
-                      progress=None, progress_meta=(0, 0, ""), label="аудио",
+                      atrack: int = 0, reporter: Reporter | None = None,
                       dest: Path | None = None):
     """low_mem: ffmpeg декодирует PCM s16le (`channels` каналов) ПРЯМО в рабочий файл `a.raw`
     (без WAV-обёртки и без перечитывания), затем `np.memmap` поверх — RAM не растёт на длинных
@@ -177,11 +170,11 @@ def _decode_audio_mmap(video: Path, ffmpeg: str, audio_fix: bool, *, channels: i
         tmpdir.mkdir(parents=True, exist_ok=True)
         d = Path(tempfile.mkdtemp(prefix="extract_", dir=str(tmpdir)))
         raw = d / "a.raw"
-    dur = (probe_duration(video, FFPROBE) or 0.0) if progress is not None else 0.0
+    dur = (probe_duration(video, FFPROBE) or 0.0) if reporter is not None else 0.0
     cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack),
            "-progress", "pipe:1", "-nostats", str(raw)]
     proc = procreg.popen(cmd, stdout=subprocess.PIPE, text=True)
-    _pump_progress(proc.stdout, dur, progress, progress_meta, label)   # дренит stdout до конца
+    _pump_progress(proc.stdout, dur, reporter)   # дренит stdout до конца
     proc.wait(); procreg.done(proc)
     if proc.returncode not in (0, None):
         raise subprocess.CalledProcessError(proc.returncode, cmd)
@@ -543,14 +536,13 @@ def _load_align_ckpt(out_path: Path, n_syn: int, stamp: str):
 
 
 def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
-              ffmpeg, progress, meta):
+              ffmpeg, rep: Reporter | None):
     """Геом-разбор СЛЕПОЙ пары (кроп/зум/анаморф/полосы): conform.geom.consensus_G находит
     глобальное преобразование → пересборка SRM рефа и дубля с `crop` (ВТОРОЙ декод, только
     для слепых) → грубый проход заново. -> (refv, syn, off0, G, fps_ref, fps_dub, tcr, tcd,
     ax_ref, ax_dub) — последние два = VFR-оси пересобранных SRM (кадры те же, ось из того же
     исходника); G is None ⟹ геометрия не восстановлена / cv2 нет / нет ref.src."""
     from track_muxer.conform import geom
-    di, dt, dnm = meta
     _none = (None, None, None, None, fps_ref, fps_dub, None, None, None, None)
     if ref.src is None:
         return _none
@@ -562,17 +554,17 @@ def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
     if G is None:
         if not geom.available():
             return _none
-        if progress is not None:
-            progress(Progress("geom", 0.0, "оценка кадрирования и масштаба", di, dt, dnm))
-        G = geom.consensus_G(Path(ref.src), Path(dub_audio))
+        if rep is not None:
+            rep.mark(0.0, "оценка кадрирования и масштаба")
+        G = geom.consensus_G(Path(ref.src), Path(dub_audio), on_prog=part(rep, 0.0, 0.40))
         if G is None:
             return _none
         if keep_tmp and cache_dir is not None:
             cache_mod.save_geom(cache_dir, Path(ref.src), Path(dub_audio), G)
-    if progress is not None:
-        progress(Progress("geom", 0.7, "пересчёт признаков кадров", di, dt, dnm))
+    if rep is not None:
+        rep.mark(0.40, "пересчёт признаков кадров")
 
-    def _srm(video: Path, fps: float, crop: str) -> SrmFeatures:
+    def _srm(video: Path, fps: float, crop: str, sub: Reporter | None) -> SrmFeatures:
         # tmp-чекпоинт кропнутого SRM (CK1 geom): повтор слепой пары без передекода
         h = probe_resolution(video)
         if low_mem and keep_tmp and cache_dir is not None:
@@ -581,15 +573,15 @@ def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
                 return cached
             mp = cache_mod.srm_file(cache_dir, video, crop=crop)
             with decode_backend(h, ffmpeg) as _be:
-                f = build_srm(video, fps, ffmpeg=ffmpeg, crop=crop, mmap_path=mp, backend=_be)
+                f = build_srm(video, fps, ffmpeg=ffmpeg, crop=crop, mmap_path=mp, backend=_be, reporter=sub)
             cache_mod.save_meta(cache_dir, video, len(f.srm), f.fps, crop=crop)
             return f
         mp = (Path(tempfile.mkdtemp(prefix="geomsrm_")) / "f.f16") if low_mem else None
         with decode_backend(h, ffmpeg) as _be:
-            return build_srm(video, fps, ffmpeg=ffmpeg, crop=crop, mmap_path=mp, backend=_be)
+            return build_srm(video, fps, ffmpeg=ffmpeg, crop=crop, mmap_path=mp, backend=_be, reporter=sub)
 
-    ref2 = _srm(Path(ref.src), fps_ref, G["crop_ref"])
-    dub2 = _srm(Path(dub_audio), fps_dub, G["crop_dub"])
+    ref2 = _srm(Path(ref.src), fps_ref, G["crop_ref"], part(rep, 0.40, 0.70))
+    dub2 = _srm(Path(dub_audio), fps_dub, G["crop_dub"], part(rep, 0.70, 0.96))
     # VFR-оси пересобранных SRM: кроп не меняет НАБОР кадров → ось из того же исходника
     # (build_srm/load_srm приложили сами); валидность длины сверяет вызывающий.
     ax_ref2, ax_dub2 = ref2.pts, dub2.pts
@@ -603,9 +595,10 @@ def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
                            if ax_ref2 is None else (ref2.srm, fps_ref, dict(_no_tc)))
     dsrm, fps_dub2, tcd = (_detelecine(dub2.srm, fps_dub, tmp_dir=_tctmp)
                            if ax_dub2 is None else (dub2.srm, fps_dub, dict(_no_tc)))
-    if progress is not None:
-        progress(Progress("geom", 0.95, "повторное грубое соответствие", di, dt, dnm))
-    off0, _, _, _ = (coarse_windowed if low_mem else coarse_robust)(dsrm, rsrm)
+    if rep is not None:
+        rep.mark(0.96, "повторное грубое соответствие")
+    off0, _, _, _ = (coarse_windowed(dsrm, rsrm, on_prog=part(rep, 0.96, 1.0)) if low_mem
+                     else coarse_robust(dsrm, rsrm))
     return rsrm, dsrm, off0, G, fps_ref2, fps_dub2, tcr, tcd, ax_ref2, ax_dub2
 
 
@@ -674,7 +667,10 @@ def conform_features(
     при повторе пропуск декода аудио и матчинга. ТЗ: doc/ТЗ_чекпоинты_conform.md. (CK1 SRM
     дубля — в conform_pair выше.)"""
     t0 = time.perf_counter()
-    di, dt, dnm = progress_meta
+
+    def _rep(stage: str, detail: str = "") -> Reporter | None:
+        return Reporter.of(progress, stage, progress_meta, detail)
+
     name = dub_name or (dub.src.name if dub.src else dub_audio.name)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -726,20 +722,21 @@ def conform_features(
     _ck3 = (_load_align_ckpt(out_path, N, _astamp)
             if (keep_tmp and cache_dir is not None and not _is_tc) else None)
     cache_mod._a("CK3 зрение", _ck3 is not None, out_path.stem)        # реюз матчинга (пропуск GPU-матчинга)
-    _band_prog = ((lambda f: progress(Progress("band", f, "сопоставление кадров в полосе поиска", di, dt, dnm)))
-                  if progress is not None else None)
+    _band = None
     if _ck3 is not None:
         pred, asg, cut_intervals = _ck3
     else:
-        if progress is not None:
-            progress(Progress("coarse", 0.0, "оценка общего смещения", di, dt, dnm))
-        off0, _, n_keep, chain_aj0 = (coarse_windowed if low_mem else coarse_robust)(syn, refv)  # 3.2: длинные файлы
+        _coarse = _rep("coarse", "оценка общего смещения")
+        if _coarse is not None:
+            _coarse.mark(0.0)
+        off0, _, n_keep, chain_aj0 = (coarse_windowed(syn, refv, on_prog=_coarse) if low_mem
+                                      else coarse_robust(syn, refv))  # 3.2: длинные файлы
         # ── ГЕЙТ: грубый проход не нашёл структуру (n_keep≈0) → зрение слепнет от геом-рассинхрона
         #     (кроп/зум/анаморф/полосы) → геом-разбор + пересборка SRM с crop ДО отсечки «чужое видео». ──
         if n_keep < GEOM_GATE:
             _rv, _sn, _o0, _G, _fr, _fd, _tcr, _tcd, _axr, _axd = _try_geom(
                 ref, dub_audio, fps_ref, fps_tst, low_mem,
-                cache_dir, keep_tmp, ffmpeg, progress, (di, dt, dnm))
+                cache_dir, keep_tmp, ffmpeg, _rep("geom"))
             if _G is not None:
                 refv, syn, off0, geom_info = _rv, _sn, _o0, _G
                 fps_ref, fps_tst, N = _fr, _fd, len(syn)        # детелесин внутри geom → обновлённые fps
@@ -756,12 +753,19 @@ def conform_features(
             if ax_dub is None:
                 syn, fps_tst, tc_dub = _detelecine(syn, fps_tst, tmp_dir=_tctmp)
             N = len(syn)
-            off0, _, n_keep, chain_aj0 = (coarse_windowed if low_mem else coarse_robust)(syn, refv)
-        if progress is not None:
-            progress(Progress("band", 0.0, "сопоставление кадров в полосе поиска", di, dt, dnm))
+            _coarse = _rep("coarse", "повторная оценка после прореживания каденса")
+            if _coarse is not None:
+                _coarse.mark(0.0)
+            off0, _, n_keep, chain_aj0 = (coarse_windowed(syn, refv, on_prog=_coarse) if low_mem
+                                          else coarse_robust(syn, refv))
+        _band = _rep("band", "сопоставление кадров в полосе поиска")
+        if _band is not None:
+            _band.mark(0.0)
         pred = band_align(syn, refv, off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
-                          free_start=free_start, on_prog=_band_prog, chain_aj=chain_aj0,
+                          free_start=free_start, on_prog=part(_band, 0.0, 0.85), chain_aj=chain_aj0,
                           chain_off=(off0[chain_aj0] if chain_aj0 is not None else None))
+        if _band is not None:
+            _band.mark(0.85, "разбор уровней и краёв")
 
         # === НОВЫЙ слой: единое правило по СДВИГУ УРОВНЯ (вместо restore_blind + R-фильтра) ===
         # Доп-проходы на краях идут ПЕРЕД разбором (возвращают совпадающий опенинг/концовку).
@@ -793,7 +797,7 @@ def conform_features(
     if assigned_pct < ABORT_ASSIGNED_PCT and not coarse_strong and geom_info is None:
         _rv, _sn, _o0, _G, _fr, _fd, _tcr, _tcd, _axr, _axd = _try_geom(
             ref, dub_audio, fps0_ref, fps0_tst, low_mem,
-            cache_dir, keep_tmp, ffmpeg, progress, (di, dt, dnm))
+            cache_dir, keep_tmp, ffmpeg, _rep("geom"))
         if _G is not None:
             refv, syn, off0, geom_info = _rv, _sn, _o0, _G
             fps_ref, fps_tst, N = _fr, _fd, len(syn)
@@ -801,10 +805,13 @@ def conform_features(
             ax_dub = _axd if (_axd is not None and len(_axd) == len(syn)) else None
             if _tcr is not None: tc_ref = _tcr
             if _tcd is not None: tc_dub = _tcd
-            if progress is not None:
-                progress(Progress("band", 0.0, "сопоставление кадров после коррекции", di, dt, dnm))
+            _band = _rep("band", "сопоставление кадров после коррекции")
+            if _band is not None:
+                _band.mark(0.0)
             pred = band_align(syn, refv, off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
-                              free_start=free_start, on_prog=_band_prog)
+                              free_start=free_start, on_prog=part(_band, 0.0, 0.85))
+            if _band is not None:
+                _band.mark(0.85, "разбор уровней и краёв")
             if recover_edges:
                 n_recovered = _recover_edges(syn, refv, pred)
             creep_zones = _creep_drop(syn, refv, pred, fps_tst)
@@ -829,8 +836,8 @@ def conform_features(
 
     # --- ВИДЕО-КАРТА анализатором зрения (ЕДИНСТВЕННЫЙ путь): детект ступеней + ломаная вместо
     #     ската. tg_s со ступенями на резах (без maximum.accumulate) — резы перекроет тишина ниже. ---
-    if progress is not None:                                   # карта зрения быстрая → лид-ин к декоду аудио
-        progress(Progress("extract", 0.0, "декодирование звука исходного файла", di, dt, dnm))
+    if _band is not None:
+        _band.mark(0.88, "построение карты соответствия")
     # Длина рефа: по VFR-оси = время последнего кадра + средний кадр (индекс/fps на VFR врёт).
     dur_ref = (float(ax_ref[-1]) + 1.0 / fps_ref) if ax_ref is not None else len(refv) / fps_ref
     cos_asg = _cos_anchors(syn, refv, pred, asg)   # cos якорей: вес анализатора зрения И единого графика
@@ -842,6 +849,9 @@ def conform_features(
     # буфер out на C каналов, варп применяется к каждому каналу. Анализ (band/muq) идёт по моно
     # (среднее всех каналов) — варп один на все каналы, фаза между каналами сохраняется.
     n_out = int(dur_ref * SR)
+    _extract = _rep("extract", "декодирование звука озвучки")
+    if _extract is not None:
+        _extract.mark(0.0)
     dub_ch, dub_layout = probe_audio_channels(dub_audio, FFPROBE, atrack=dub_atrack)
     aud_cleanup = out_tmp = ref_tmp = None
     memlog('перед декодом аудио озвучки')
@@ -854,19 +864,19 @@ def conform_features(
             dest = (cache_mod.audio_raw(cache_dir, dub_audio, dub_atrack)
                     if (keep_tmp and cache_dir is not None) else None)
             aud, aud_cleanup = _decode_audio_mmap(dub_audio, ffmpeg, audio_fix, channels=dub_ch,
-                                                 atrack=dub_atrack,
-                                                 progress=progress, progress_meta=(di, dt, dnm),
-                                                 label="аудио озвучки", dest=dest)  # int16-memmap [N,C]
+                                                 atrack=dub_atrack, reporter=_extract,
+                                                 dest=dest)  # int16-memmap [N,C]
             if dest is not None:
                 cache_mod.save_audio_meta(cache_dir, dub_audio, dub_ch, atrack=dub_atrack)   # CK2 мета (+EXT_VER)
         n_aud = len(aud)
         out_tmp = Path(tempfile.mkdtemp(prefix="out_", dir=str(tmp))) / "out.f32"
         out = np.memmap(out_tmp, dtype=np.float32, mode="w+", shape=(n_out, dub_ch))
         BLK = 30 * SR                                    # 30с кусок: индексы и чтение аудио — по куску
+        _resample = _rep("resample", "перекладка звука на таймлайн референса")
         for s1 in range(0, n_out, BLK):
             s2 = min(s1 + BLK, n_out)
-            if progress is not None:
-                progress(Progress("resample", s2 / max(1, n_out), "перекладка звука на таймлайн референса", di, dt, dnm))
+            if _resample is not None:
+                _resample(s2 / max(1, n_out))
             src = np.interp(np.arange(s1, s2) / SR, grid, tg_s) * SR
             # Полоса [a1:a2] покрывает src. clamp в [0,n_aud] обязателен: карта (vision/любая)
             # может указывать ЗА пределы аудио дубля (дубль КОРОЧЕ рефа → хвостовые блоки src за
@@ -880,14 +890,15 @@ def conform_features(
         memlog('после ресэмпла звука по зрению')
     else:
         aud = _decode_audio(dub_audio, ffmpeg, audio_fix, channels=dub_ch, atrack=dub_atrack,
-                           progress=progress, progress_meta=(di, dt, dnm), label="аудио озвучки")
+                           reporter=_extract)
         n_aud = len(aud)
         t_out = np.arange(n_out) / SR
         t_syn_at = np.interp(t_out, grid, tg_s)
         src = t_syn_at * SR; sg = np.arange(len(aud))
         out = np.empty((n_out, dub_ch), np.float32)
-        if progress is not None:
-            progress(Progress("resample", 0.5, "перекладка звука на таймлайн референса", di, dt, dnm))
+        _resample = _rep("resample", "перекладка звука на таймлайн референса")
+        if _resample is not None:
+            _resample.mark(0.5)
         for ch in range(dub_ch):
             out[:, ch] = warp_interp(aud[:, ch], src)        # sg=arange(len(aud)) → grid; GPU/CPU
         del aud, t_out, t_syn_at, src, sg   # 1.2: освобождаем крупные индекс-массивы сразу после ресэмпла
@@ -931,7 +942,7 @@ def conform_features(
             ra = ref_audio
             if ra is None and ref.src is not None:
                 ra = _decode_audio(Path(ref.src), ffmpeg, False, atrack=ref_atrack,
-                                  progress=progress, progress_meta=(di, dt, dnm), label="аудио рефа")
+                                  reporter=_rep("extract", "аудио рефа"))
             if ra is not None:
                 m = min(len(ra), n_out)
                 if low_mem:
@@ -953,8 +964,6 @@ def conform_features(
     band_on = audio_band and ref_buf is not None
     muq_on = (not band_on) and audio_muq and ref_buf is not None
     anchor_on = band_on or muq_on
-    ap = ((lambda f, s: progress(Progress("audio", f, s, di, dt, dnm)))
-          if progress is not None else None)
 
     # --- настоящие вырезы: ТИШИНА (синхронное заполнение рефом — финальным проходом ниже) ---
     real_cuts_s = sum(b - a for a, b in fill_spans)      # вырезы УЖЕ занулены выше (резы build_curve)
@@ -984,16 +993,17 @@ def conform_features(
     # --- НОВЫЙ аудио-слой (Band/MuQ) — ПОСЛЕ заливки вырезов: видит реф/тишину в вырезе (как
     #     боевой off, на чём валидирован), а не сырой дубль → без ложного краевого реза. Варпит out.
     memlog('перед аудио-слоем')
+    _audio = _rep("audio", "звуковой анализ") if anchor_on else None
     if anchor_on:
         from .anchor import apply as _anchor          # ленивый импорт: GPU+опц. transformers только при выборе
-        if progress is not None:
-            progress(Progress("audio", 0.0, "звуковой анализ", di, dt, dnm))
+        if _audio is not None:
+            _audio.mark(0.0)
         # CK4: кэш benv рефа (coarse_dtw) — реф переиспользуется между дублями эпизода/запусками (keep_tmp).
         _dsp_cache = (cache_mod.dsp_ref_path(cache_dir, ref.src, ref_atrack)
                       if (keep_tmp and cache_dir is not None and ref.src is not None) else None)
         audio_resid_ms = _anchor.audio_anchor(
             out, ref_buf, fps_ref, method=("muq" if muq_on else "band"),
-            apply_cuts=apply_cuts, drift_speed_pct=drift_speed_pct, info=audio_info, progress=ap,
+            apply_cuts=apply_cuts, drift_speed_pct=drift_speed_pct, info=audio_info, progress=part(_audio, 0.0, 0.70),
             plot_dir=out_path.parent / "_plots", plot_stem=out_path.stem, render_own=False,
             vision_spans=fill_spans, dsp_cache=_dsp_cache)   # зоны тишины зрения + CK4-кэш benv рефа
             # render_own=False: band свой график НЕ рисует — conform строит ЕДИНЫЙ (зрение+аудио) ниже
@@ -1002,6 +1012,8 @@ def conform_features(
     #     рефу). В дырах озвучки (резы, вырезы, края), где реф звучит, подставляем синхронный
     #     реф. На несинхронной дорожке (аудио off) НЕ делаем — там вставка плодит рассинхрон. ---
     memlog('после аудио-слоя')
+    if _audio is not None:
+        _audio.mark(0.70, "заполнение тишины рефом")
     ref_filled_s = 0.0
     if fill_silence and anchor_on and ref_buf is not None:
         ref_filled_s = _fill_silence_from_ref(out, ref_buf)
@@ -1010,6 +1022,8 @@ def conform_features(
 
     # --- ЕДИНЫЙ график укладки: ЗРЕНИЕ (всегда, видео-укладка) + АУДИО (если был anchor-слой).
     #     Read-only: падение не роняет conform. 1 панель (только зрение) / 2 панели (зрение+аудио). ---
+    if _audio is not None:
+        _audio.mark(0.78, "графики укладки")
     unified_plots: list[dict] = []
     try:
         from .anchor import plots_unified as _pu
@@ -1084,13 +1098,12 @@ def conform_features(
     except Exception:  # noqa: BLE001 — графики не должны ронять conform
         unified_plots = []
 
-    _wprog = ((lambda f: progress(Progress("write", f, out_path.name, di, dt, dnm)))
-              if progress is not None else None)
-    if progress is not None:
-        progress(Progress("write", 0.0, out_path.name, di, dt, dnm))
+    _write = _rep("write", out_path.name)
+    if _write is not None:
+        _write.mark(0.0)
     memlog('перед записью файла')
     try:
-        _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_wprog)  # FLAC, раскладка дубля
+        _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_write)  # FLAC, раскладка дубля
     finally:
         # ⚠ Уборка ОБЯЗАНА идти при любом исходе. Раньше она стояла просто после записи:
         # запись падала — и десятки гигабайт промежуточных файлов оставались лежать
@@ -1242,7 +1255,10 @@ def _align_audio_only(
     скорость аудио) и структурные расхождения за пределами охвата prealign/DTW.
     PairResult.mode="audio"; поля зрения (assigned/cos/slope) не имеют смысла и остаются 0."""
     t0 = time.perf_counter()
-    di, dt, dnm = progress_meta
+
+    def _rep(stage: str, detail: str = "") -> Reporter | None:
+        return Reporter.of(progress, stage, progress_meta, detail)
+
     dub_audio = Path(dub_audio)
     name = dub_name or dub_audio.name
     out_path = Path(out_path)
@@ -1267,8 +1283,8 @@ def _align_audio_only(
                     if (keep_tmp and cache_dir is not None) else None)
             aud, aud_cleanup = _decode_audio_mmap(dub_audio, ffmpeg, True, channels=dub_ch,
                                                   atrack=dub_atrack,
-                                                  progress=progress, progress_meta=(di, dt, dnm),
-                                                  label="аудио озвучки", dest=dest)
+                                                  reporter=_rep("extract", "декодирование звука озвучки"),
+                                                  dest=dest)
             if dest is not None:
                 cache_mod.save_audio_meta(cache_dir, dub_audio, dub_ch, atrack=dub_atrack)   # CK2 мета (+EXT_VER)
         out_tmp = Path(tempfile.mkdtemp(prefix="out_", dir=str(tmp))) / "out.f32"
@@ -1282,7 +1298,7 @@ def _align_audio_only(
         del aud
     else:
         aud = _decode_audio(dub_audio, ffmpeg, True, channels=dub_ch, atrack=dub_atrack,
-                            progress=progress, progress_meta=(di, dt, dnm), label="аудио озвучки")
+                            reporter=_rep("extract", "декодирование звука озвучки"))
         out = np.zeros((n_out, dub_ch), np.float32)
         m = min(len(aud), n_out)
         out[:m] = aud[:m]
@@ -1295,7 +1311,7 @@ def _align_audio_only(
             ra = ref_audio
             if ra is None and ref.src is not None:
                 ra = _decode_audio(Path(ref.src), ffmpeg, True, atrack=ref_atrack,
-                                  progress=progress, progress_meta=(di, dt, dnm), label="аудио рефа")
+                                  reporter=_rep("extract", "аудио рефа"))
             if ra is not None:
                 mr = min(len(ra), n_out)
                 if low_mem:
@@ -1315,21 +1331,22 @@ def _align_audio_only(
     anchor_on = band_on or muq_on
     audio_resid_ms = 0.0
     audio_info: dict = {}
+    _audio = _rep("audio", "звуковой анализ (файл без видеоряда)") if anchor_on else None
     if anchor_on:
         from .anchor import apply as _anchor
-        if progress is not None:
-            progress(Progress("audio", 0.0, "звуковой анализ (файл без видеоряда)", di, dt, dnm))
-        ap = ((lambda f, s: progress(Progress("audio", f, s, di, dt, dnm)))
-              if progress is not None else None)
+        if _audio is not None:
+            _audio.mark(0.0)
         _dsp_cache = (cache_mod.dsp_ref_path(cache_dir, ref.src, ref_atrack)
                       if (keep_tmp and cache_dir is not None and ref.src is not None) else None)
         audio_resid_ms = _anchor.audio_anchor(
             out, ref_buf, fps_ref, method=("muq" if muq_on else "band"),
-            apply_cuts=apply_cuts, drift_speed_pct=drift_speed_pct, info=audio_info, progress=ap,
+            apply_cuts=apply_cuts, drift_speed_pct=drift_speed_pct, info=audio_info, progress=part(_audio, 0.0, 0.70),
             plot_dir=out_path.parent / "_plots", plot_stem=out_path.stem,
             render_own=True,                       # свой график band: панели зрения в этом режиме нет
             vision_spans=None, dsp_cache=_dsp_cache)
 
+    if _audio is not None:
+        _audio.mark(0.70, "заполнение тишины рефом")
     ref_filled_s = 0.0
     if fill_silence and anchor_on and ref_buf is not None:
         ref_filled_s = _fill_silence_from_ref(out, ref_buf)
@@ -1348,12 +1365,11 @@ def _align_audio_only(
         if abs(audio_resid_ms) > 80.0:
             warns.append(f"остаточное рассогласование {audio_resid_ms:.0f} мс — больше допустимых ±80 мс")
 
-    _wprog = ((lambda f: progress(Progress("write", f, out_path.name, di, dt, dnm)))
-              if progress is not None else None)
-    if progress is not None:
-        progress(Progress("write", 0.0, out_path.name, di, dt, dnm))
+    _write = _rep("write", out_path.name)
+    if _write is not None:
+        _write.mark(0.0)
     try:
-        _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_wprog)
+        _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_write)
     finally:
         if low_mem:                                      # уборка при любом исходе (см. видео-путь)
             del out
@@ -1410,6 +1426,9 @@ def conform_pair(
                                  progress=progress, progress_meta=progress_meta,
                                  low_mem=low_mem, cache_dir=cache_dir, keep_tmp=keep_tmp,
                                  dub_name=dub_video.name, should_stop=should_stop, **opts)
+    _decode = Reporter.of(progress, "decode", progress_meta, "разбор файла")
+    if _decode is not None:
+        _decode.mark(0.0)
     # CK1: попытка взять SRM дубля из кэша серии (пропуск GPU-декода).
     dub = cache_mod.load_srm(cache_dir, dub_video) if (keep_tmp and cache_dir is not None) else None
     if dub is not None:
@@ -1429,8 +1448,8 @@ def conform_pair(
         tmpdir.mkdir(parents=True, exist_ok=True)
         mp = Path(tempfile.mkdtemp(prefix="srm_", dir=str(tmpdir))) / "dub.f16"
     with decode_backend(probe_resolution(dub_video), ffmpeg) as _be:   # 1080+ → GPU (потолок NVDEC), иначе CPU
-        dub = build_srm(dub_video, fps_dub, ffmpeg=ffmpeg, progress=progress,
-                        should_stop=should_stop, progress_meta=progress_meta, mmap_path=mp, backend=_be)
+        dub = build_srm(dub_video, fps_dub, ffmpeg=ffmpeg, reporter=_decode,
+                        should_stop=should_stop, mmap_path=mp, backend=_be)
     if into_cache:
         cache_mod.save_meta(cache_dir, dub_video, len(dub.srm), dub.fps)   # CK1 мета (+EMB_VER)
     try:

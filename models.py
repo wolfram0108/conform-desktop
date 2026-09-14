@@ -38,7 +38,7 @@ class SrmFeatures:
 class Progress:
     """Снимок прогресса для коллбэка (демон превращает в % для WEB)."""
 
-    stage: str                 # "decode" | "align" | "resample" | "write"
+    stage: str                 # decode | coarse | geom | band | extract | resample | audio | write
     pct: float                 # 0..1 внутри этапа
     detail: str = ""
     dub_index: int = 0

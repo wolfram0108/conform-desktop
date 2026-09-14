@@ -19,7 +19,7 @@ def _benv(x):
     return E / (E.std(2, keepdim=True) + 1e-6)
 
 @torch.no_grad()
-def drift(refz, dubz, T, win=WIN):
+def drift(refz, dubz, T, win=WIN, on_prog=None):
     w = int(win*SR); half = w//2; out = np.empty(len(T))
     n = min(int(refz.shape[0]), int(dubz.shape[0]))      # окна не за конец дорожки (короткие)
     for i in range(0, len(T), 256):
@@ -37,4 +37,5 @@ def drift(refz, dubz, T, win=WIN):
         den = y0 - 2*y1 + y2
         off = torch.where(den.abs() > 1e-9, 0.5*(y0-y2)/den, torch.zeros_like(den)).clamp(-1, 1)
         lg = lags[sel].float(); out[i:i+256] = ((lg[k]+off)/fps*1000.0).cpu().numpy()
+        if on_prog is not None: on_prog((i + 256) / len(T))
     return out/FRAME

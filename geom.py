@@ -32,6 +32,8 @@ from scipy.signal import fftconvolve
 
 from track_muxer.conform.config import FFMPEG, FFPROBE
 from track_muxer.conform import procreg
+from track_muxer.conform.features import probe_video_duration
+from track_muxer.conform.progress import part
 
 try:
     import cv2
@@ -129,15 +131,18 @@ def crop_detect(video: Path, *, thr: int = 20, samples=(120, 300, 500, 700, 900)
 
 
 # ── ШАГ 1: слепки → якоря без модели времени ──
-def _decode_sig(video: Path, crop: str):
+def _decode_sig(video: Path, crop: str, on_prog=None):
     """Потоковый декод (после среза полей) → дескриптор кадра [N,22]:
     6 гор.зон×RGB(18) + Y-перцентили p10/p50/p90(3) + новизна(1). + fps. Память O(блока)."""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(video), "-an",
            "-vf", f"crop={crop},scale={DESC_W}:{DESC_H},format=rgb24", "-vsync", "0",
            "-f", "rawvideo", "-"]
     fb = DESC_W * DESC_H * 3
+    fps = probe_fps(video)
+    n_expect = int(round((probe_video_duration(video) or 0.0) * fps)) if on_prog is not None else 0
     p = procreg.popen(cmd, stdout=subprocess.PIPE, bufsize=fb * 1024)
     rows: list[np.ndarray] = []
+    n_done = 0
     prevY = None; buf = b""
     while True:
         chunk = p.stdout.read(fb * 1024)
@@ -157,12 +162,15 @@ def _decode_sig(video: Path, crop: str):
             nov[j] = 0.0 if prevY is None else float(np.abs(Y[j] - prevY).mean())
             prevY = Y[j]
         rows.append(np.concatenate([zones, pcts, nov[:, None]], axis=1))
+        n_done += k
+        if on_prog is not None and n_expect:
+            on_prog(min(0.999, n_done / n_expect))
     p.stdout.close()
     rc_geom = p.wait(); procreg.done(p)
     if rc_geom not in (0, None):   # обрыв декода слепков — не молчать (класс dr-stone ep09)
         raise RuntimeError(f"geom: декод слепков упал (ffmpeg rc={p.returncode}): {Path(video).name}")
     sig = np.concatenate(rows) if rows else np.zeros((0, NZONES * 3 + 4), np.float32)
-    return sig, probe_fps(video)
+    return sig, fps
 
 
 def _to_grid(sig: np.ndarray, fps: float):
@@ -209,11 +217,11 @@ def _fine_check(G_r, ci_s, G_d, td_coarse, w):
     return float(seg[jj]), (lo + jj + half) / GRID_HZ
 
 
-def _find_anchors(ref: Path, dub: Path):
+def _find_anchors(ref: Path, dub: Path, on_prog=None):
     """Кандидаты якорей [(t_ref, t_dub, prom, fine)] после prominence+mutual+fine."""
     cr_ref = crop_detect(ref); cr_dub = crop_detect(dub)
-    sig_r, fps_r = _decode_sig(ref, cr_ref); G_r = _to_grid(sig_r, fps_r)
-    sig_d, fps_d = _decode_sig(dub, cr_dub); G_d = _to_grid(sig_d, fps_d)
+    sig_r, fps_r = _decode_sig(ref, cr_ref, part(on_prog, 0.05, 0.55)); G_r = _to_grid(sig_r, fps_r)
+    sig_d, fps_d = _decode_sig(dub, cr_dub, part(on_prog, 0.55, 0.95)); G_d = _to_grid(sig_d, fps_d)
     G_r = (G_r - G_r.mean(0)) / (G_r.std(0) + 1e-9)
     G_d = (G_d - G_d.mean(0)) / (G_d.std(0) + 1e-9)
     w = np.ones(G_r.shape[1]); w[-1] = W_NOV
@@ -317,21 +325,24 @@ def _consensus_crop(recs, ref_wh, dub_wh):
                 sy=float(np.median([r["sy"] for r in recs])), n=len(recs))
 
 
-def consensus_G(ref: Path, dub: Path):
+def consensus_G(ref: Path, dub: Path, on_prog=None):
     """ПОЛНЫЙ конвейер шаг1+шаг2 → готовые crop для build_srm.
     -> dict(crop_ref, crop_dub, sx, sy, n_in) или None если геометрия не восстановлена.
        crop_ref = 'W:H:X:Y' области рефа, видимой дублем (ROI, native ref-координаты);
        crop_dub = 'W:H:X:Y' среза полей дубля. Оба → build_srm(crop=...)."""
     if not (_HAS_CV2 and _HAS_LOFTR):
         return None
-    good, _, _ = _find_anchors(ref, dub)            # ШАГ 1: синхронизация (якорные времена)
+    good, _, _ = _find_anchors(ref, dub, part(on_prog, 0.0, 0.6))   # ШАГ 1: синхронизация (якорные времена)
     if not good:
         return None
     Wr, Hr = probe_wh(ref); Wd, Hd = probe_wh(dub)
     raw_ref = "%d:%d:0:0" % (Wr, Hr); raw_dub = "%d:%d:0:0" % (Wd, Hd)
     recs = []                                        # ШАГ 2: LoFTR-аффин на RAW-кадрах (полосы=часть аффина)
-    for tc, td, _, _ in good:
+    lp = part(on_prog, 0.6, 1.0)
+    for k, (tc, td, _, _) in enumerate(good):
         rg = _decode_frame(ref, tc, raw_ref); dg = _decode_frame(dub, td, raw_dub)
+        if lp is not None:
+            lp((k + 1) / len(good))
         if rg is None or dg is None:
             continue
         r = _affine_frac(rg, dg)

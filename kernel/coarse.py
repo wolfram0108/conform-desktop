@@ -69,11 +69,12 @@ def coarse_robust(srm_s, srm_r):
     return off, nrel, len(keep), aj2                # aj2 = synth-кадры цепочки (для краевого спасения band)
 
 
-def coarse_windowed(srm_s, srm_r, win=CWIN, ov=COV, sr=CSR):
+def coarse_windowed(srm_s, srm_r, win=CWIN, ov=COV, sr=CSR, on_prog=None):
     """ОКОННЫЙ грубый проход: окна по synth с перекрытием, seed offset ПЕРЕТЕКАЕТ из окна
     в окно, поиск ref только в ПОЛОСЕ ±sr вокруг seed. Память и время ограничены окном
     (не растут с длиной файла). Якорный критерий тот же (_anchors). Возврат как coarse_robust.
-    Бит-в-бит совпал с полным проходом на 26 реальных/синтетических кейсах."""
+    Бит-в-бит совпал с полным проходом на 26 реальных/синтетических кейсах.
+    on_prog(frac) — optional per-window progress hook."""
     N = len(srm_s); Rn = len(srm_r)
     gj_all, gr_all = [], []
     seed = 0; a = 0
@@ -81,6 +82,8 @@ def coarse_windowed(srm_s, srm_r, win=CWIN, ov=COV, sr=CSR):
         b = min(a + win, N)
         r1 = max(0, a + seed - sr); r2 = min(Rn, b + seed + sr)
         aj, ar = _anchors(srm_s[a:b], srm_r[r1:r2])
+        if on_prog is not None:
+            on_prog(b / N)
         if len(aj):
             gj = aj + a; gr = ar + r1
             gj_all.append(gj); gr_all.append(gr)

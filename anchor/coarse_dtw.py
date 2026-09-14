@@ -15,6 +15,7 @@ HW6 ∩ HW18 (короткое окно-матчер + длинное окно-�
 import numpy as np, torch
 from .maps import band as _B
 from .params import FRAME, STEP
+from ..progress import part
 from ..kernel.dropdtw import drop_dtw_affine_guard_amerce, backtrack_affine
 from .. import vision_detect as _VD
 from .. import cache as _cache
@@ -66,7 +67,7 @@ def _whiten(Rr, Dr):
     return wh(Rr.astype(np.float64)), wh(Dr.astype(np.float64))
 
 
-def _banded_dtw(R, Dd, off, *, amerce=AMERCE, diag_prior=DIAG_PRIOR):
+def _banded_dtw(R, Dd, off, *, amerce=AMERCE, diag_prior=DIAG_PRIOR, on_prog=None):
     """MEMORY-BOUNDED Drop-DTW (закон проекта: длительность не ограничена): полоса ±MARG вокруг ТРЕНДА
     off, кусками CHUNK с OVERLAP. colmin по куску (аудио cos≈0.5). СИГНАЛ-АДАПТИВНЫЙ ДИАГ-ПРИОР после
     colmin: штраф diag_prior·|откл.лага от тренда|·wsig, wsig=вес «нет матча ВОКРУГ» (сглаж. 1−colmin,
@@ -92,6 +93,7 @@ def _banded_dtw(R, Dd, off, *, amerce=AMERCE, diag_prior=DIAG_PRIOR):
         for idx, kk in enumerate(range(a, b + 1)):
             q = min(kk - a, b - kk)
             if q > quality[kk]: quality[kk] = q; pred_full[kk] = pred[idx]
+        if on_prog is not None: on_prog((b + 1) / N)
         if b == N - 1: break
     pred_full[pred_full == -2] = -1
     return pred_full
@@ -157,12 +159,12 @@ def _classify(cuts, tR, pred, drs, *, minfr=MINFR):
     return cutsL, insL
 
 
-def _detect_one(Rr, tR, Dr, tD, vspans):
+def _detect_one(Rr, tR, Dr, tD, vspans, on_prog=None):
     """Один масштаб: whiten → banded_dtw(diag-приор) → (o,w) → global_trend/build_curve → roundtrip → classify.
     post-vision: тренд off=0 (поток уже уложен зрением). -> (events_cuts, events_inserts, curve[на tR], o, w)."""
     R, Dd = _whiten(Rr, Dr)
     off = np.clip(np.searchsorted(tR, tD), 0, len(tR) - 1) - np.arange(len(tD))   # ≈0 (диагональ)
-    pred = _banded_dtw(R, Dd, off.astype(np.int64))
+    pred = _banded_dtw(R, Dd, off.astype(np.int64), on_prog=on_prog)
     m = pred >= 0; di = np.where(m)[0]; ri = pred[m]; trf = tR[np.clip(ri, 0, len(tR) - 1)]
     drs = (set(range(int(ri.min()), int(ri.max()) + 1)) - set(int(x) for x in ri)) if m.any() else set()
     sh = (trf - tD[di]) * 1000.0 / FRAME
@@ -200,18 +202,21 @@ def _ref_benv(ref_mono16, ref_cache):
     return _benv(ref_mono16)
 
 
-def detect(ref_mono16, dub_mono16, *, vspans=None, ref_cache=None):
+def detect(ref_mono16, dub_mono16, *, vspans=None, ref_cache=None, on_prog=None):
     """ПОЛНЫЙ детектор: кросс-масштаб (HW6 матчер ∩ HW18 арбитр). Вход — mono @16к (post-vision дубль + реф).
     ref_cache (путь .npy) — CK4: кэш benv рефа (реф переиспользуется между дублями). -> dict: curve
     (кадры, на сетке ts короткого окна), ts, o, w, events_cuts, events_inserts (подтв. кросс-масштабом)."""
-    Er = _ref_benv(ref_mono16, ref_cache); Ed = _benv(dub_mono16)
+    Er = _ref_benv(ref_mono16, ref_cache)
+    if on_prog is not None: on_prog(0.15)
+    Ed = _benv(dub_mono16)
+    if on_prog is not None: on_prog(0.30)
     Rr6, tR6 = _desc(Er, HW_SHORT); Dr6, tD6 = _desc(Ed, HW_SHORT)
-    cutsL, insL, curve, o, w = _detect_one(Rr6, tR6, Dr6, tD6, vspans)
+    cutsL, insL, curve, o, w = _detect_one(Rr6, tR6, Dr6, tD6, vspans, on_prog=part(on_prog, 0.30, 0.75))
     cand = [(t, dv, te, tn) for t, dv, te, tn in cutsL] + [(t, None, None, None) for t, ln in insL]
     conf_c, conf_i = cutsL, insL
     if cand:                                                       # кросс-масштаб ЛЕНИВО: только при кандидатах
         Rr18, tR18 = _desc(Er, HW_LONG); Dr18, tD18 = _desc(Ed, HW_LONG)
-        lc, li, _cv, _o, _w = _detect_one(Rr18, tR18, Dr18, tD18, vspans)
+        lc, li, _cv, _o, _w = _detect_one(Rr18, tR18, Dr18, tD18, vspans, on_prog=part(on_prog, 0.75, 1.0))
         long_t = [t for t, dv, te, tn in lc] + [t for t, ln in li]
         ok = lambda tc: any(abs(t - tc) <= CROSS_TOL_S for t in long_t)
         conf_c = [(t, dv, te, tn) for t, dv, te, tn in cutsL if ok(t)]

@@ -25,7 +25,8 @@ from track_muxer.conform.align import conform_pair
 from track_muxer.conform.config import FFMPEG
 from track_muxer.conform.decode_backend import decode_backend
 from track_muxer.conform.features import build_srm, probe_resolution
-from track_muxer.conform.models import EpisodeResult, PairResult, Progress, SrmFeatures
+from track_muxer.conform.models import EpisodeResult, PairResult, SrmFeatures
+from track_muxer.conform.progress import Reporter
 
 
 def conform_episode(
@@ -67,8 +68,9 @@ def conform_episode(
     total = len(dubs)
 
     # Реф: ref_features → дисковый кеш → декод (+сохранить в кеш).
-    if progress is not None:
-        progress(Progress("decode", 0.0, f"референс {ref_video.name}", 0, total, "референс"))
+    _decode = Reporter.of(progress, "decode", (0, total, "реф"), f"референс {ref_video.name}")
+    if _decode is not None:
+        _decode.mark(0.0)
     ref = ref_features
     if ref is None and cache_dir is not None:
         ref = cache_mod.load_srm(cache_dir, ref_video)        # memmap, если в кеше
@@ -77,20 +79,20 @@ def conform_episode(
         with decode_backend(probe_resolution(ref_video), ffmpeg) as _be:   # 1080+ → GPU (потолок NVDEC), иначе CPU
             if low_mem and cache_dir is not None:             # строим реф ПОТОКОМ прямо в кеш → memmap
                 Path(cache_dir).mkdir(parents=True, exist_ok=True)
-                ref = build_srm(ref_video, fps_ref, ffmpeg=ffmpeg, progress=progress,
-                                should_stop=should_stop, progress_meta=(0, total, "реф"),
+                ref = build_srm(ref_video, fps_ref, ffmpeg=ffmpeg, reporter=_decode,
+                                should_stop=should_stop,
                                 mmap_path=cache_mod.srm_file(cache_dir, ref_video), backend=_be)
                 cache_mod.save_meta(cache_dir, ref_video, len(ref.srm), ref.fps)
             elif low_mem:                                     # без кеша — во временный memmap, удалим в конце
                 td = ref_video.parent / "_tmp"
                 td.mkdir(parents=True, exist_ok=True)
                 ref_tmp = Path(tempfile.mkdtemp(prefix="srmref_", dir=str(td)))
-                ref = build_srm(ref_video, fps_ref, ffmpeg=ffmpeg, progress=progress,
-                                should_stop=should_stop, progress_meta=(0, total, "реф"),
+                ref = build_srm(ref_video, fps_ref, ffmpeg=ffmpeg, reporter=_decode,
+                                should_stop=should_stop,
                                 mmap_path=ref_tmp / "ref.f16", backend=_be)
             else:
-                ref = build_srm(ref_video, fps_ref, ffmpeg=ffmpeg, progress=progress,
-                                should_stop=should_stop, progress_meta=(0, total, "реф"), backend=_be)
+                ref = build_srm(ref_video, fps_ref, ffmpeg=ffmpeg, reporter=_decode,
+                                should_stop=should_stop, backend=_be)
                 if cache_dir is not None:
                     cache_mod.save_srm(cache_dir, ref_video, ref)
     if fps_ref is not None:                       # явный fps перекрывает сохранённый в кеше
@@ -122,8 +124,8 @@ def conform_episode(
                 try:
                     from track_muxer.conform.align import _decode_audio
                     ref_audio = _decode_audio(ref_video, ffmpeg, False, atrack=ref_atrack,
-                                             progress=progress,
-                                             progress_meta=(0, total, "реф"), label="аудио рефа (1 раз)")
+                                             reporter=Reporter.of(progress, "extract", (0, total, "реф"),
+                                                                  "аудио рефа (1 раз)"))
                 except Exception:  # noqa: BLE001 — нет аудио → пары извлекут сами/откатятся на тишину
                     ref_audio = None
             memlog('перед парой (после реф-аудио и SRM)')

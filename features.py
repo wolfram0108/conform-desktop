@@ -18,13 +18,14 @@ from scipy import ndimage
 
 from track_muxer.conform.config import FFMPEG, FFPROBE
 from track_muxer.conform import procreg
-from track_muxer.conform.models import Progress, SrmFeatures
+from track_muxer.conform.models import SrmFeatures
+from track_muxer.conform.progress import Reporter
 
 GW, GH = 128, 72
 KB = np.array([[-1, 2, -1], [2, -4, 2], [-1, 2, -1]], np.float32)
 D1 = np.array([[0, 0, 0], [0, -1, 1], [0, 0, 0]], np.float32)
 T = 3.0
-_RBLOCK = 1024
+_RBLOCK = 256
 
 
 def probe_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
@@ -356,10 +357,12 @@ def build_srm(
     mmap_path: Path | None = None,
     crop: str | None = None,
     backend: str = "cpu",
+    reporter: Reporter | None = None,
 ) -> SrmFeatures:
     """Декод видео + свёртка → SrmFeatures. fps=None → авто (кадры/длительность).
 
-    progress(Progress) вызывается периодически на этапе "decode".
+    Progress of the decode goes to `reporter` (stage Reporter); `progress`+`progress_meta`
+    build one for stage "decode" when no reporter is given.
     should_stop() == True → прерывает декод (RuntimeError("stopped")).
     mmap_path задан → фичи ПОТОКОМ пишутся в raw-файл f16 (в RAM не копятся), srm
     возвращается как np.memmap (read-only). Значения идентичны in-RAM пути (бит-в-бит).
@@ -375,7 +378,7 @@ def build_srm(
     # fps видеопотока — для оценки числа кадров: прогресс-бар И гейт полноты декода (ниже).
     fps_est = fps if fps else probe_fps(video, ffprobe)
     nb_meta, avg_fps = probe_frame_count_hints(video, ffprobe)   # честные источники для гейта
-    di, dt, dname = progress_meta
+    rep = reporter if reporter is not None else Reporter.of(progress, "decode", progress_meta)
 
     vf = (f"crop={crop},scale={GW}:{GH},format=gray" if crop
           else f"scale={GW}:{GH},format=gray")
@@ -389,7 +392,7 @@ def build_srm(
     vecs: list[np.ndarray] = []           # используется только при mmap_path is None
     n_written = 0
     buf = b""
-    t0 = time.perf_counter(); last = t0
+    t0 = time.perf_counter()
     # Ожидаемое число кадров для гейта полноты (ниже) и прогресс-бара. Источники по убыванию
     # честности. `r_frame_rate` — ТОЛЬКО последний фолбэк, он бывает мусорным (48.0 и 90000.0
     # при реальных 23.976 у cvh/Persona99 → гейт ронял честную серию целиком); `avg_frame_rate`
@@ -433,13 +436,10 @@ def build_srm(
                 else:
                     vecs.append(bvs)
                 n_written += k
-                if progress is not None and time.perf_counter() - last >= 2.0:
-                    done = n_written
-                    frac = (done / n_expect) if n_expect else 0.0
-                    kps = done / (time.perf_counter() - t0 + 1e-9)
-                    progress(Progress("decode", min(frac, 0.999),
-                                      f"{done} кадров, {kps:,.0f} к/с", di, dt, dname))
-                    last = time.perf_counter()
+                if rep is not None:
+                    frac = (n_written / n_expect) if n_expect else 0.0
+                    kps = n_written / (time.perf_counter() - t0 + 1e-9)
+                    rep(min(frac, 0.999), f"{n_written} кадров, {kps:,.0f} к/с")
     finally:
         p.stdout.close()
         p.wait(); procreg.done(p)
