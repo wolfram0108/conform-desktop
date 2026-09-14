@@ -14,22 +14,28 @@ import time
 import urllib.request
 from pathlib import Path
 
+_FROZEN = bool(getattr(sys, "frozen", False))
+_HOME = (Path(sys.executable).resolve().parent if _FROZEN
+         else Path(__file__).resolve().parent.parent)     # exe dir or repository root
+
 # ── frozen-бутстрап ДО импорта conform (config.py резолвит ffmpeg при импорте) ──
-if getattr(sys, "frozen", False):
-    _d = Path(sys.executable).resolve().parent
-    for _c in (_d / "_internal", _d):
+if _FROZEN:
+    for _c in (_HOME / "_internal", _HOME):
         if (_c / "ffmpeg.exe").exists():
             os.environ.setdefault("TM_FFMPEG", str(_c / "ffmpeg.exe"))
             os.environ.setdefault("TM_FFPROBE", str(_c / "ffprobe.exe"))
             break
-    # windowed-exe: stdout/stderr = None — любая запись в них (loguru, uvicorn, traceback)
-    # валит процесс. Подменяем ОБА безусловно на файл рядом с exe, до импорта чего-либо.
-    _log_dir = _d / "appdata"
+
+# Any windowed launch (frozen exe or pythonw) has stdout/stderr = None: loguru, uvicorn's
+# logging setup (sys.stdout.isatty()) and tracebacks then kill threads silently. Redirect both
+# to a file before importing anything.
+if sys.stdout is None or sys.stderr is None:
+    _log_dir = _HOME / "appdata"
     _log_dir.mkdir(parents=True, exist_ok=True)
     _log = open(_log_dir / "ui.log", "a", buffering=1, encoding="utf-8", errors="replace")
-    if sys.stdout is None or not hasattr(sys.stdout, "write"):
+    if sys.stdout is None:
         sys.stdout = _log
-    if sys.stderr is None or not hasattr(sys.stderr, "write"):
+    if sys.stderr is None:
         sys.stderr = _log
 
 # ── ГАРАНТИЯ: ни одного консольного окна из ЛЮБОГО кода процесса ──
@@ -127,9 +133,13 @@ def main() -> int:
         # запросы к API (при загрузке с file:// они запрещены политикой безопасности).
         from fastapi.staticfiles import StaticFiles
         _APP.mount("/app", StaticFiles(directory=str(web_dir()), html=True), name="ui")
-        threading.Thread(target=_start_server, daemon=True, name="api").start()
+        api = threading.Thread(target=_start_server, daemon=True, name="api")
+        api.start()
         for _ in range(150):                      # ждём готовности (torch-импорты небыстрые)
             if _health_ok(base):
+                break
+            if not api.is_alive():                # a dead server must be named, not waited for
+                logger.error("встроенный сервер не запустился на порту {}: см. appdata/ui.log", PORT)
                 break
             time.sleep(0.2)
 
