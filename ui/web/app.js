@@ -234,10 +234,9 @@ const TRACK_OPS = [
 const opsOf = sliceI => (sliceI === 0 ? REF_OPS : TRACK_OPS);
 const opName = (sliceI, op) => t(sliceI === 0 ? "op.ref." + op : "op." + op);
 
-/* Нормативы скорости — ЗАМЕРЫ на двух материалах, см.
-   doc/reports/conform_standalone_build/PROGRESS_metrics_design.md §3.
-   Звуковые операции почти не зависят от материала (с на минуту), декод зависит
-   от разрешения и нормируется на пиксели (с на гигапиксель). */
+/* Speed norms are MEASURED on two materials. Audio operations barely depend on the material
+   (seconds per minute); decoding depends on resolution and is normalised to pixels
+   (seconds per gigapixel). */
 const RATE_PER_MIN = {coarse: 0.20, band: 0.70, extract: 0.29, resample: 0.35, audio: 0.43, write: 0.48};
 const decodeRate = h => h >= 1500 ? 0.55 : h >= 900 ? 0.80 : 0.43;   // с / гигапиксель
 const GEOM_SHARE = 0.2;              // геометрия ≈ пятая часть декода (замер: 2:18 против 12:40)
