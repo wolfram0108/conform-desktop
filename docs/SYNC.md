@@ -1,32 +1,42 @@
 # Синхронизация ядра conform (git subtree)
 
-Ядро `src/track_muxer/conform/` — НЕ редактируется в этом репозитории. Канон живёт в
-приватном репозитории `track-muxer` (`src/track_muxer/conform/` — путь ОБЯЗАН совпадать,
-иначе ломаются абсолютные импорты `from track_muxer.conform.… import …`).
+Ядро `src/track_muxer/conform/` в этом репозитории не редактируется. Канон живёт в приватном
+репозитории `track-muxer` по тому же пути: путь обязан совпадать, иначе ломаются абсолютные импорты
+`from track_muxer.conform.… import …`.
 
-Синк — одно-направленный, squash (история канона не тянется):
+Перенос односторонний, со сжатием истории. Источник — ветка `main` канона.
+
+## Порядок
+
+| Шаг | Где | Команда |
+|---|---|---|
+| 1 | канон | `git subtree split --prefix=src/track_muxer/conform main -b conform-split` |
+| 2 | здесь | `git subtree pull --squash --prefix=src/track_muxer/conform <путь к канону> conform-split` |
+| 3 | здесь | `python build/accept.py run` — приёмка на новом ядре |
+| 4 | канон | `git branch -D conform-split` |
+
+Стандартный `git subtree` кладёт в префикс корень ветки целиком, а нужен подкаталог; поэтому история
+подкаталога сначала выделяется во временную ветку на стороне канона (шаг 1). Ветка живёт только на время
+переноса: создаётся шагом 1 и удаляется шагом 4.
+
+Сжатый перенос сливает по содержимому, а не по истории: он проходит и тогда, когда хэши выделенной
+ветки отличаются от прошлого переноса. Итог проверяется равенством деревьев:
 
 ```bash
-# первый раз (уже сделано):
-git subtree add  --squash --prefix=src/track_muxer/conform <track-muxer-url-или-путь> main:src/track_muxer/conform  # см. ниже
-
-# обновление ядра до текущего main track-muxer:
-git subtree pull --squash --prefix=src/track_muxer/conform <track-muxer-url-или-путь> main
+git rev-parse HEAD:src/track_muxer/conform                       # здесь
+git -C <путь к канону> rev-parse main:src/track_muxer/conform    # в каноне — то же значение
 ```
 
-⚠ Стандартный `git subtree` тянет ветку ЦЕЛИКОМ и кладёт её корень в prefix. Нам нужен
-ПОДКАТАЛОГ ветки (`src/track_muxer/conform` → `src/track_muxer/conform`). Это делается
-через split на стороне канона:
+## Приёмка после переноса
 
-```bash
-# в клоне track-muxer: выделить историю подкаталога во временную ветку
-git subtree split --prefix=src/track_muxer/conform main -b conform-split
+`python build/accept.py run` прогоняет контрольный материал через локальный API и сверяет сумму выхода
+с эталоном `installer/selfcheck/reference.json` — тем же, по которому загрузчик проверяет установку.
 
-# в conform-desktop: добавить/обновить из этой ветки
-git subtree add  --squash --prefix=src/track_muxer/conform <путь-к-track-muxer> conform-split   # первый раз
-git subtree pull --squash --prefix=src/track_muxer/conform <путь-к-track-muxer> conform-split   # обновление
-```
+| Исход | Значение | Действие |
+|---|---|---|
+| принято | выход побайтно равен эталонному | перенос завершён |
+| не принято, сумма иная | алгоритм изменил выход на контрольном материале | сравнить рассогласование и покрытие с эталоном; новый эталон — `python build/accept.py bless <запись>`, отдельным осознанным коммитом, вместе с пересборкой дистрибутива |
+| дефект прибора | наблюдение не состоялось | читать журнал предмета в `_work/accept/<метка>/subject.log` |
 
-Правило: любые изменения алгоритма → сначала в track-muxer (со стендами и регрессом),
-затем subtree pull сюда. Патчи к ядру в этом репозитории не принимаются (PR в ядро —
-только через канон).
+Правило: изменения алгоритма вносятся в канон, затем переносятся сюда. Правки ядра в этом репозитории
+не принимаются.
