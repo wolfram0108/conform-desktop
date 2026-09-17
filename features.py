@@ -110,9 +110,57 @@ def probe_audio_channels(video: Path, ffprobe: str = FFPROBE,
     return (max(1, ch), layout if layout and layout != "unknown" else None)
 
 
+def _stream_starts(video: Path, ffprobe: str) -> list[tuple[str, float]] | None:
+    """[(codec_type, start_time)] of every stream in container order; None when ffprobe output is unusable."""
+    r = procreg.run(
+        [ffprobe, "-v", "error", "-show_entries", "stream=codec_type,start_time", "-of", "json", str(video)],
+        capture_output=True, text=True,
+    )
+    try:
+        return [(str(s.get("codec_type")), float(s.get("start_time") or 0.0))
+                for s in json.loads(r.stdout or "{}").get("streams") or []]
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def probe_av_delay(video: Path, ffprobe: str = FFPROBE, atrack: int = 0) -> float:
+    """Container delay video_start − audio_start (s) of the file, 0.0 without one of the streams.
+    Each stream is decoded from its own zero, so the audio must be moved by this value to sit
+    on the video's time axis (positive: audio leads the video and its head is trimmed)."""
+    starts = _stream_starts(video, ffprobe)
+    if starts is None:
+        return 0.0
+    v = next((t for kind, t in starts if kind == "video"), None)
+    audio = [t for kind, t in starts if kind == "audio"]
+    a = audio[int(atrack)] if 0 <= int(atrack) < len(audio) else None
+    if v is None or a is None:
+        return 0.0
+    return float(v - a)
+
+
+def probe_video_start(video: Path, ffprobe: str = FFPROBE) -> float:
+    """Video start on the container timeline (s): first video frame minus the earliest stream start.
+    Sidecar subtitles are timed on the container timeline, conform's axis starts at the first frame."""
+    starts = _stream_starts(video, ffprobe)
+    v = next((t for kind, t in starts or [] if kind == "video"), None)
+    if v is None:
+        return 0.0
+    return float(v - min(t for _, t in starts))
+
+
+def av_delay_filters(delay_s: float) -> list[str]:
+    """ffmpeg audio filters that lay the audio on the video axis for a container delay.
+    Positive delay trims the audio head, negative pads it with silence; |delay| ≤ 1 ms is no-op."""
+    if delay_s > 0.001:
+        return [f"atrim=start={delay_s:.6f}", "asetpts=PTS-STARTPTS"]
+    if delay_s < -0.001:
+        return [f"adelay={int(round(-delay_s * 1000))}:all=1"]
+    return []
+
+
 def probe_audio_tracks(video: Path, ffprobe: str = FFPROBE) -> list[dict]:
     """Список ВСЕХ аудиодорожек файла — для выбора дорожки в UI (реф-дорожка /
-    дорожки озвучек, требование 10 CHARTER standalone). Каждая запись:
+    дорожки озвучек). Каждая запись:
     {index (0-based среди аудио), codec, channels, layout, lang, title, default}.
     Ошибка/нет аудио → []."""
     r = procreg.run(
@@ -188,8 +236,7 @@ def probe_frame_count_hints(video: Path, ffprobe: str = FFPROBE) -> tuple[int | 
     видеопакетов у всех 71 файла, где он есть (0 расхождений).
     ⚠ `avg_frame_rate` НЕ является честным источником на VFR: у Matroska с переменной частотой
     он остаётся номинальным (замер: 24000/1001 при реальных 3237 кадрах за 180с = 17.98) —
-    поэтому при отсутствии `nb_frames` считаем пакеты честно (`probe_packet_count`).
-    Отчёт: doc/reports/conform_input_robustness/."""
+    поэтому при отсутствии `nb_frames` считаем пакеты честно (`probe_packet_count`)."""
     # JSON, не csv: ffprobe выводит поля во ВНУТРЕННЕМ порядке, а не в порядке запроса
     # (проверено: `stream=nb_frames,avg_frame_rate` → csv «avg,nb»), позиционный разбор хрупок.
     r = procreg.run(
@@ -213,8 +260,7 @@ def probe_media_info(path: Path, ffprobe: str = FFPROBE) -> dict:
     """Паспорт файла ОДНОЙ пробой метаданных: длительность, кадр, частота, число кадров.
 
     Нужен панели: показать, с чем работаем, и оценить остаток времени (нормативы
-    привязаны к минутам материала и к гигапикселям декода — см.
-    doc/reports/conform_standalone_build/PROGRESS_metrics_design.md).
+    привязаны к минутам материала и к гигапикселям декода).
 
     Только метаданные, БЕЗ прохода по файлу: цена — доли секунды. Число кадров может
     отсутствовать (VFR, битые заголовки) — тогда оценивается как длительность × частоту,
@@ -276,7 +322,7 @@ def probe_packet_count(video: Path, ffprobe: str = FFPROBE) -> int | None:
 
 def probe_has_video(video: Path, ffprobe: str = FFPROBE) -> bool:
     """Есть ли у файла НАСТОЯЩИЙ видеопоток. Голое аудио (flac/mka/mp3/aac…) → False —
-    признак ветки АУДИО-ONLY conform (требование 9 CHARTER standalone-миссии).
+    признак ветки АУДИО-ONLY conform.
     ⚠ Обложка (attached_pic у mp3/flac) — формально видеопоток, но НЕ видео: исключаем по
     disposition. Ошибка пробы → True (консервативно: пусть падает видео-путь с понятной
     ошибкой, а не молча уходит в аудио-режим)."""

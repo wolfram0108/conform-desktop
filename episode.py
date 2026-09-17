@@ -19,6 +19,7 @@ from pathlib import Path
 from loguru import logger
 
 from track_muxer.conform import cache as cache_mod
+from track_muxer.conform import subs_transfer
 from track_muxer.conform import tmpfiles
 from track_muxer.conform.memlog import memlog
 from track_muxer.conform.align import conform_pair
@@ -98,6 +99,11 @@ def conform_episode(
     if fps_ref is not None:                       # явный fps перекрывает сохранённый в кеше
         ref.fps = float(fps_ref)
 
+    # The reference's own subtitles only move from the container axis to the first-frame axis.
+    ref_dur = (float(ref.pts[-1]) + 1.0 / ref.fps) if ref.pts is not None else len(ref.srm) / ref.fps
+    ref_text_tracks = subs_transfer.transfer_sidecars(
+        ref_video, out_dir, ref_video.stem, subs_transfer.identity_time_map(ref.fps, ref_dur))
+
     # Реф-АУДИО извлекаем ОДИН раз на серию и переиспользуем для всех озвучек (реф может
     # быть на гигабайты — повторное извлечение читало бы весь файл на каждую озвучку).
     # ЛЕНИВО (на первой реально обрабатываемой паре), в RAM; по выходу из функции освобождается.
@@ -114,7 +120,7 @@ def conform_episode(
             break
         atrack = int(dub_atracks[i - 1]) if (dub_atracks and i - 1 < len(dub_atracks)) else 0
         stem = dub_video.stem + (f"__a{atrack}" if atrack else "")   # дорожка≠0 → суффикс (виртуальные дубли)
-        out_path = out_dir / f"{stem}.flac"                     # выход conform — FLAC l12 16/44.1
+        out_path = out_dir / f"{stem}.flac"                     # conform output: FLAC, 16-bit / 44.1 kHz
         old = out_dir / f"{stem}.wav"                           # старый формат (миграция: тоже «готово»)
         done = next((p for p in (out_path, old) if p.exists() and p.stat().st_size > 0), None)
         if skip_existing and done is not None:
@@ -137,11 +143,15 @@ def conform_episode(
                                    ref_atrack=ref_atrack, dub_atrack=atrack,
                                    low_mem=low_mem, cache_dir=cache_dir, keep_tmp=keep_tmp,
                                    **pair_opts)
-            except Exception as e:  # noqa: BLE001 — одна озвучка не валит серию
-                # ⚠ в результат уходит только текст ошибки; без записи в журнал причина
-                # (трасса, этап) теряется навсегда — а прогон мог идти час
-                logger.exception("conform: озвучка {} упала на серии {}", dub_video.name, ref.name)
+            except Exception as e:  # noqa: BLE001 — one dub must not take the episode down
+                # conform_pair records and saves its own trace; this catches only what escaped it.
+                logger.exception("conform: озвучка {} упала на серии {}", dub_video.name, ref_video.name)
                 res = PairResult(dub=dub_video.name, out_path=None, ok=False, error=str(e))
+        # Finished pairs are served too: the stored map makes the transfer free of matching.
+        if res.ok and res.out_path is not None:
+            tmap = subs_transfer.load_time_map(out_path)
+            if tmap is not None:
+                res.text_tracks = subs_transfer.transfer_sidecars(dub_video, out_dir, stem, tmap)
         pairs.append(res)
         if on_pair is not None:
             try:
@@ -163,4 +173,4 @@ def conform_episode(
         cache_mod.clear_dir(cache_dir)
 
     return EpisodeResult(ref=ref_video.name, out_dir=out_dir, pairs=pairs,
-                         elapsed_s=time.perf_counter() - t0)
+                         elapsed_s=time.perf_counter() - t0, ref_text_tracks=ref_text_tracks)

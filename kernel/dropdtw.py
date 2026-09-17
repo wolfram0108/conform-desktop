@@ -1,5 +1,5 @@
-"""Drop-DTW: «выравнивание с пропусками» (numba). Перенос 1-в-1 из
-research/dropdtw_conform/_probe_dropdtw.py — функции движка БЕЗ изменений.
+"""Drop-DTW: «выравнивание с пропусками» (numba). Функции движка перенесены из
+исследовательского прототипа БЕЗ изменений.
 
 Убраны (не нужны в боевом конвейере, тянули датасет/matplotlib):
   ref_window, case_of, probe_case, find_cuts, probe_cut, main.
@@ -290,8 +290,7 @@ def drop_dtw_affine_guard_amerce(C, OPEN, EXT, DSYN, MATCH_THR, AMERCE, free_sta
     Плато постоянного лага = диагональ (move 0, без штрафа); лаг меняется через hwarp(move1)/vwarp(move2)
     — им +ω. DROP-ветви (drop_syn DSYN / drop_ref OPEN/EXT) = реальные события, ω их НЕ трогает.
     Подавляет ВАРП-сингулярности (ложные дипы пути); реальное событие (выигрыш ≫ω) берётся.
-    Диаг-приор (тяга к тренду в слепых зонах) добавляется ВЫШЕ в матрицу C (банд-обёртка), не здесь.
-    Референс: doc/reports/audio_bench/REFERENCE_DTW_methods_math.md §5."""
+    Диаг-приор (тяга к тренду в слепых зонах) добавляется ВЫШЕ в матрицу C (банд-обёртка), не здесь."""
     R, S = C.shape
     INF = 1e18
     colmin = np.empty(S, np.float64)

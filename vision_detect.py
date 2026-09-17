@@ -19,9 +19,8 @@ tg_s + МОНОТОНИЗАЦИЯ (дубль нельзя играть наза
   - РЕШАЕТ ДЕЛЬТА (уровень сдвига), не длина: рез — только при ПОСТОЯННОМ изменении дельты;
     дельта ВЕРНУЛАСЬ (экскурсия вниз-вверх) = слепой выброс → мост, НЕ рез (сколько бы якорей);
   - край без опоры (голова/хвост) → экстраполяция плато + ТИШИНА (заливка рефом).
-5 честных параметров (W_CONF/SMAX/TOL/ISLAND_MAX/EDGE_MAX) вместо ~15. История/валидация:
-doc/reports/vision_clean_map/HANDOFF_clean_vision_map.md; прототип bench/_clean_map.py; знак:
-правее=+; кадр=41.708мс.
+5 честных параметров (W_CONF/SMAX/TOL/ISLAND_MAX/EDGE_MAX) вместо ~15. Знак: правее=+;
+кадр=41.708мс.
 """
 from __future__ import annotations
 
@@ -36,7 +35,7 @@ VIS_MAX_SCALE_PCT = 15.0  # санити-гард доверия глобаль�
                           # >15% = якоря мусорные → масштаб не снимаем)
 VIS_SCALE_BIN_S = 25.0    # бин оценки масштаба, с (плато 15-40): давит шум якорей перед медианой
 
-# Чистый построитель — 5 честных параметров (десерты в комментариях; HANDOFF §2)
+# Clean builder: 5 honest parameters
 VIS_W_CONF = 0.5         # порог уверенности якоря (надёжность измерения; w≈0 шум ↔ w≈1 уверен)
 VIS_TOL = 6.0           # джиттер якоря, к (внутри плато якоря дрожат ~1.5к)
 VIS_EDGE_MAX = 12       # короткий первый/последний рун без опоры с краю (якорей) = краевой скачок → фильтр
@@ -46,12 +45,12 @@ VIS_RDP_EPS = 3.0       # RDP: макс отклонение ломаной от
 VIS_SMOOTH_WIN = 8      # окно робастного сглаживания якорей перед RDP, узлов (давит выбросы)
 VIS_ADAPT_THR = 8.0     # адаптив: 90%-невязка прод-прямой ≤ порога → прямая (ступени бит-в-бит), иначе RDP
 
-# Шум зрения на неоднозначном контенте (тёмные/повторные сцены, NTSC «Призрак»): укладка на
-# TV-DENOISING (1D total variation / fused lasso). Короткая экскурсия (даже высокая) не окупает
-# скачок базы → поглощается; устойчивая ступень окупает → база шагает. ГЛОБАЛЬНАЯ оптимизация всей
-# дорожки (без жадной локальной контаминации соседними экскурсиями). Выверено на 690 кэш-дублях
-# (0 регрессий vs прежний скан, −20 ложных резов, чинит шумные хвосты ep05/06), λ-свип = широкое
-# плато [1200,3000]. Память project_layout_tv_denoise.
+# Vision noise on ambiguous content (dark or repeated scenes, NTSC sources): the layout uses
+# TV denoising (1D total variation / fused lasso). A short excursion, even a tall one, does not pay
+# for a base jump and is absorbed; a persistent step pays and the base moves. The optimisation is
+# global over the track, so neighbouring excursions cannot contaminate each other locally.
+# Validated on 690 cached dubs: 0 regressions against the greedy scan, 20 fewer false cuts;
+# the lambda sweep shows a wide plateau [1200,3000].
 VIS_TV_LAM = 1800.0     # порог окупаемости скачка TV, к·сэмпл (плато 1200-3000)
 VIS_TV_STEP_MIN = 8.0   # |Δ уровня| рез, к (>8 убирает мелкую TV-лестницу на гладком гулянии)
 VIS_OUT_THR = 12.0      # |o_res − B(TV)| = выброс → исключить из подгонки кривой, к
@@ -67,12 +66,12 @@ def _wmedian(x, wts):
     return float(x[int(np.searchsorted(cw, 0.5 * cw[-1]))])
 
 
-# ── Запечённый 3:2-телесин (NTSC риперы «пекут» фильм 23.976 в 29.97 без обратного телесина IVTC →
-#    каждый ~5-й кадр временно́й гибрид → SRM шумит → шумная укладка/джиттер якорей). Детект =
-#    пик автокорреляции несхожести соседних кадров на ПЕРИОДЕ 5 (поверх готового SRM 128×72,
-#    РАЗРЕШЕНИЕ-инвариантно). Реакция = мягкий IVTC: дроп избыточного кадра из каждой 5-ки → ~23.976
-#    → чистый матчинг. На не-NTSC / не-телесине — НО-ОП (бит-в-бит). Доказано на 132 синт-клипах +
-#    обоих сезонах «Призрака»: doc/reports/telecine_lab/EXPERIMENTS_telecine_detection.md.
+# ── Baked 3:2 telecine: NTSC rips carry 23.976 film as 29.97 without inverse telecine, so every
+#    ~5th frame is a temporal hybrid, SRM gets noisy and anchors jitter. Detection is the peak of
+#    the autocorrelation of neighbour-frame dissimilarity at PERIOD 5, computed over the ready
+#    128x72 SRM and therefore resolution-invariant. The reaction is a soft IVTC: the redundant
+#    frame of each five is dropped, giving ~23.976 and clean matching. Non-NTSC and non-telecine
+#    input is a bit-exact no-op. Proven on 132 synthetic clips and both seasons of an NTSC-sourced series.
 VIS_TC_NTSC = (29.0, 30.5)      # fps NTSC → кандидат на 3:2-телесин (PAL/film период-5 не дают)
 VIS_TC_FLOOR = 0.05             # мин выступ периода-5 (защита от случайного argmax=5 на шуме)
 _TC_SAMPLE = 6000               # кадров фикс-сэмпла детекта (память O(const), не растёт с длиной)

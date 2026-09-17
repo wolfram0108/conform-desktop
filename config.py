@@ -30,7 +30,7 @@ FFPROBE = _resolve("TM_FFPROBE", "ffprobe.exe")
 # Каталог опционального дискового SRM-кэша (по умолчанию ВЫКЛ — ~1.26 ГБ/файл).
 DEFAULT_CACHE_DIR = Path(os.environ.get("TM_CONFORM_CACHE", PROJECT_ROOT / "_conform_cache"))
 
-# ── Гибридный декод видео CPU/GPU (замеры: doc/reports/decode_bench/PLAN_hybrid_decode.md) ──
+# ── Hybrid CPU/GPU video decode ──
 # 1080+ декодируется на GPU (NVDEC) пока активных cuda-сессий < CUDA_MAX (потолок против деления
 # одного чипа: 4 cuda = +3%, 2 cuda+2 cpu = +13%); <1080 — всегда CPU (там CPU быстрее GPU).
 # Нет CUDA в ffmpeg → всё на CPU (fallback). GPU-декод бит-в-бит идентичен CPU (scale на CPU).

@@ -1,6 +1,6 @@
-"""Следящая полоса + Drop-DTW на целом видео. Перенос 1-в-1 из
-research/dropdtw_conform/_band_align.py — функции coarse_offset, band_align,
-band_align_local_affine, cluster БЕЗ изменений логики/констант.
+"""Следящая полоса + Drop-DTW на целом видео. Функции coarse_offset, band_align,
+band_align_local_affine, cluster перенесены из исследовательского прототипа БЕЗ изменений
+логики/констант.
 
 Убран тестовый main() (датасет/matplotlib). Импорты движка — относительные.
 """

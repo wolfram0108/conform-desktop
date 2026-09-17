@@ -105,6 +105,7 @@ class DubResult(BaseModel):
     audio_max_step_ms: float = 0.0 # band/muq: крупнейший рез, мс
     audio_coverage: float = 0.0    # band/muq: доля трека с надёжными якорями (0..1)
     audio_span_ms: float = 0.0     # band/muq: диапазон движения сдвига, мс
+    mirror_used: bool = False      # dub frames are horizontally mirrored; matched on mirrored features
     geom_used: bool = False        # применена геом-коррекция (кроп/зум/анаморф/полосы) — зрение слепло без неё
     geom_n_in: int = 0             # геом: inlier-якорей консенсуса (надёжность регистрации)
     geom_sx: float = 0.0           # геом: масштаб по X (анаморф = sx≠sy)
@@ -112,9 +113,12 @@ class DubResult(BaseModel):
     plots: list[PlotRef] = Field(default_factory=list)  # PNG-графики укладки
     suspect: bool = False          # авто-флаг брака (cos<0.3 / назнач<90 / ошибка)
     warnings: list[str] = Field(default_factory=list)  # предупреждения «обрати внимание» (с причинами)
-    critical: list[str] = Field(default_factory=list)  # КРАСНОЕ: не исправляемый авто дефект (студийный A/V-десинк)
+    critical: list[str] = Field(default_factory=list)  # red: output sync not trustworthy by the audio layer's result
     error: str | None = None
     elapsed_s: float = 0.0
+    trace: list[dict] = Field(default_factory=list)  # decision trace of the pair (conform.trace)
+    # Sidecar subtitles carried onto the reference timeline: [{source, file, cues_in, cues_out, dropped_drawings, dropped_empty, dropped_duplicates, dropped_settings, error}].
+    text_tracks: list[dict] = Field(default_factory=list)
 
 
 class ConformJob(BaseModel):
@@ -129,7 +133,6 @@ class ConformJob(BaseModel):
     cache_dir: str | None = None       # подкаталог кеша (<серия>/_conform_cache)
     keep_tmp: bool = False             # tmp-чекпоинты: сохранить ВСЁ промежуточное (реф SRM + дубль
                                        # CK1/2/3) → повтор без GPU-декода; OFF → кеш чистится после серии
-                                       # (doc/ТЗ_чекпоинты_conform.md)
     # опции (как в align/CLI)
     fps_ref: str | None = None
     fps_dub: str | None = None
@@ -513,12 +516,13 @@ class ConformQueue:
                     dropped_intro_s=res.dropped_intro_s,
                     audio_cuts=res.audio_cuts, audio_max_step_ms=res.audio_max_step_ms,
                     audio_coverage=res.audio_coverage, audio_span_ms=res.audio_span_ms,
-                    geom_used=res.geom_used, geom_n_in=res.geom_n_in,
+                    mirror_used=res.mirror_used, geom_used=res.geom_used, geom_n_in=res.geom_n_in,
                     geom_sx=res.geom_sx, geom_sy=res.geom_sy,
                     plots=[PlotRef(**p) for p in res.plots],
                     suspect=_suspect(res),
                     warnings=res.warnings, critical=res.critical,
-                    error=res.error, elapsed_s=res.elapsed_s))
+                    error=res.error, elapsed_s=res.elapsed_s, trace=list(res.trace),
+                    text_tracks=list(res.text_tracks)))
                 # +1 доля — реф (slices = dub_total + 1): после k готовых озвучек → (k+1)/(N+1)
                 jj.progress = min(0.999, (len(jj.results) + 1) / (jj.dub_total + 1))
                 jj.updated_at = _now()

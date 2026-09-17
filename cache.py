@@ -36,13 +36,15 @@ D = GW * GH * 2          # размерность вектора кадра (rk+
 # Версии этапов для инвалидации чекпоинтов (режим tmp). Бампать при смене кода ЭТАПА —
 # тогда стухший чекпоинт пересоберётся, а тяжёлое выше возьмётся из кэша. Пользователь не
 # управляет. EMB_VER — SRM/эмбединг (features.build_srm), покрывает кэш SRM рефа И дубля.
-# Полное ТЗ: doc/ТЗ_чекпоинты_conform.md.
 EMB_VER = 1
-EXT_VER = 2              # извлечение аудио (_extract_wav[_mmap]) — кэш аудио CK2
+EXT_VER = 3              # извлечение аудио (_extract_wav[_mmap]) — кэш аудио CK2
+#   v3: audio is laid on the video axis by the container delay (features.probe_av_delay);
+#   v2 caches of files with video_start != audio_start hold the audio shifted by that delay.
 #   v2 (2026-08-06): декод аудио ВСЕГДА идёт через `aresample=async=1:first_pts=0`
 #   (был тумблер audio_fix, выкл. по умолчанию — см. align._extract_base). На чистом входе
 #   данные идентичны v1 (бит-в-бит), но кэш файла С ДЫРОЙ PTS, снятый по v1, рассинхронен.
-DSP_VER = 2             # DSP-48 benv РЕФА (coarse_dtw) — кэш CK4. Бампать при смене benv/полос/ресэмпла.
+DSP_VER = 3             # DSP-48 benv РЕФА (coarse_dtw) — кэш CK4. Бампать при смене benv/полос/ресэмпла.
+#   v3: reference audio decode now applies the container delay (see EXT_VER v3).
 #   v2 (2026-08-06): benv считается по аудио рефа, а его декод изменился (см. EXT_VER).
 
 
