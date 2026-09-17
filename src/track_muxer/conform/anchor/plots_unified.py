@@ -25,6 +25,7 @@ API:
 Read-only диагностика: падение рендера не должно ронять conform. Знак: правее=+; кадр=FRAME мс."""
 from __future__ import annotations
 
+import html
 from pathlib import Path
 
 import numpy as np
@@ -46,6 +47,54 @@ EVENT_STYLE = {
     "dtw_insert": dict(color="#17a020", ls="-", dash="solid", panel=2),
 }
 SPEED_LABEL_MIN_PCT = 0.1        # layout segments slower/faster than the scale by less are not labelled
+LABEL_ROWS = 5                   # rows of event labels under the top edge of a panel
+LABEL_ROW_FRAC = 0.045           # row height as a share of the panel height
+LABEL_CHAR_PX = 5.6              # average glyph width of the label font
+PNG_PLOT_PX = 1300               # width of the plot area in the fixed-size PNG
+HTML_MIN_PLOT_PX = 600           # the HTML chart is responsive: slots are laid out for the narrowest sane width
+PNG_HEADER_CHARS = 250           # header line capacity of the fixed-width PNG at its header font
+ITEM_SEP = " · "
+
+
+def _wrap_items(lines, limit):
+    """Lines no longer than `limit`, broken only between items, so a metric is never split in two."""
+    out = []
+    for line in lines:
+        current = ""
+        for item in line.split(ITEM_SEP):
+            candidate = item if not current else current + ITEM_SEP + item
+            if current and len(candidate) > limit:
+                out.append(current)
+                current = item
+            else:
+                current = candidate
+        out.append(current)
+    return out
+
+
+def _label_slots(items, x0, x1, plot_px):
+    """(row, side) for each (t, text) so that no label covers another one or leaves the plot area;
+    None when every row is taken near that line — the line stays, the text lives in the event list.
+
+    A label is a box beside its line: to the right of it, or to the left when the right side is taken
+    or runs past the axis. Rows go down from the top edge of the panel, inside the plot area, so a
+    label never reaches the panel title above it."""
+    span = max(float(x1) - float(x0), 1e-9)
+    taken = [[] for _ in range(LABEL_ROWS)]
+    slots = [None] * len(items)
+    for i in sorted(range(len(items)), key=lambda k: items[k][0]):
+        t, text = float(items[i][0]), items[i][1]
+        width = (len(text) * LABEL_CHAR_PX + 8) / plot_px * span
+        for row in range(LABEL_ROWS):
+            for side, box in (("right", (t, t + width)), ("left", (t - width, t))):
+                inside = box[0] >= x0 and box[1] <= x1
+                if inside and all(box[1] <= a or box[0] >= b for a, b in taken[row]):
+                    taken[row].append(box)
+                    slots[i] = (row, side)
+                    break
+            if slots[i] is not None:
+                break
+    return slots
 
 
 # ───────────────────────── общие помощники ─────────────────────────
@@ -141,7 +190,7 @@ def _header_lines(passport, lang):
             elif isinstance(v, bool):
                 v = term("value.yes" if v else "value.no", lang)
             parts.append(term("metric." + it["key"], lang, value=v))
-        out.append(f"{term(line_key, lang)}: " + " · ".join(parts))
+        out.append(f"{term(line_key, lang)}: " + ITEM_SEP.join(parts))
     vd = (passport or {}).get("verdict")
     if vd:
         txt = term("metric.verdict", lang, value=term("verdict." + vd, lang))
@@ -202,11 +251,18 @@ def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG,
                 ax.axvspan(a_s, b_s, color="crimson", alpha=(0.16, 0.10)[pi], lw=0, zorder=0)
 
     def draw_events(ax, panel, ylim):
-        for e, est in _events(passport, panel):
+        found = list(_events(passport, panel))
+        texts = [term("event." + e["kind"], lang, value=float(e["value"])) for e, _ in found]
+        slots = _label_slots([(e["t"], tx) for (e, _), tx in zip(found, texts)], xl[0], xl[1], PNG_PLOT_PX)
+        for (e, est), text, slot in zip(found, texts, slots):
             ax.axvline(float(e["t"]), color=est["color"], ls=est["ls"], lw=1.1, alpha=0.9, zorder=6)
-            ax.annotate(term("event." + e["kind"], lang, value=float(e["value"])),
-                        (float(e["t"]), ylim * 0.92), color=est["color"], fontsize=7,
-                        ha="center", va="top", rotation=90, zorder=7)
+            if slot is None:
+                continue
+            row, side = slot
+            ax.annotate(text, (float(e["t"]), 1.0 - 0.012 - row * LABEL_ROW_FRAC), xycoords=("data", "axes fraction"),
+                        xytext=(3 if side == "right" else -3, 0), textcoords="offset points",
+                        color=est["color"], fontsize=7, ha="left" if side == "right" else "right", va="top",
+                        zorder=7)
 
     # --- зрение ---
     ax1.axhline(0, color="#bbb", lw=0.7)
@@ -234,7 +290,7 @@ def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG,
     h1 = [Line2D([], [], marker="o", ls="", color="#3b528b", ms=4), Line2D([], [], color="#ff7f0e", lw=2.6)]
     l1 = [term("legend.anchor_vision", lang), term("legend.layout", lang)]
     hz, lz = _legend(passport, 1, present, lang)
-    ax1.legend(h1 + hz, l1 + lz, loc="upper right", fontsize=7)
+    ax1.legend(h1 + hz, l1 + lz, loc="lower right", fontsize=7)   # the top rows belong to event labels
     fig.colorbar(sc1, ax=ax1, pad=0.01, fraction=0.02).set_label(term("colorbar.cos", lang))
     # --- слух ---
     if two:
@@ -261,12 +317,14 @@ def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG,
         h2 = [Line2D([], [], marker="o", ls="", color="#7f7f7f", ms=4), Line2D([], [], color="#2ca02c", lw=2.2)]
         l2 = [term("legend.anchor_audio", lang), term("legend.audio_curve", lang)]
         hz2, lz2 = _legend(passport, 2, present, lang)
-        ax2.legend(h2 + hz2, l2 + lz2, loc="upper right", fontsize=7)
+        ax2.legend(h2 + hz2, l2 + lz2, loc="lower right", fontsize=7)
         fig.colorbar(sc2, ax=ax2, pad=0.01, fraction=0.02).set_label(term("colorbar.w", lang))
     axb = ax2 if two else ax1
     axb.set_xlabel(f"{term('axis.time', lang)} · {term('axis.time.mmss', lang)}")
     axb.xaxis.set_major_formatter(FuncFormatter(lambda x, _p: f"{x:.0f}\n{_mmss(x)}"))
-    fig.suptitle(title, fontsize=11, y=0.995)
+    # The title is placed by hand above the header; left in the layout it reserves its height twice.
+    fig.suptitle(title, fontsize=11, y=0.995).set_in_layout(False)
+    header = _wrap_items(header, PNG_HEADER_CHARS)       # the PNG has a fixed width: long lines wrap at items
     for i, line in enumerate(header):
         fig.text(0.01, 0.972 - 0.021 * i, line, fontsize=7.5, ha="left", va="top", color="#222")
     fig.tight_layout(rect=(0, 0, 1, 0.975 - 0.021 * len(header)))
@@ -305,11 +363,20 @@ def _html(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG
                                       name=term("zone." + kind, lang), row=1, col=1)
 
     def events(row, panel):
-        for e, est in _events(passport, panel):
+        found = list(_events(passport, panel))
+        texts = [term("event." + e["kind"], lang, value=float(e["value"])) for e, _ in found]
+        slots = _label_slots([(e["t"], tx) for (e, _), tx in zip(found, texts)],
+                             0.0, float(vision["dur"]), HTML_MIN_PLOT_PX)
+        for (e, est), text, slot in zip(found, texts, slots):
             fig.add_vline(x=float(e["t"]), line=dict(color=est["color"], dash=est["dash"], width=1.2),
-                          annotation_text=term("event." + e["kind"], lang, value=float(e["value"])),
-                          annotation_position="top", annotation=dict(font_size=9, font_color=est["color"]),
                           row=row, col=1)
+            if slot is None:
+                continue
+            level, side = slot
+            fig.add_annotation(x=float(e["t"]), y=1.0 - 0.012 - level * LABEL_ROW_FRAC, yref="y domain",
+                               text=text, showarrow=False, font=dict(size=9, color=est["color"]),
+                               xanchor="left" if side == "right" else "right", yanchor="top",
+                               xshift=3 if side == "right" else -3, row=row, col=1)
 
     # зрение
     fig.add_hline(y=0, line=dict(color="#bbb", width=0.7), row=1, col=1)
@@ -365,13 +432,45 @@ def _html(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG
         bl = max(8.0, _peak * 1.08 + 2)
         fig.update_yaxes(range=[-bl, bl], title_text=term("axis.audio_y", lang), row=2, col=1)
     fig.update_xaxes(title_text=term("axis.time", lang), row=rows, col=1)
-    header = _header_lines(passport, lang)
-    fig.update_layout(title=dict(text=title + (("<br><sup>" + "<br>".join(header) + "</sup>") if header else "")),
-                      template="plotly_white", height=(760 if two else 460) + 18 * len(header),
+    fig.update_layout(template="plotly_white", height=760 if two else 460, margin=dict(t=40),
                       hovermode="x unified", legend=dict(orientation="h", y=-0.08))
     p = Path(plot_dir) / f"{stem}__track.html"
-    fig.write_html(str(p), include_plotlyjs="inline")
+    p.write_text(_page(title, _header_lines(passport, lang), _event_list(passport, lang),
+                       fig.to_html(full_html=False, include_plotlyjs="inline"), lang), encoding="utf-8")
     return p.name
+
+
+PAGE_STYLE = """
+body { margin: 0; font: 13px/1.45 system-ui, sans-serif; color: #2a3f5f; background: #fff; }
+header { padding: 12px 20px 0; }
+h1 { margin: 0 0 4px; font-size: 17px; font-weight: 500; overflow-wrap: anywhere; }
+header p { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
+details { margin-top: 4px; font-size: 12px; }
+details ol { margin: 4px 0 0; padding-left: 22px; columns: 22em; }
+"""
+
+
+def _event_list(passport, lang):
+    """Every event as text, in time order: a label that found no free row on the chart is still readable here."""
+    found = sorted(((passport or {}).get("events") or []), key=lambda e: float(e["t"]))
+    return [f"{_mmss(float(e['t']))} — {term('event.' + e['kind'], lang, value=float(e['value']))}"
+            for e in found if e["kind"] in EVENT_STYLE]
+
+
+def _page(title, header, event_list, chart_div, lang):
+    """The passport header is ordinary HTML above the chart, not text inside the SVG: the browser wraps it
+    to any window width, and its height can never collide with the panels."""
+    esc = html.escape
+    parts = [f"<!doctype html><html lang='{esc(lang)}'><head><meta charset='utf-8'>",
+             f"<title>{esc(title)}</title><style>{PAGE_STYLE}</style></head><body><header>",
+             f"<h1>{esc(title)}</h1>"]
+    parts += [f"<p>{esc(line)}</p>" for line in header]
+    if event_list:
+        parts.append(f"<details><summary>{esc(term('list.events', lang, value=len(event_list)))}</summary><ol>")
+        parts += [f"<li>{esc(item)}</li>" for item in event_list]
+        parts.append("</ol></details>")
+    parts += ["</header>", chart_div, "</body></html>"]
+    return "".join(parts)
 
 
 # ───────────────────────── публичный рендер ─────────────────────────
