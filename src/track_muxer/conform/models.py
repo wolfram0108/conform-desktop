@@ -71,6 +71,7 @@ class PairResult:
     blind_zones: int = 0               # drop-зоны, опознанные как слепые (не режем)
     blind_restored: int = 0            # кадров возвращено в карту (R_ins)
     edge_recovered: int = 0            # кадров возвращено доп-проходом на краях (опенинг/концовка)
+    mirror_used: bool = False          # dub frames are horizontally mirrored; matched on mirrored SRM features
     geom_used: bool = False            # сработал геом-разбор (кроп/зум/анаморф/полосы) — зрение слепло без него
     geom_n_in: int = 0                 # геом: inlier-якорей в консенсусе (надёжность регистрации)
     geom_sx: float = 0.0               # геом: масштаб по X (анаморф = sx≠sy)
@@ -87,9 +88,12 @@ class PairResult:
     audio_span_ms: float = 0.0         # band/muq: полный диапазон движения сдвига, мс
     plots: list[dict] = field(default_factory=list)  # PNG-графики укладки: [{kind,name,t,v_ms}]
     warnings: list[str] = field(default_factory=list)
-    critical: list[str] = field(default_factory=list)  # КРАСНОЕ: дефект, не исправляемый авто (студийный A/V-десинк)
+    critical: list[str] = field(default_factory=list)  # red: output sync not trustworthy by the audio layer's result
     error: str | None = None
     elapsed_s: float = 0.0
+    trace: list[dict] = field(default_factory=list)  # decision trace (conform.trace): every branch with its inputs
+    # Sidecar subtitles carried onto the reference timeline: [{source, file, cues_in, cues_out, dropped_drawings, dropped_empty, dropped_duplicates, dropped_settings, error}].
+    text_tracks: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -100,6 +104,8 @@ class EpisodeResult:
     out_dir: Path
     pairs: list[PairResult] = field(default_factory=list)
     elapsed_s: float = 0.0
+    # The reference's own sidecar subtitles, moved onto its first-frame axis.
+    ref_text_tracks: list[dict] = field(default_factory=list)
 
     @property
     def n_ok(self) -> int:

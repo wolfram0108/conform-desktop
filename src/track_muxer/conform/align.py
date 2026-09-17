@@ -18,6 +18,7 @@ import tempfile
 import threading
 import time
 import warnings
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -35,14 +36,18 @@ from track_muxer.conform.interp_backend import warp_interp        # GPU/CPU audi
 from track_muxer.conform.features import (
     build_srm,
     probe_audio_channels,
+    probe_av_delay,
+    av_delay_filters,
     probe_duration,
     probe_has_video,
     probe_resolution,
 )
 from track_muxer.conform.kernel.band_align import band_align
 from track_muxer.conform.kernel.coarse import coarse_robust, coarse_windowed
+from track_muxer.conform.kernel.orient import mirror_srm, orientation_probe
 from track_muxer.conform.models import PairResult, SrmFeatures
 from track_muxer.conform.progress import Reporter, part
+from track_muxer.conform.trace import Trace
 from track_muxer.conform.vision_detect import build_map as _vision_build_map, global_trend as _vision_global_trend, vision_ow as _vision_ow, detelecine as _detelecine, is_baked_telecine as _is_telecine
 from track_muxer.conform.anchor.params import FRAME as VFRAME, T as VGT, make_T as _make_T  # ms per frame + anchor grid T (cut silence, unified plot)
 
@@ -51,10 +56,19 @@ SR = 44100
 DT = 0.005
 ABORT_ASSIGNED_PCT = 60.0  # assigned% below this means a foreign video (dub of another episode):
                            # fail the pair right after matching, before resampling and GPU audio
+AUDIO_RESID_MAX_MS = 80.0       # project criterion: a place is out of sync beyond ±80 ms (2 frames)
+AUDIO_COVERAGE_BLIND = 0.15     # below: the files share almost no sound, the layer measured nothing
+AUDIO_COVERAGE_LOW = 0.5        # below: the layer had support on less than half of the track
+AUDIO_EXCESS_WARN_MS = 2000.0   # cut movement that cancelled out (Σ|steps| − |net|): the layer went back and forth
+AUDIO_EXCESS_CRIT_MS = 10000.0  # population: healthy ≤ 0.4 s (95th pct), blind chase ≥ 12 s; red above this
+FREEZE_MIN_S = 10.0             # identical frames this long are a frozen picture (broken encode), not a scene
+FREEZE_COS = 0.999              # SRM cosine of frames ~0.5 s apart that only identical decoded frames reach
+FREEZE_GAP_S = 1.0              # a frozen run survives cadence dips shorter than this
+MIRROR_RATIO = 2.0         # the mirrored frame sample must beat the plain one by this factor to switch orientation
 GEOM_GATE = 50             # coarse pass found < N anchors: vision is blind (crop/zoom/anamorph/bars),
                            # so run the geometry pass before the foreign-video cutoff
 COARSE_SAME_MIN_FRAC = 0.10  # share of thinned (K=8) frames in the monotone coarse chain that still
-                           # means the same episode despite low assigned%; see doc/reports/geom_align/
+                           # means the same episode despite low assigned%
 CUT_MIN_S = 0.3          # a cut is longer than 0.3 s
 FADE = int(0.010 * SR)
 FILL_MIN_S = 1.0         # cuts longer than 1 s are filled with the reference, shorter ones get silence
@@ -75,16 +89,16 @@ LEVEL_WIN_S = 4.0        # median window of the offset level before/after a drop
 # Level-aware cut detection: a transient offset outlier on static content is not a cut
 LEVEL_CUT_COALESCE_S = 3.0  # reference gaps closer than this merge into one cluster
 LEVEL_CUT_RECOVER_S = 8.0   # в пределах этого ищем ВОЗВРАТ уровня (выброс-пила) vs устойчивый сдвиг (реальный вырез)
-# Детектор «налипания» (кейс case/04): зона ПРИСВОЕННЫХ кадров, чужих рефу по содержимому.
-# Пороги по разделимости (8 пар, bench/_creep_survey.log): здоровые зоны — cos≥0.22 и ≤1.0с,
-# дефект — cos≤0.02 и 11.3с; пороги посреди пустыни с запасом >×1.5 в обе стороны.
+# Creep detector: a zone of ASSIGNED frames whose content is foreign to the reference.
+# Thresholds sit in the gap measured on 8 pairs: healthy zones have cos>=0.22 and last <=1.0 s,
+# the defect has cos<=0.02 and lasts 11.3 s; both keep a >x1.5 margin to either side.
 CREEP_COS = 0.15         # медиана cos присвоенной зоны ниже → кадры чужие
 CREEP_MIN_S = 3.0        # зона длиннее этого → выбросить (короче не трогаем; арбитр — _level_decide)
 CREEP_BRIDGE_S = 1.0     # мостик через уже выброшенные кадры внутри зоны
 
 
 def _extract_base(video: Path, ffmpeg: str, audio_fix: bool = True, channels: int = 2,
-                  atrack: int = 0) -> list[str]:
+                  atrack: int = 0, delay_s: float = 0.0) -> list[str]:
     """Общие аргументы декода аудио → PCM s16le @ SR, `channels` каналов. Любой кодек входа
     (AAC/FLAC/AC3/PCM) ffmpeg декодирует; `-ar SR` ресэмплит ТОЛЬКО при несовпадении частот
     (44.1 на входе → no-op). `-ac channels`: для рефа/анализа = 2 (даунмикс), для ВЫХОДНОГО
@@ -98,17 +112,21 @@ def _extract_base(video: Path, ffmpeg: str, audio_fix: bool = True, channels: in
         последующий звук съезжает. Стенд `dub_51_audio_gap_pts` (дыра 3.02с): без фильтра
         6 окон из 11 вне ±80мс (макс 3310мс) → с фильтром **0 из 13**.
       • БЕЗОПАСЕН: на чистом входе бит-в-бит no-op (md5 совпал на синтетике И на реальной паре
-        `case/atele…ep02` — выход идентичен, resid 1.1489566 в обоих прогонах); на стенде из
+        из библиотеки случаев — выход идентичен, resid 1.1489566 в обоих прогонах); на стенде из
         10 дублей не изменил НИ ОДНОГО остального кейса.
       • `async=1` = только filling/trimming, БЕЗ растяжения (замер: тоны 440/880 Гц сохранены
         точно; растяжение начинается при async>1).
     Параметр `audio_fix` сохранён в сигнатуре для совместимости вызовов (CLI/API/queue), но на
     команду больше НЕ влияет — подлежит удалению из API и UI отдельным шагом.
-    Отчёт: doc/reports/conform_input_robustness/EXPERIMENTS_wild_formats.md §1.5, §6.45.
 
-    atrack — индекс аудиодорожки файла (многодорожечность, этап 5.1 standalone); 0 = как было."""
+    atrack — индекс аудиодорожки файла (многодорожечность, этап 5.1 standalone); 0 = как было.
+
+    delay_s — container delay video_start − audio_start (features.probe_av_delay): the audio is
+    laid on the VIDEO axis because SRM takes frame time from index 0. 0 → command unchanged."""
+    # Delay filters go before aresample: first_pts=0 would otherwise refill the trimmed head.
+    af = ",".join([*av_delay_filters(delay_s), "aresample=async=1:first_pts=0"])
     return [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video),
-            "-map", f"0:a:{int(atrack)}", "-af", "aresample=async=1:first_pts=0",
+            "-map", f"0:a:{int(atrack)}", "-af", af,
             "-ac", str(channels), "-ar", str(SR), "-f", "s16le"]
 
 
@@ -126,13 +144,17 @@ def _pump_progress(stream, dur, reporter) -> None:
 
 
 def _decode_audio(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 2,
-                 atrack: int = 0, reporter: Reporter | None = None) -> np.ndarray:
+                 atrack: int = 0, reporter: Reporter | None = None,
+                 delay_s: float | None = None) -> np.ndarray:
     """Декод аудио (`channels` каналов) в float32 (ЦЕЛИКОМ в RAM) ПРЯМО из пайпа ffmpeg — без
     временного файла на диске. PCM s16le → stdout; прогресс — со stderr (`-progress pipe:2`),
     читается в отдельном потоке (иначе блокировка при заполнении любого из пайпов).
-    Возврат (N, channels) float32 (int16-размах)."""
+    Возврат (N, channels) float32 (int16-размах).
+    delay_s=None → the container delay is probed here; callers that trace it pass it in."""
+    if delay_s is None:
+        delay_s = probe_av_delay(video, FFPROBE, atrack=atrack)
     dur = (probe_duration(video, FFPROBE) or 0.0) if reporter is not None else 0.0
-    cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack),
+    cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack, delay_s),
            "-progress", "pipe:2", "-nostats", "pipe:1"]
     proc = procreg.popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     th = threading.Thread(target=_pump_progress, args=(proc.stderr, dur, reporter), daemon=True)
@@ -147,7 +169,7 @@ def _decode_audio(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 
 
 def _decode_audio_mmap(video: Path, ffmpeg: str, audio_fix: bool, *, channels: int = 2,
                       atrack: int = 0, reporter: Reporter | None = None,
-                      dest: Path | None = None):
+                      dest: Path | None = None, delay_s: float | None = None):
     """low_mem: ffmpeg декодирует PCM s16le (`channels` каналов) ПРЯМО в рабочий файл `a.raw`
     (без WAV-обёртки и без перечитывания), затем `np.memmap` поверх — RAM не растёт на длинных
     дорожках. Файл — рабочий буфер (НЕ throwaway), удаляется вызывающим (rmtree каталога). PCM
@@ -164,8 +186,10 @@ def _decode_audio_mmap(video: Path, ffmpeg: str, audio_fix: bool, *, channels: i
         tmpdir.mkdir(parents=True, exist_ok=True)
         d = Path(tempfile.mkdtemp(prefix="extract_", dir=str(tmpdir)))
         raw = d / "a.raw"
+    if delay_s is None:
+        delay_s = probe_av_delay(video, FFPROBE, atrack=atrack)
     dur = (probe_duration(video, FFPROBE) or 0.0) if reporter is not None else 0.0
-    cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack),
+    cmd = [*_extract_base(video, ffmpeg, audio_fix, channels, atrack, delay_s),
            "-progress", "pipe:1", "-nostats", str(raw)]
     proc = procreg.popen(cmd, stdout=subprocess.PIPE, text=True)
     _pump_progress(proc.stdout, dur, reporter)   # дренит stdout до конца
@@ -319,7 +343,7 @@ def _recover_edges(syn, refv, pred):
 
 
 def _creep_drop(syn, refv, pred, fps_dub):
-    """Детектор «налипания» (кейс case/04, пост-проход — ядро band_align НЕ трогаем).
+    """Детектор «налипания» (пост-проход — ядро band_align НЕ трогаем).
 
     Дефект: вставка в дубле (повтор СВОЕГО контента с наложенным текстом) присваивается
     Drop-DTW «ползучим ходом» вместо drop — близнецы кадров лежат в рефе ВПЕРЕДИ, и
@@ -491,8 +515,8 @@ def _cos_anchors(syn, refv, pred, asg):
     return cos
 
 
-# ── Чекпоинты режима tmp: версии этапов + штамп align (валидность CK3). ТЗ doc/ТЗ_чекпоинты_conform.md ──
-ALIGN_VER = 2   # матчинг + карта зрения (band_align/_level_decide/vision_detect). Бампать при их правке.
+# ── tmp-mode checkpoints: stage versions + the align stamp (CK3 validity) ──
+ALIGN_VER = 3   # matching + vision map (band_align/_level_decide/vision_detect); bump when they change
 
 
 def _align_stamp(dub_audio, ref, fps_ref, fps_tst, *, free_start, recover_edges) -> str:
@@ -529,32 +553,150 @@ def _load_align_ckpt(out_path: Path, n_syn: int, stamp: str):
         return None
 
 
+@dataclass
+class _Match:
+    """Features and everything measured on them. Replaced as one unit whenever the features
+    change (detelecine, geom rebuild), so no decision can read a value from an older state."""
+
+    refv: np.ndarray
+    syn: np.ndarray
+    fps_ref: float
+    fps_dub: float
+    ax_ref: np.ndarray | None
+    ax_dub: np.ndarray | None
+    tc_ref: dict
+    tc_dub: dict
+    state: str                                   # "plain" | "detelecine" | "mirror" | "geom"
+    off0: np.ndarray | None = None
+    nrel: int = 0
+    n_keep: int = -1                             # -1: no coarse pass on this state (CK3 reuse)
+    chain: np.ndarray | None = None
+    mirror: bool = False                         # dub features are those of the horizontally mirrored frames
+
+    @property
+    def n(self) -> int:
+        return len(self.syn)
+
+    @property
+    def strong_thr(self) -> float:
+        return COARSE_SAME_MIN_FRAC * self.n / 8  # K=8 is the thinning step of coarse._anchors
+
+    @property
+    def coarse_strong(self) -> bool:
+        return self.n_keep >= self.strong_thr
+
+
+def _frozen_runs(syn, fps: float, ax=None) -> list[tuple[float, float]]:
+    """Runs of identical consecutive frames longer than FREEZE_MIN_S, in seconds. Probes the rows the
+    coarse pass thins to (every K-th frame, so they are already in the page cache after it) and
+    compares each with the probe two steps later; a telecine cadence dents single probes, so a run
+    survives dips up to FREEZE_GAP_S."""
+    K = 8; n = len(syn)
+    idx = np.arange(0, n - 2 * K, K)
+    if len(idx) < 4:
+        return []
+    a = np.asarray(syn[idx]).astype(np.float32); b = np.asarray(syn[idx + 2 * K]).astype(np.float32)
+    cos = np.einsum("ij,ij->i", a, b)
+    t = (ax[idx] if ax is not None else idx / fps).astype(np.float64)
+    runs: list[tuple[float, float]] = []; start = None; last_hi = None
+    for ti, c in zip(t, cos):
+        if c >= FREEZE_COS:
+            start = ti if start is None else start; last_hi = ti
+        elif start is not None and ti - last_hi > FREEZE_GAP_S:
+            if last_hi - start >= FREEZE_MIN_S:
+                runs.append((float(start), float(last_hi)))
+            start = None
+    if start is not None and last_hi - start >= FREEZE_MIN_S:
+        runs.append((float(start), float(last_hi)))
+    return runs
+
+
+def _run_coarse(m: _Match, low_mem: bool, rep: Reporter | None, trace: Trace) -> _Match:
+    """Coarse pass on the given state; the chain and n_keep stay bound to that state."""
+    if rep is not None:
+        rep.mark(0.0)
+    m.off0, m.nrel, m.n_keep, m.chain = (coarse_windowed(m.syn, m.refv, on_prog=rep) if low_mem
+                                         else coarse_robust(m.syn, m.refv))
+    trace.event("coarse", state=m.state, n_dub=m.n, n_ref=len(m.refv), anchors=int(m.nrel),
+                n_keep=int(m.n_keep), chain_len=int(len(m.chain)),
+                off0_median_s=float(np.median(m.off0)) / m.fps_ref if m.fps_ref else 0.0)
+    return m
+
+
+def _mirrored_copy(v: np.ndarray, low_mem: bool, tmp_dir) -> np.ndarray:
+    """SRM of the mirrored frames; on disk under tmp_dir in low_mem mode like the other rebuilt features."""
+    if low_mem and tmp_dir is not None:
+        Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+        mp = Path(tempfile.mkdtemp(prefix="mirror_", dir=str(tmp_dir))) / "f.f16"
+        out = np.memmap(mp, dtype=np.float16, mode="w+", shape=v.shape)
+    else:
+        out = np.empty(v.shape, np.float16)
+    return mirror_srm(v, out=out)
+
+
+def _try_mirror(m: _Match, low_mem: bool, tmp_dir, rep: Reporter | None, trace: Trace) -> _Match | None:
+    """Orientation second chance, before geometry: a frame sample is matched in both orientations
+    (seconds, no decode); when the mirrored sample clearly wins, the coarse pass is redone on the
+    mirrored features. Returns the new state or None; the decision is traced either way."""
+    pr = orientation_probe(m.syn, m.refv)
+    need = COARSE_SAME_MIN_FRAC * pr["sample"]
+    win = pr["mirror"] >= need and pr["mirror"] > MIRROR_RATIO * max(pr["plain"], 1)
+    trace.decide("mirror", state=m.state, inputs=dict(pr, n_keep=int(m.n_keep)),
+                 thresholds={"min_strong": need, "MIRROR_RATIO": MIRROR_RATIO},
+                 verdict="applied" if win else "none")
+    if not win:
+        return None
+    mm = _Match(m.refv, _mirrored_copy(m.syn, low_mem, tmp_dir), m.fps_ref, m.fps_dub,
+                m.ax_ref, m.ax_dub, m.tc_ref, m.tc_dub, "mirror", mirror=True)
+    return _run_coarse(mm, low_mem, rep, trace)
+
+
+def _detelecine_state(m: _Match, tmp_dir, trace: Trace) -> _Match:
+    """Thin the baked 3:2 cadence on both sides; a side with a live VFR axis is left alone
+    because thinning would break its 1:1 index-to-time stitching."""
+    if m.ax_ref is None:
+        m.refv, m.fps_ref, m.tc_ref = _detelecine(m.refv, m.fps_ref, tmp_dir=tmp_dir)
+    if m.ax_dub is None:
+        m.syn, m.fps_dub, m.tc_dub = _detelecine(m.syn, m.fps_dub, tmp_dir=tmp_dir)
+    m.state = "detelecine"
+    m.off0 = None; m.nrel = 0; m.n_keep = -1; m.chain = None
+    trace.event("detelecine", state=m.state, dropped_ref=int(m.tc_ref["dropped"]),
+                dropped_dub=int(m.tc_dub["dropped"]), fps_ref=m.fps_ref, fps_dub=m.fps_dub, n_dub=m.n)
+    return m
+
+
 def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
-              ffmpeg, rep: Reporter | None):
-    """Геом-разбор СЛЕПОЙ пары (кроп/зум/анаморф/полосы): conform.geom.consensus_G находит
-    глобальное преобразование → пересборка SRM рефа и дубля с `crop` (ВТОРОЙ декод, только
-    для слепых) → грубый проход заново. -> (refv, syn, off0, G, fps_ref, fps_dub, tcr, tcd,
-    ax_ref, ax_dub) — последние два = VFR-оси пересобранных SRM (кадры те же, ось из того же
-    исходника); G is None ⟹ геометрия не восстановлена / cv2 нет / нет ref.src."""
+              ffmpeg, rep: Reporter | None, trace: Trace, mirror: bool = False) -> tuple[_Match | None, dict | None]:
+    """Geometry pass for a pair vision cannot match (crop/zoom/anamorph/bars): consensus_G finds
+    the global transform, both SRM are rebuilt with `crop` (a second decode, only for such pairs)
+    and the coarse pass runs on the rebuilt features. Returns the new state and G, or (None, None)
+    with the reason recorded in the trace."""
     from track_muxer.conform import geom
-    _none = (None, None, None, None, fps_ref, fps_dub, None, None, None, None)
     if ref.src is None:
-        return _none
-    # CK-geom: результат consensus_G (crop/scale) из кэша — НЕ перезапускаем дорогой+флаки LoFTR-geom
-    # каждый conform. Хит → кропаем даже без kornia (она нужна лишь для ВЫЧИСЛЕНИЯ). Промах → считаем
-    # (если geom доступен) и сохраняем.
+        trace.decide("geom", state="geom", verdict="none", inputs={"reason": "reference has no source file"})
+        return None, None
+    # The LoFTR consensus is expensive and not deterministic, so a cached G is reused as is.
     G = (cache_mod.load_geom(cache_dir, Path(ref.src), Path(dub_audio))
          if (keep_tmp and cache_dir is not None) else None)
+    if G is not None and bool(G.get("flip", False)) != mirror:   # cached for the other orientation
+        G = None
+    source = "cache"
     if G is None:
         if not geom.available():
-            return _none
+            trace.decide("geom", state="geom", verdict="none", inputs={"reason": "geom backend unavailable"})
+            return None, None
         if rep is not None:
             rep.mark(0.0, "оценка кадрирования и масштаба")
-        G = geom.consensus_G(Path(ref.src), Path(dub_audio), on_prog=part(rep, 0.0, 0.40))
+        G = geom.consensus_G(Path(ref.src), Path(dub_audio), on_prog=part(rep, 0.0, 0.40), flip=mirror)
+        source = "computed"
         if G is None:
-            return _none
+            trace.decide("geom", state="geom", verdict="none", inputs={"reason": "no consensus transform"})
+            return None, None
         if keep_tmp and cache_dir is not None:
             cache_mod.save_geom(cache_dir, Path(ref.src), Path(dub_audio), G)
+    trace.decide("geom", state="geom", verdict="applied", source=source,
+                 inputs={"sx": G["sx"], "sy": G["sy"], "n_in": G["n_in"],
+                         "crop_ref": G["crop_ref"], "crop_dub": G["crop_dub"], "mirror": mirror})
     if rep is not None:
         rep.mark(0.40, "пересчёт признаков кадров")
 
@@ -576,24 +718,23 @@ def _try_geom(ref, dub_audio, fps_ref, fps_dub, low_mem, cache_dir, keep_tmp,
 
     ref2 = _srm(Path(ref.src), fps_ref, G["crop_ref"], part(rep, 0.40, 0.70))
     dub2 = _srm(Path(dub_audio), fps_dub, G["crop_dub"], part(rep, 0.70, 0.96))
-    # VFR-оси пересобранных SRM: кроп не меняет НАБОР кадров → ось из того же исходника
-    # (build_srm/load_srm приложили сами); валидность длины сверяет вызывающий.
-    ax_ref2, ax_dub2 = ref2.pts, dub2.pts
-    # запечённый 3:2-телесин на кропнутом SRM (геом-путь) → прорежаем каденс ДО грубого прохода
-    # (как в основном пути). На не-телесине — НО-ОП; поток с VFR-осью НЕ прорежаем (сшивка 1:1).
+    # Cropping keeps the frame set, so the VFR axes of the rebuilt SRM are the source's own.
+    ax_ref2 = ref2.pts if (ref2.pts is not None and len(ref2.pts) == len(ref2.srm)) else None
+    ax_dub2 = dub2.pts if (dub2.pts is not None and len(dub2.pts) == len(dub2.srm)) else None
     _tctmp = (Path(dub_audio).parent / "_tmp") if low_mem else None
     if _tctmp is not None:
         _tctmp.mkdir(parents=True, exist_ok=True)
     _no_tc = {"telecine": False, "tele_score": 0.0, "argmax": 0, "dropped": 0}
-    rsrm, fps_ref2, tcr = (_detelecine(ref2.srm, fps_ref, tmp_dir=_tctmp)
-                           if ax_ref2 is None else (ref2.srm, fps_ref, dict(_no_tc)))
-    dsrm, fps_dub2, tcd = (_detelecine(dub2.srm, fps_dub, tmp_dir=_tctmp)
-                           if ax_dub2 is None else (dub2.srm, fps_dub, dict(_no_tc)))
+    syn2 = _mirrored_copy(dub2.srm, low_mem, _tctmp) if mirror else dub2.srm
+    m = _Match(ref2.srm, syn2, fps_ref, fps_dub, ax_ref2, ax_dub2, dict(_no_tc), dict(_no_tc), "geom",
+               mirror=mirror)
+    if m.ax_ref is None:
+        m.refv, m.fps_ref, m.tc_ref = _detelecine(m.refv, m.fps_ref, tmp_dir=_tctmp)
+    if m.ax_dub is None:
+        m.syn, m.fps_dub, m.tc_dub = _detelecine(m.syn, m.fps_dub, tmp_dir=_tctmp)
     if rep is not None:
         rep.mark(0.96, "повторное грубое соответствие")
-    off0, _, _, _ = (coarse_windowed(dsrm, rsrm, on_prog=part(rep, 0.96, 1.0)) if low_mem
-                     else coarse_robust(dsrm, rsrm))
-    return rsrm, dsrm, off0, G, fps_ref2, fps_dub2, tcr, tcd, ax_ref2, ax_dub2
+    return _run_coarse(m, low_mem, part(rep, 0.96, 1.0), trace), G
 
 
 def _edge_silence(out, grid, tg_s, n_aud, sr, fill_spans, fade):
@@ -654,11 +795,12 @@ def conform_features(
     low_mem: bool = False,
     cache_dir: Path | str | None = None,   # чекпоинты CK2/CK3/CK5 (режим tmp); None=выкл
     keep_tmp: bool = False,
+    trace: Trace | None = None,     # decision trace of the pair; created here when the caller has none
 ) -> PairResult:
     """Выровнять озвучку (фичи dub + её аудио dub_audio) на таймлайн ref → out_path.
 
     keep_tmp+cache_dir → чекпоинты в `cache_dir` (аудио CK2 / align CK3 / выход CK5):
-    при повторе пропуск декода аудио и матчинга. ТЗ: doc/ТЗ_чекпоинты_conform.md. (CK1 SRM
+    при повторе пропуск декода аудио и матчинга. (CK1 SRM
     дубля — в conform_pair выше.)"""
     t0 = time.perf_counter()
 
@@ -701,132 +843,137 @@ def conform_features(
     if _is_tc and _tctmp is not None:
         _tctmp.mkdir(parents=True, exist_ok=True)
 
-    # CK3 (режим tmp): результат матчинга (pred/asg/cut_intervals) из __vision.npz, если штамп
-    # совпал → пропуск дорогих coarse/band_align/_level_decide. Карта зрения (build_map ниже)
-    # дёшево пересчитывается из pred/asg — бит-в-бит. ТЗ: doc/ТЗ_чекпоинты_conform.md.
-    # ТЕЛЕСИН-трек CK3 НЕ реюзим: прореживание меняет индексы рефа → старый кэш pred стух.
+    # CK3 (tmp mode): the matching result (pred/asg/cut_intervals) comes from __vision.npz when
+    # the stamp matches, skipping the costly coarse/band_align/_level_decide. The vision map
+    # (build_map below) is cheap to rebuild from pred/asg, bit-exact.
+    # The telecine CK3 track is not reused: decimation shifts reference indices, cached pred is stale.
+    trace = trace if trace is not None else Trace(name)
+    trace.event("telecine", state="plain", ref_fps=fps_ref, dub_fps=fps_tst, n_ref=len(refv), n_dub=N,
+                ref=tc_ref, dub=tc_dub, vfr_ref=ax_ref is not None, vfr_dub=ax_dub is not None)
     n_restore = 0; n_recovered = 0; n_blind = 0
-    n_keep = -1                                       # -1: грубый проход не запускался (CK3-кэш) → отсечка строгая
-    geom_info = None                                  # сработал геом-разбор (слепота зрения) → dict G
+    geom_info = None                                  # G of the geometry pass when it was applied
     creep_zones: list[tuple[int, int, float, float]] = []
     cut_intervals: list[tuple[int, int]] = []
+    m = _Match(refv, syn, fps_ref, fps_tst, ax_ref, ax_dub, tc_ref, tc_dub, "plain")
+    freeze_runs: list[tuple[float, float]] = []
     _astamp = (_align_stamp(dub_audio, ref, fps_ref, fps_tst, free_start=free_start,
                             recover_edges=recover_edges)
                if keep_tmp else "")
     _ck3 = (_load_align_ckpt(out_path, N, _astamp)
             if (keep_tmp and cache_dir is not None and not _is_tc) else None)
     cache_mod._a("CK3 зрение", _ck3 is not None, out_path.stem)        # реюз матчинга (пропуск GPU-матчинга)
+    trace.decide("ck3_reuse", state="cache", source="cache",
+                 inputs={"checkpoints": bool(keep_tmp and cache_dir is not None), "telecine": _is_tc},
+                 verdict="hit" if _ck3 is not None else "miss")
     _band = None
+
+    def _match(m: _Match, detail: str):
+        """Band + edge/creep/level passes on one state; the chain is the one coarse found on it."""
+        nonlocal _band
+        _band = _rep("band", detail)
+        if _band is not None:
+            _band.mark(0.0)
+        pred = band_align(m.syn, m.refv, m.off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
+                          free_start=free_start, on_prog=part(_band, 0.0, 0.85), chain_aj=m.chain,
+                          chain_off=(m.off0[m.chain] if m.chain is not None else None))
+        if _band is not None:
+            _band.mark(0.85, "разбор уровней и краёв")
+        raw = int((pred >= 0).sum())
+        n_rec = _recover_edges(m.syn, m.refv, pred) if recover_edges else 0
+        creep = _creep_drop(m.syn, m.refv, pred, m.fps_dub)
+        pred, cuts, n_res = _level_decide(pred, m.fps_ref, m.fps_dub, len(m.refv), m.n)
+        asg = np.where(pred >= 0)[0]
+        trace.event("band", state=m.state, chain_len=int(len(m.chain)) if m.chain is not None else 0,
+                    assigned_raw_pct=100.0 * raw / max(1, m.n), edge_recovered=int(n_rec),
+                    creep_zones=len(creep), cuts=len(cuts), restored=int(n_res),
+                    assigned_pct=100.0 * len(asg) / max(1, m.n))
+        return pred, asg, n_rec, creep, cuts, n_res
+
     if _ck3 is not None:
         pred, asg, cut_intervals = _ck3
     else:
-        _coarse = _rep("coarse", "оценка общего смещения")
-        if _coarse is not None:
-            _coarse.mark(0.0)
-        off0, _, n_keep, chain_aj0 = (coarse_windowed(syn, refv, on_prog=_coarse) if low_mem
-                                      else coarse_robust(syn, refv))  # 3.2: длинные файлы
-        # ── ГЕЙТ: грубый проход не нашёл структуру (n_keep≈0) → зрение слепнет от геом-рассинхрона
-        #     (кроп/зум/анаморф/полосы) → геом-разбор + пересборка SRM с crop ДО отсечки «чужое видео». ──
-        if n_keep < GEOM_GATE:
-            _rv, _sn, _o0, _G, _fr, _fd, _tcr, _tcd, _axr, _axd = _try_geom(
-                ref, dub_audio, fps_ref, fps_tst, low_mem,
-                cache_dir, keep_tmp, ffmpeg, _rep("geom"))
-            if _G is not None:
-                refv, syn, off0, geom_info = _rv, _sn, _o0, _G
-                fps_ref, fps_tst, N = _fr, _fd, len(syn)        # детелесин внутри geom → обновлённые fps
-                ax_ref = _axr if (_axr is not None and len(_axr) == len(refv)) else None
-                ax_dub = _axd if (_axd is not None and len(_axd) == len(syn)) else None
-                chain_aj0 = None                                # якоря цепочки устарели после пересборки SRM
-                if _tcr is not None: tc_ref = _tcr
-                if _tcd is not None: tc_dub = _tcd
-        elif _is_tc:
-            # запечённый телесин БЕЗ геом-рассинхрона → прорежаем каденс + пере-грубый на
-            # прореженном. Поток с VFR-осью НЕ прорежаем (см. гейт выше — ломает сшивку 1:1).
-            if ax_ref is None:
-                refv, fps_ref, tc_ref = _detelecine(refv, fps_ref, tmp_dir=_tctmp)
-            if ax_dub is None:
-                syn, fps_tst, tc_dub = _detelecine(syn, fps_tst, tmp_dir=_tctmp)
-            N = len(syn)
-            _coarse = _rep("coarse", "повторная оценка после прореживания каденса")
-            if _coarse is not None:
-                _coarse.mark(0.0)
-            off0, _, n_keep, chain_aj0 = (coarse_windowed(syn, refv, on_prog=_coarse) if low_mem
-                                          else coarse_robust(syn, refv))
-        _band = _rep("band", "сопоставление кадров в полосе поиска")
-        if _band is not None:
-            _band.mark(0.0)
-        pred = band_align(syn, refv, off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
-                          free_start=free_start, on_prog=part(_band, 0.0, 0.85), chain_aj=chain_aj0,
-                          chain_off=(off0[chain_aj0] if chain_aj0 is not None else None))
-        if _band is not None:
-            _band.mark(0.85, "разбор уровней и краёв")
+        m = _run_coarse(m, low_mem, _rep("coarse", "оценка общего смещения"), trace)
+        freeze_runs = _frozen_runs(m.syn, m.fps_dub, m.ax_dub)      # after coarse: its thinned rows are cached
+        trace.event("video_freeze", state=m.state, runs=[(round(a, 2), round(b, 2)) for a, b in freeze_runs],
+                    total_s=round(sum(b - a for a, b in freeze_runs), 2))
+        # Too few anchors means vision is blind (crop/zoom/anamorph/bars): geometry before anything else.
+        blind = m.n_keep < GEOM_GATE
+        trace.decide("geom_gate", state=m.state, inputs={"n_keep": m.n_keep},
+                     thresholds={"GEOM_GATE": GEOM_GATE},
+                     verdict="geom" if blind else ("detelecine" if _is_tc else "band"))
+        if blind:
+            # Orientation is checked before geometry: the probe costs seconds and needs no decode.
+            mm = _try_mirror(m, low_mem, _tctmp, _rep("coarse", "проверка ориентации кадра"), trace)
+            if mm is not None:
+                m = mm
+                if _is_tc:
+                    m = _detelecine_state(m, _tctmp, trace)
+                    m = _run_coarse(m, low_mem, _rep("coarse", "повторная оценка после прореживания каденса"), trace)
+                blind = m.n_keep < GEOM_GATE
+        if blind:
+            gm, G = _try_geom(ref, dub_audio, fps_ref, fps_tst, low_mem,
+                              cache_dir, keep_tmp, ffmpeg, _rep("geom"), trace, mirror=m.mirror)
+            if G is not None:
+                m, geom_info = gm, G
+        elif _is_tc and m.state == "plain":
+            m = _detelecine_state(m, _tctmp, trace)
+            m = _run_coarse(m, low_mem, _rep("coarse", "повторная оценка после прореживания каденса"), trace)
+        pred, asg, n_recovered, creep_zones, cut_intervals, n_restore = _match(
+            m, "сопоставление кадров в полосе поиска")
 
-        # === НОВЫЙ слой: единое правило по СДВИГУ УРОВНЯ (вместо restore_blind + R-фильтра) ===
-        # Доп-проходы на краях идут ПЕРЕД разбором (возвращают совпадающий опенинг/концовку).
-        if recover_edges:
-            n_recovered = _recover_edges(syn, refv, pred)
-        creep_zones = _creep_drop(syn, refv, pred, fps_tst)   # налипшие вставки → drop (case/04)
-        pred, cut_intervals, n_restore = _level_decide(pred, fps_ref, fps_tst, len(refv), len(syn))
-        asg = np.where(pred >= 0)[0]
-
-    # --- РАННЯЯ ОТСЕЧКА: назн% < порога = ЧУЖОЕ видео (озвучка не от той серии). Валим пару
-    #     СРАЗУ — до ресэмпла, GPU-аудио и записи (fail-fast). Красная ошибка, wav не создаём. ---
-    assigned_pct = 100.0 * len(asg) / max(1, N)
-    # Двухсигнальная отсечка (прецедент hon-kon_studio 2026-06-30, doc/reports/geom_align/):
-    # низкий назн% — ПРОКСИ «чужого видео», но он же проседает на дубле ТОЙ ЖЕ серии с низко-
-    # косинусным энкодом (другой мастер-источник: high-pass SRM ловит энкод-шум → косинус упёрт
-    # ~0.70 при ИДЕНТИЧНОМ контенте и геометрии). Прямой признак «та серия» — КОГЕРЕНТНОСТЬ грубого
-    # прохода: n_keep (длина монотонной цепочки якорей) у любой «той серии» = сотни-тысячи, у реально
-    # чужого видео = десятки (территория GEOM_GATE). Валим «чужое» лишь когда ОБА сигнала против;
-    # при сильном грубом проходе (coarse_strong) — продолжаем укладку + warning «проверить вручную».
-    coarse_strong = n_keep >= COARSE_SAME_MIN_FRAC * N / 8   # K=8 — прорежение coarse._anchors
-    # ── ГЕОМ-ВТОРОЙ ШАНС перед отсечкой: МЯГКИЙ геом-рассинхрон (зум ~3%, кейс Fronda ep01
-    #    kamennye-vojny) оставляет coarse ~сотню якорей — больше GEOM_GATE (геом-гейт выше молчит),
-    #    но матчинг валится ниже порога → раньше пара падала в мёртвую зону порогов
-    #    [GEOM_GATE, coarse_strong) и ложно отсекалась как «чужое видео». Теперь кандидата на
-    #    отсечку сначала проверяем геометрией: G найден → пересборка SRM с кропом и матчинг заново
-    #    (после кропа SRM «прозревает»: cos верных пар 0.1→0.86). Цена — geom-проход только на
-    #    парах, которые иначе выбрасываются. fps передаём ИСХОДНЫЕ (fps0_*): текущие могли быть
-    #    уже ужаты детелесином, а _try_geom пересобирает SRM из файла и детелесинит сам. ──
-    if assigned_pct < ABORT_ASSIGNED_PCT and not coarse_strong and geom_info is None:
-        _rv, _sn, _o0, _G, _fr, _fd, _tcr, _tcd, _axr, _axd = _try_geom(
-            ref, dub_audio, fps0_ref, fps0_tst, low_mem,
-            cache_dir, keep_tmp, ffmpeg, _rep("geom"))
-        if _G is not None:
-            refv, syn, off0, geom_info = _rv, _sn, _o0, _G
-            fps_ref, fps_tst, N = _fr, _fd, len(syn)
-            ax_ref = _axr if (_axr is not None and len(_axr) == len(refv)) else None
-            ax_dub = _axd if (_axd is not None and len(_axd) == len(syn)) else None
-            if _tcr is not None: tc_ref = _tcr
-            if _tcd is not None: tc_dub = _tcd
-            _band = _rep("band", "сопоставление кадров после коррекции")
-            if _band is not None:
-                _band.mark(0.0)
-            pred = band_align(syn, refv, off0, affine=True, DSYN=DSYN, MATCH_THR=MATCH_THR,
-                              free_start=free_start, on_prog=part(_band, 0.0, 0.85))
-            if _band is not None:
-                _band.mark(0.85, "разбор уровней и краёв")
-            if recover_edges:
-                n_recovered = _recover_edges(syn, refv, pred)
-            creep_zones = _creep_drop(syn, refv, pred, fps_tst)
-            pred, cut_intervals, n_restore = _level_decide(pred, fps_ref, fps_tst, len(refv), len(syn))
-            asg = np.where(pred >= 0)[0]
-            assigned_pct = 100.0 * len(asg) / max(1, N)
-    _geom_kw = dict(geom_used=geom_info is not None,
+    assigned_pct = 100.0 * len(asg) / max(1, m.n)
+    # A low assigned share is only a proxy for a foreign video: a soft zoom leaves enough coarse
+    # anchors to pass GEOM_GATE yet starves the band, so geometry gets a second chance first.
+    second = assigned_pct < ABORT_ASSIGNED_PCT and not m.coarse_strong and geom_info is None
+    trace.decide("geom_second_chance", state=m.state,
+                 inputs={"assigned_pct": assigned_pct, "n_keep": m.n_keep, "geom_used": geom_info is not None},
+                 thresholds={"ABORT_ASSIGNED_PCT": ABORT_ASSIGNED_PCT, "strong_thr": m.strong_thr},
+                 verdict="try" if second else "skip")
+    if second and not m.mirror:
+        mm = _try_mirror(m, low_mem, _tctmp, _rep("coarse", "проверка ориентации кадра"), trace)
+        if mm is not None:
+            m = mm
+            if _is_tc:
+                m = _detelecine_state(m, _tctmp, trace)
+                m = _run_coarse(m, low_mem, _rep("coarse", "повторная оценка после прореживания каденса"), trace)
+            pred, asg, n_recovered, creep_zones, cut_intervals, n_restore = _match(
+                m, "сопоставление кадров после отражения")
+            assigned_pct = 100.0 * len(asg) / max(1, m.n)
+            second = assigned_pct < ABORT_ASSIGNED_PCT and not m.coarse_strong
+    if second:
+        # fps0: the current ones may already be thinned by detelecine, and the geometry pass
+        # rebuilds the SRM from the files and thins on its own.
+        gm, G = _try_geom(ref, dub_audio, fps0_ref, fps0_tst, low_mem,
+                          cache_dir, keep_tmp, ffmpeg, _rep("geom"), trace, mirror=m.mirror)
+        if G is not None:
+            m, geom_info = gm, G
+            pred, asg, n_recovered, creep_zones, cut_intervals, n_restore = _match(
+                m, "сопоставление кадров после коррекции")
+            assigned_pct = 100.0 * len(asg) / max(1, m.n)
+    refv, syn, fps_ref, fps_tst, N = m.refv, m.syn, m.fps_ref, m.fps_dub, m.n
+    ax_ref, ax_dub, tc_ref, tc_dub, n_keep = m.ax_ref, m.ax_dub, m.tc_ref, m.tc_dub, m.n_keep
+    _geom_kw = dict(mirror_used=bool(m.mirror), geom_used=geom_info is not None,
                     geom_n_in=int(geom_info["n_in"]) if geom_info else 0,
                     geom_sx=float(geom_info["sx"]) if geom_info else 0.0,
                     geom_sy=float(geom_info["sy"]) if geom_info else 0.0,
                     telecine_ref=bool(tc_ref["telecine"]), telecine_dub=bool(tc_dub["telecine"]),
                     tele_score=round(max(tc_ref["tele_score"], tc_dub["tele_score"]), 3),
                     tc_dropped=int(tc_ref["dropped"]) + int(tc_dub["dropped"]))
-    low_cos_proceed = assigned_pct < ABORT_ASSIGNED_PCT and coarse_strong
-    if assigned_pct < ABORT_ASSIGNED_PCT and not coarse_strong:
+    # Foreign video only when both signals agree; a strong coarse chain with a low assigned share
+    # is a low-cosine encode of the same episode and proceeds with a warning.
+    low_cos_proceed = assigned_pct < ABORT_ASSIGNED_PCT and m.coarse_strong
+    foreign = assigned_pct < ABORT_ASSIGNED_PCT and not m.coarse_strong
+    trace.decide("foreign_gate", state=m.state,
+                 inputs={"assigned_pct": assigned_pct, "n_keep": m.n_keep, "n_dub": m.n},
+                 thresholds={"ABORT_ASSIGNED_PCT": ABORT_ASSIGNED_PCT, "strong_thr": m.strong_thr},
+                 verdict="abort" if foreign else ("proceed_low_cos" if low_cos_proceed else "proceed"))
+    if foreign:
         return PairResult(
             dub=name, out_path=None, ok=False,
             error=f"чужое видео: сопоставлено {assigned_pct:.0f}% (< {ABORT_ASSIGNED_PCT:.0f}%) — выравнивание прервано",
             fps_ref=fps_ref, fps_dub=fps_tst, n_frames=N,
             duration_s=len(refv) / fps_ref, assigned_pct=assigned_pct,
-            elapsed_s=time.perf_counter() - t0, **_geom_kw)
+            elapsed_s=time.perf_counter() - t0, trace=trace.to_list(), **_geom_kw)
 
     # --- ВИДЕО-КАРТА анализатором зрения (ЕДИНСТВЕННЫЙ путь): детект ступеней + ломаная вместо
     #     ската. tg_s со ступенями на резах (без maximum.accumulate) — резы перекроет тишина ниже. ---
@@ -847,6 +994,7 @@ def conform_features(
     if _extract is not None:
         _extract.mark(0.0)
     dub_ch, dub_layout = probe_audio_channels(dub_audio, FFPROBE, atrack=dub_atrack)
+    dub_delay = probe_av_delay(dub_audio, FFPROBE, atrack=dub_atrack)
     aud_cleanup = out_tmp = ref_tmp = None
     memlog('перед декодом аудио озвучки')
     if low_mem:
@@ -854,15 +1002,18 @@ def conform_features(
         # CK2: аудио дубля из кэша (пропуск декода) или декод ПРЯМО в кэш (режим tmp).
         aud = (cache_mod.load_audio_mmap(cache_dir, dub_audio, dub_ch, atrack=dub_atrack)
                if (keep_tmp and cache_dir is not None) else None)
+        _aud_src = "cache" if aud is not None else "decoded"
         if aud is None:
             dest = (cache_mod.audio_raw(cache_dir, dub_audio, dub_atrack)
                     if (keep_tmp and cache_dir is not None) else None)
             aud, aud_cleanup = _decode_audio_mmap(dub_audio, ffmpeg, audio_fix, channels=dub_ch,
                                                  atrack=dub_atrack, reporter=_extract,
-                                                 dest=dest)  # int16-memmap [N,C]
+                                                 dest=dest, delay_s=dub_delay)  # int16-memmap [N,C]
             if dest is not None:
                 cache_mod.save_audio_meta(cache_dir, dub_audio, dub_ch, atrack=dub_atrack)   # CK2 мета (+EXT_VER)
         n_aud = len(aud)
+        trace.event("dub_audio", state="audio", source=_aud_src, channels=dub_ch, layout=dub_layout,
+                    atrack=dub_atrack, seconds=n_aud / SR, container_delay_s=dub_delay)
         out_tmp = Path(tempfile.mkdtemp(prefix="out_", dir=str(tmp))) / "out.f32"
         out = np.memmap(out_tmp, dtype=np.float32, mode="w+", shape=(n_out, dub_ch))
         BLK = 30 * SR                                    # 30с кусок: индексы и чтение аудио — по куску
@@ -884,8 +1035,10 @@ def conform_features(
         memlog('после ресэмпла звука по зрению')
     else:
         aud = _decode_audio(dub_audio, ffmpeg, audio_fix, channels=dub_ch, atrack=dub_atrack,
-                           reporter=_extract)
+                           reporter=_extract, delay_s=dub_delay)
         n_aud = len(aud)
+        trace.event("dub_audio", state="audio", source="decoded", channels=dub_ch, layout=dub_layout,
+                    atrack=dub_atrack, seconds=n_aud / SR, container_delay_s=dub_delay)
         t_out = np.arange(n_out) / SR
         t_syn_at = np.interp(t_out, grid, tg_s)
         src = t_syn_at * SR; sg = np.arange(len(aud))
@@ -938,16 +1091,16 @@ def conform_features(
                 ra = _decode_audio(Path(ref.src), ffmpeg, False, atrack=ref_atrack,
                                   reporter=_rep("extract", "аудио рефа"))
             if ra is not None:
-                m = min(len(ra), n_out)
+                mr = min(len(ra), n_out)
                 if low_mem:
                     ref_tmp = Path(tempfile.mkdtemp(prefix="refbuf_", dir=str(Path(dub_audio).parent / "_tmp"))) / "ref.f32"
                     ref_buf = np.memmap(ref_tmp, dtype=np.float32, mode="w+", shape=(n_out, 2))
-                    ref_buf[:m] = ra[:m]
-                    if m < n_out:
-                        ref_buf[m:] = 0.0                # хвост — тишина (как np.zeros)
+                    ref_buf[:mr] = ra[:mr]
+                    if mr < n_out:
+                        ref_buf[mr:] = 0.0                # хвост — тишина (как np.zeros)
                 else:
                     ref_buf = np.zeros((n_out, 2), np.float32)
-                    ref_buf[:m] = ra[:m]
+                    ref_buf[:mr] = ra[:mr]
         except Exception:  # noqa: BLE001 — нет аудио у рефа → откат на тишину
             ref_buf = None
 
@@ -971,18 +1124,21 @@ def conform_features(
     #     по картинке) → дефект исходника, дорожка НЕ годится для дальнейшего. Поведение укладки и
     #     band НЕ трогаем — только сигнализируем КРАСНЫМ.
     memlog('перед буфером рефа')
-    av_critical: list[str] = []
+    trace.event("vision_map", state=m.state, cuts=len(vision_cuts), silenced_spans=len(fill_spans),
+                silenced_s=sum(b - a for a, b in fill_spans), dur_ref_s=dur_ref, n_anchors=int(len(asg)))
+    dv = None
     if ref_buf is not None:
         try:
             from .anchor import apply as _anchor_det
             dv = _anchor_det.detect_av_desync(out, ref_buf, sr_audio=SR)
-            if dv and dv["danger"]:
-                av_critical.append(
-                    f"студийный A/V-десинк ≈ {dv['lag_ms'] / 1000:+.2f}с: аудио устойчиво смещено "
-                    f"относительно видео (±{dv['mad_ms']:.0f}мс по {dv['n_windows']} окнам) — "
-                    f"дефект исходника, дорожка не годится для дальнейшего")
-        except Exception:  # noqa: BLE001 — детектор не должен ронять conform
-            pass
+            # Diagnostics only: a constant offset is what the audio layer removes; the track verdict
+            # is taken from what remains after it (_audio_verdict), never from this pre-layer value.
+            trace.decide("av_desync", state="audio", verdict="offset" if (dv and dv["danger"]) else "ok",
+                         inputs={k: dv[k] for k in ("lag_ms", "mad_ms", "n_windows") if dv and k in dv})
+        except Exception as e:  # noqa: BLE001 — детектор не должен ронять conform
+            trace.decide("av_desync", state="audio", verdict="error", inputs={"error": str(e)[:200]})
+    else:
+        trace.decide("av_desync", state="audio", verdict="skipped", inputs={"reason": "no reference audio"})
 
     # --- НОВЫЙ аудио-слой (Band/MuQ) — ПОСЛЕ заливки вырезов: видит реф/тишину в вырезе (как
     #     боевой off, на чём валидирован), а не сырой дубль → без ложного краевого реза. Варпит out.
@@ -1001,6 +1157,18 @@ def conform_features(
             plot_dir=out_path.parent / "_plots", plot_stem=out_path.stem, render_own=False,
             vision_spans=fill_spans, dsp_cache=_dsp_cache)   # зоны тишины зрения + CK4-кэш benv рефа
             # render_own=False: band свой график НЕ рисует — conform строит ЕДИНЫЙ (зрение+аудио) ниже
+        trace.event("audio_layer", state="audio", method=("muq" if muq_on else "band"),
+                    resid_ms=audio_resid_ms, cuts=int(audio_info.get("audio_cuts", 0)),
+                    max_step_ms=float(audio_info.get("audio_max_step_ms", 0.0)),
+                    coverage=float(audio_info.get("audio_coverage", 0.0)),
+                    span_ms=float(audio_info.get("audio_span_ms", 0.0)),
+                    drift_ms=float(audio_info.get("audio_drift_ms", 0.0)),
+                    excess_ms=_audio_excess_ms(audio_info),
+                    global_offset_ms=float(audio_info.get("audio_global_offset_ms", 0.0)),
+                    structure=audio_info.get("audio_structure"))
+    else:
+        trace.event("audio_layer", state="audio", method="none",
+                    reason=("no reference audio" if (audio_band or audio_muq) else "audio layers disabled"))
 
     # --- ФИНАЛЬНОЕ заполнение ТИШИНЫ озвучки рефом: ТОЛЬКО ПОСЛЕ band/muq (дорожка синхронна
     #     рефу). В дырах озвучки (резы, вырезы, края), где реф звучит, подставляем синхронный
@@ -1013,6 +1181,20 @@ def conform_features(
         ref_filled_s = _fill_silence_from_ref(out, ref_buf)
         audio_info["ref_filled_s"] = round(ref_filled_s, 1)
     n_filled = int(round(ref_filled_s))          # PairResult.filled_cuts = секунд тишины залито рефом
+    trace.event("fill_silence", state="audio", enabled=bool(fill_silence and anchor_on and ref_buf is not None),
+                filled_s=ref_filled_s)
+
+    # --- паспорт качества + предупреждения (read-only, на wav не влияет); до графика: шапка берёт вердикт ---
+    metrics = _metrics(syn, refv, pred, asg, fps_ref, fps_tst, free_start)
+    warns = _warnings(asg=asg, n_syn=N, pred=pred, fps_ref=fps_ref, fps_dub=fps_tst,
+                      dur_ref=dur_ref, real_cuts_s=real_cuts_s, metrics=metrics,
+                      creep_zones=creep_zones, freeze_runs=freeze_runs)
+    critical: list[str] = []
+    if anchor_on and audio_info:
+        critical, audio_warns = _audio_verdict(audio_info, audio_resid_ms)
+        warns += audio_warns
+    verdict = "critical" if critical else ("warn" if warns else "ok")
+    trace.decide("verdict", state="audio", verdict=verdict, inputs={"critical": critical, "warnings": warns})
 
     # --- ЕДИНЫЙ график укладки: ЗРЕНИЕ (всегда, видео-укладка) + АУДИО (если был anchor-слой).
     #     Read-only: падение не роняет conform. 1 панель (только зрение) / 2 панели (зрение+аудио). ---
@@ -1087,8 +1269,15 @@ def conform_features(
         except Exception:  # noqa: BLE001 — дамп зрения не должен ронять conform
             pass
         audio_d = audio_info.get("band_layers")                       # None → только зрение (1 панель)
+        passport = _pair_passport(
+            vision_cuts=vision_cuts, fill_spans=fill_spans, freeze_runs=freeze_runs, audio_info=audio_info,
+            shift_T=shift_T, T_v=T_v, scale_a=sa, fps_ref=fps_ref, assigned_pct=assigned_pct,
+            metrics=metrics, tc_ref=tc_ref, tc_dub=tc_dub, geom_info=geom_info, mirror=bool(m.mirror),
+            container_delay=dub_delay, anchor_on=anchor_on, audio_resid_ms=audio_resid_ms,
+            av_desync=dv, verdict=verdict, verdict_text=(critical or warns or [""])[0])
         unified_plots = _pu.render_unified(out_path.parent / "_plots", out_path.stem,
-                                           vision=vision_d, audio=audio_d, title=out_path.stem)
+                                           vision=vision_d, audio=audio_d, title=out_path.stem,
+                                           passport=passport)
     except Exception:  # noqa: BLE001 — графики не должны ронять conform
         unified_plots = []
 
@@ -1098,6 +1287,8 @@ def conform_features(
     memlog('перед записью файла')
     try:
         _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_write)  # FLAC, раскладка дубля
+        trace.event("write", state="output", path=out_path, layout=dub_layout, seconds=n_out / SR,
+                    bytes=out_path.stat().st_size if out_path.exists() else 0)
     finally:
         # ⚠ Уборка ОБЯЗАНА идти при любом исходе. Раньше она стояла просто после записи:
         # запись падала — и десятки гигабайт промежуточных файлов оставались лежать
@@ -1110,11 +1301,14 @@ def conform_features(
                       ref_tmp.parent if ref_tmp else None, aud_cleanup):
                 tmpfiles.drop_dir(d)          # подключения закрыты выше (del), проверка внутри
 
-    # --- паспорт качества + предупреждения (read-only, на wav не влияет) ---
-    metrics = _metrics(syn, refv, pred, asg, fps_ref, fps_tst, free_start)
-    warns = _warnings(asg=asg, n_syn=N, pred=pred, fps_ref=fps_ref, fps_dub=fps_tst,
-                      dur_ref=dur_ref, real_cuts_s=real_cuts_s, metrics=metrics,
-                      anchor_on=anchor_on, audio_info=audio_info, creep_zones=creep_zones)
+    # The vision layout is the pair's time map; stored so subtitles can follow the audio.
+    try:
+        from .subs_transfer import save_time_map
+        save_time_map(out_path, _make_T(dur_ref), _vcurve, vision_cuts, fps_ref, dur_ref)
+        trace.event("time_map", state="output", cuts=len(vision_cuts))
+    except Exception as e:  # noqa: BLE001
+        trace.event("time_map", state="output", error=str(e)[:200])
+
     if low_cos_proceed:                               # назн% < порога, но грубый проход подтвердил серию
         warns.insert(0, f"низкий косинус энкода (назн {assigned_pct:.0f}% < {ABORT_ASSIGNED_PCT:.0f}%): "
                         f"отсечка «чужое видео» НЕ применена — грубый проход подтвердил серию "
@@ -1135,8 +1329,8 @@ def conform_features(
         audio_span_ms=float(audio_info.get("audio_span_ms", 0.0)),
         plots=unified_plots,
         warnings=warns,
-        critical=av_critical,
-        elapsed_s=time.perf_counter() - t0, **_geom_kw,
+        critical=critical,
+        elapsed_s=time.perf_counter() - t0, trace=trace.to_list(), **_geom_kw,
     )
 
 
@@ -1165,8 +1359,106 @@ def _mmss(t: float) -> str:
     t = max(0, int(t)); return f"{t // 60}:{t % 60:02d}"
 
 
+def _pair_passport(*, vision_cuts, fill_spans, freeze_runs, audio_info, shift_T, T_v, scale_a, fps_ref,
+                   assigned_pct, metrics, tc_ref, tc_dub, geom_info, mirror, container_delay, anchor_on,
+                   audio_resid_ms, av_desync, verdict, verdict_text) -> dict:
+    """One passport of the pair for both chart renders: zones and events with their kind and size,
+    layout segments whose speed differs from the global scale, header metrics of vision and hearing,
+    and the verdict. Numbers only; labels and units come from the chart's term catalog."""
+    st = audio_info.get("audio_structure") or {}
+    zones = ([{"kind": "vision_cut", "a": float(a), "b": float(b)} for a, b in fill_spans]
+             + [{"kind": "video_freeze", "a": float(a), "b": float(b)} for a, b in freeze_runs]
+             + [{"kind": "audio_gap", "a": float(a), "b": float(b)} for a, b in st.get("gaps", [])]
+             + [{"kind": "dtw_cut", "a": float(a), "b": float(b)}
+                for a, b in (audio_info.get("band_layers") or {}).get("dtw_cut_zones", [])])
+    events = ([{"kind": "vision_step", "t": float(tc), "value": float(v) / fps_ref} for tc, v, _te, _tn in vision_cuts]
+              + [{"kind": "audio_cut", "t": float(t), "value": float(v) * VFRAME} for t, v in audio_info.get("cuts", [])]
+              + [{"kind": "audio_jump", "t": float(t), "value": float(d)} for t, d in st.get("jumps", [])]
+              + [{"kind": "dtw_insert", "t": float(tc), "value": float(ln)}
+                 for tc, ln in (audio_info.get("band_layers") or {}).get("dtw_inserts", [])])
+    # Layout speed per segment between vision steps: slope of the applied map against the global scale.
+    segments = []
+    bounds = [0.0] + sorted(float(tc) for tc, *_ in vision_cuts) + [float(T_v[-1])]
+    for a, b in zip(bounds[:-1], bounds[1:]):
+        m = (T_v >= a) & (T_v <= b) & np.isfinite(shift_T)
+        if m.sum() >= 10 and b - a >= 20.0:
+            slope = float(np.polyfit(T_v[m], shift_T[m], 1)[0])          # frames of layout per second
+            segments.append({"a": a, "b": b, "speed_pct": (slope - scale_a) / fps_ref * 100.0})
+    vision_line = [
+        {"key": "assigned", "value": float(assigned_pct)},
+        {"key": "cos", "value": float(metrics["cos_median"])},
+        {"key": "scale", "value": float(scale_a) / max(float(fps_ref), 1e-6) * 100.0},
+        {"key": "telecine", "tpl": "value.telecine",
+         "value": {"ref": float(tc_ref["tele_score"]), "dub": float(tc_dub["tele_score"])}},
+        {"key": "tc_dropped", "value": int(tc_ref["dropped"]) + int(tc_dub["dropped"])},
+        {"key": "geom", "tpl": "value.geom",
+         "value": ({"sx": float(geom_info["sx"]), "sy": float(geom_info["sy"]), "n": int(geom_info["n_in"])}
+                   if geom_info else None)},
+        {"key": "mirror", "value": bool(mirror)},
+        {"key": "container_delay", "value": float(container_delay)},
+        {"key": "vision_cuts", "tpl": "value.count_dur",
+         "value": {"n": len(fill_spans), "dur": float(sum(b - a for a, b in fill_spans))}},
+        {"key": "freezes", "tpl": "value.count_dur",
+         "value": {"n": len(freeze_runs), "dur": float(sum(b - a for a, b in freeze_runs))}},
+    ]
+    audio_line = []
+    if anchor_on and audio_info:
+        audio_line = [
+            {"key": "method", "value": str(audio_info.get("anchor_method", ""))},
+            {"key": "structure", "tpl": "value.structure",
+             "value": ({"plateaus": len(st["plateaus"]), "jumps": len(st["jumps"])} if st else None)},
+            {"key": "resid", "value": float(abs(audio_resid_ms))},
+            {"key": "cuts", "value": int(audio_info.get("audio_cuts", 0))},
+            {"key": "max_step", "value": float(audio_info.get("audio_max_step_ms", 0.0))},
+            {"key": "coverage", "value": float(audio_info.get("audio_coverage", 0.0)) * 100.0},
+            {"key": "excess", "value": _audio_excess_ms(audio_info) / 1000.0},
+            {"key": "filled", "value": float(audio_info.get("ref_filled_s", 0.0))},
+            {"key": "av_offset", "tpl": "value.av_offset",
+             "value": ({"lag": float(av_desync["lag_ms"]), "mad": float(av_desync["mad_ms"])} if av_desync else None)},
+        ]
+    return {"zones": zones, "events": events, "segments": segments,
+            "header": [vision_line, audio_line], "verdict": verdict, "verdict_text": verdict_text}
+
+
+def _audio_excess_ms(audio_info: dict) -> float:
+    """Cut movement that cancelled itself out: Σ|steps| − |Σsteps|. Real audio edits accumulate in one
+    direction; a layer chasing a blind measurement goes back and forth and this grows to seconds."""
+    return max(0.0, float(audio_info.get("audio_sum_ms", 0.0)) - abs(float(audio_info.get("audio_net_ms", 0.0))))
+
+
+def _audio_verdict(audio_info: dict, resid_ms: float) -> tuple[list[str], list[str]]:
+    """Track verdict from what remains AFTER the audio layer -> (critical, warnings). One chokepoint
+    for both modes: constant offsets the layer removed never count, only its result does."""
+    crit: list[str] = []; warn: list[str] = []
+    resid = abs(float(resid_ms))
+    cov = float(audio_info.get("audio_coverage", 0.0))
+    cuts = int(audio_info.get("audio_cuts", 0)); excess = _audio_excess_ms(audio_info)
+    drift = float(audio_info.get("audio_drift_ms", 0.0))
+    if cov < AUDIO_COVERAGE_BLIND:
+        crit.append(f"у файлов почти нет общего звука (опора {cov * 100:.0f}% длительности) — "
+                    f"синхронность выхода не измерена")
+    elif cov < AUDIO_COVERAGE_LOW:
+        warn.append(f"звуковое измерение имело опору лишь на {cov * 100:.0f}% длительности")
+    if resid > AUDIO_RESID_MAX_MS:
+        crit.append(f"остаток после доводки {resid:.0f} мс — больше допустимых ±{AUDIO_RESID_MAX_MS:.0f} мс")
+    if excess > AUDIO_EXCESS_CRIT_MS:
+        crit.append(f"слух метался: {cuts} резов, взаимно погашено {excess / 1000:.1f} с хода — "
+                    f"синхронность выхода не гарантирована")
+    elif excess > AUDIO_EXCESS_WARN_MS:
+        warn.append(f"резы туда-обратно: {cuts} резов, взаимно погашено {excess / 1000:.1f} с хода — проверить")
+    if abs(drift) > 1000.0:
+        warn.append(f"сдвиг звука уходит на {drift / 1000:+.1f} с — вероятно, дефект исходного файла")
+    st = audio_info.get("audio_structure")
+    if st:
+        gap_s = sum(b - a for a, b in st["gaps"])
+        jumps = ", ".join(f"{j[1]:+.1f} с на {j[0]:.0f} с" for j in st["jumps"])
+        warn.append(f"структура звука: {len(st['plateaus'])} плато" + (f", скачки {jumps}" if jumps else "")
+                    + (f"; звука озвучки нет {gap_s:.0f} с — залито рефом" if gap_s else ""))
+    return crit, warn
+
+
 def _warnings(*, asg, n_syn, pred, fps_ref, fps_dub, dur_ref, real_cuts_s,
-              metrics, anchor_on, audio_info, creep_zones=()) -> list[str]:
+              metrics, creep_zones=(), freeze_runs=()) -> list[str]:
     """Эвристические предупреждения «обрати внимание» (НА wav НЕ влияют). Терпимы к ложным:
     лучше пере-предупредить. Каждое — с причиной-ярлыком, чтобы ложное было легко отмести."""
     w: list[str] = []
@@ -1175,6 +1467,8 @@ def _warnings(*, asg, n_syn, pred, fps_ref, fps_dub, dur_ref, real_cuts_s,
     for j0, j1, cz, sl in creep_zones:
         w.append(f"налипшая вставка выброшена: {_mmss(j0 / fps_dub)}–{_mmss(j1 / fps_dub)} "
                  f"дубля (~{(j1 - j0 + 1) / fps_dub:.0f}с, cos {cz:.2f}, ход {sl:.2f}×)")
+    for a, b in freeze_runs:
+        w.append(f"кадр озвучки не меняется {_mmss(a)}–{_mmss(b)} ({b - a:.0f}с) — замершая картинка или статичная заставка")
     exp = (fps_ref / fps_dub) if fps_dub else 1.0
     # — геометрия —
     if metrics["slope"] and abs(metrics["slope"] - exp) > 0.05:
@@ -1196,19 +1490,6 @@ def _warnings(*, asg, n_syn, pred, fps_ref, fps_dub, dur_ref, real_cuts_s,
         w.append(f"звуком референса заполнено {ff * 100:.0f}% длительности")
     if metrics["intro_s"] > 5.0:
         w.append(f"выпало/залито начало ~{metrics['intro_s']:.0f}с")
-    # — аудио-слой band/muq (диагностика процесса по РЕАЛЬНЫМ метрикам слоя; на wav НЕ влияет) —
-    if anchor_on and audio_info:
-        resid = abs(float(audio_info.get("resid_med_frames", 0.0))) * VFRAME   # остаток ПОСЛЕ доводки, мс
-        cov = float(audio_info.get("audio_coverage", 0.0))                     # доля трека с надёжными якорями
-        drift = float(audio_info.get("audio_drift_ms", 0.0))                   # непрерывный аудио-дрейф, мс
-        if cov < 0.15:
-            w.append("звуковому измерению почти не на что опереться: у файлов нет общего звука — проверьте результат")
-        elif cov < 0.5:
-            w.append(f"звуковое измерение имело опору лишь на {cov * 100:.0f}% длительности")
-        if resid > 80.0:                                  # главный критерий проекта: место вне ±80мс
-            w.append(f"остаточное рассогласование {resid:.0f} мс — больше допустимых ±80 мс")
-        if abs(drift) > 1000.0:
-            w.append(f"сдвиг звука уходит на {drift / 1000:+.1f} с — вероятно, дефект исходного файла")
     return w
 
 
@@ -1233,9 +1514,10 @@ def _align_audio_only(
     ref_atrack: int = 0,             # ⭐ 5.1: аудиодорожка рефа (звуковой эталон)
     dub_atrack: int = 0,             # ⭐ 5.1: аудиодорожка дубля (голое аудио обычно одна, но mka бывают многодорожечными)
     should_stop=None,
+    trace: Trace | None = None,
     **_video_only_opts,          # free_start/recover_edges/fps_dub/audio_fix — видео-понятия, в аудио-only не участвуют
 ) -> PairResult:
-    """⭐ АУДИО-ONLY conform (требование 9 CHARTER standalone-миссии, 2026-08-06): озвучка
+    """⭐ АУДИО-ONLY conform: озвучка
     БЕЗ видеопотока (голый flac/mka/mp3/aac…). Зрения нет по построению — дубль кладётся на
     таймлайн рефа КАК ЕСТЬ (identity, от нуля), после чего ВЕСЬ рассинхрон снимает штатный
     аудио-слой ровно тем же конвейером, что и после зрения:
@@ -1257,6 +1539,7 @@ def _align_audio_only(
     name = dub_name or dub_audio.name
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    trace = trace if trace is not None else Trace(name)
 
     fps_ref = ref.fps
     dur_ref = ref.duration_s
@@ -1264,6 +1547,9 @@ def _align_audio_only(
         raise ValueError(f"реф пуст/битый (dur={dur_ref}, fps={fps_ref}) — аудио-only без длины рефа невозможен")
     n_out = int(dur_ref * SR)
     dub_ch, dub_layout = probe_audio_channels(dub_audio, FFPROBE, atrack=dub_atrack)
+    dub_delay = probe_av_delay(dub_audio, FFPROBE, atrack=dub_atrack)
+    trace.event("dub_audio", state="audio-only", channels=dub_ch, layout=dub_layout, atrack=dub_atrack,
+                dur_ref_s=dur_ref, container_delay_s=dub_delay)
 
     # --- декод дубля + identity-укладка на таймлайн рефа (хвост за длиной рефа — отрез,
     #     нехватка — тишина; сдвиги/вырезы дальше разберёт аудио-слой) ---
@@ -1278,7 +1564,7 @@ def _align_audio_only(
             aud, aud_cleanup = _decode_audio_mmap(dub_audio, ffmpeg, True, channels=dub_ch,
                                                   atrack=dub_atrack,
                                                   reporter=_rep("extract", "декодирование звука озвучки"),
-                                                  dest=dest)
+                                                  dest=dest, delay_s=dub_delay)
             if dest is not None:
                 cache_mod.save_audio_meta(cache_dir, dub_audio, dub_ch, atrack=dub_atrack)   # CK2 мета (+EXT_VER)
         out_tmp = Path(tempfile.mkdtemp(prefix="out_", dir=str(tmp))) / "out.f32"
@@ -1292,7 +1578,7 @@ def _align_audio_only(
         del aud
     else:
         aud = _decode_audio(dub_audio, ffmpeg, True, channels=dub_ch, atrack=dub_atrack,
-                            reporter=_rep("extract", "декодирование звука озвучки"))
+                            reporter=_rep("extract", "декодирование звука озвучки"), delay_s=dub_delay)
         out = np.zeros((n_out, dub_ch), np.float32)
         m = min(len(aud), n_out)
         out[:m] = aud[:m]
@@ -1338,6 +1624,15 @@ def _align_audio_only(
             plot_dir=out_path.parent / "_plots", plot_stem=out_path.stem,
             render_own=True,                       # свой график band: панели зрения в этом режиме нет
             vision_spans=None, dsp_cache=_dsp_cache)
+        trace.event("audio_layer", state="audio-only", method=("muq" if muq_on else "band"),
+                    resid_ms=audio_resid_ms, cuts=int(audio_info.get("audio_cuts", 0)),
+                    max_step_ms=float(audio_info.get("audio_max_step_ms", 0.0)),
+                    coverage=float(audio_info.get("audio_coverage", 0.0)),
+                    span_ms=float(audio_info.get("audio_span_ms", 0.0)),
+                    drift_ms=float(audio_info.get("audio_drift_ms", 0.0)))
+    else:
+        trace.event("audio_layer", state="audio-only", method="none",
+                    reason=("no reference audio" if (audio_band or audio_muq) else "audio layers disabled"))
 
     if _audio is not None:
         _audio.mark(0.70, "заполнение тишины рефом")
@@ -1345,25 +1640,26 @@ def _align_audio_only(
     if fill_silence and anchor_on and ref_buf is not None:
         ref_filled_s = _fill_silence_from_ref(out, ref_buf)
         audio_info["ref_filled_s"] = round(ref_filled_s, 1)
+    trace.event("fill_silence", state="audio-only", enabled=bool(fill_silence and anchor_on and ref_buf is not None),
+                filled_s=ref_filled_s)
 
     # --- предупреждения (read-only): режим без зрения обязан честно сигналить о слепоте ---
-    warns: list[str] = []
+    warns: list[str] = []; critical: list[str] = []
     if not anchor_on:
         warns.append("аудио-only БЕЗ аудио-слоя (band/muq выключены или у рефа нет аудио): "
                      "дорожка уложена КАК ЕСТЬ, выравнивание не выполнялось")
     else:
-        cov = float(audio_info.get("audio_coverage", 0.0))
-        if cov < 0.5:
-            warns.append(f"аудио-only: низкое покрытие якорями ({cov * 100:.0f}%) — "
-                         f"слуху не за что держаться на большей части дорожки, проверить")
-        if abs(audio_resid_ms) > 80.0:
-            warns.append(f"остаточное рассогласование {audio_resid_ms:.0f} мс — больше допустимых ±80 мс")
+        critical, warns = _audio_verdict(audio_info, audio_resid_ms)
+    trace.decide("verdict", state="audio-only", verdict="critical" if critical else ("warn" if warns else "ok"),
+                 inputs={"critical": critical, "warnings": warns})
 
     _write = _rep("write", out_path.name)
     if _write is not None:
         _write.mark(0.0)
     try:
         _write_audio_streamed(out_path, out, ffmpeg, layout=dub_layout, on_prog=_write)
+        trace.event("write", state="output", path=out_path, layout=dub_layout, seconds=n_out / SR,
+                    bytes=out_path.stat().st_size if out_path.exists() else 0)
     finally:
         if low_mem:                                      # уборка при любом исходе (см. видео-путь)
             del out
@@ -1383,8 +1679,8 @@ def _align_audio_only(
         audio_coverage=float(audio_info.get("audio_coverage", 0.0)),
         audio_span_ms=float(audio_info.get("audio_span_ms", 0.0)),
         plots=list(audio_info.get("plots", [])),
-        warnings=warns,
-        elapsed_s=time.perf_counter() - t0,
+        warnings=warns, critical=critical,
+        elapsed_s=time.perf_counter() - t0, trace=trace.to_list(),
     )
 
 
@@ -1410,28 +1706,49 @@ def conform_pair(
 
     keep_tmp=True + cache_dir → ЧЕКПОИНТ CK1: SRM дубля кэшируется в `cache_dir`
     (`epXX/_conform_cache`, как реф) и при повторном запуске берётся оттуда — пропуск
-    тяжёлого GPU-декода. Ключ=файл+EMB_VER (cache.load_srm). ТЗ: doc/ТЗ_чекпоинты_conform.md."""
+    тяжёлого GPU-декода. Ключ=файл+EMB_VER (cache.load_srm)."""
     dub_video = Path(dub_video)
-    # ⭐ АУДИО-ONLY: у озвучки НЕТ видеопотока (голый flac/mka/mp3…) → зрение невозможно по
-    # построению → ветка _align_audio_only (identity-укладка + полный аудио-слой). Решение
-    # принимает алгоритм по данным файла, без тумблера (требование 9 CHARTER standalone).
+    out_path = Path(out_path)
+    trace = Trace(dub_video.name)
+    # One chokepoint for every outcome: the trace reaches the result and the disk whether the
+    # pair succeeded, was rejected by a gate or crashed; a crash alone must not lose the record.
+    try:
+        res = _conform_pair(ref, dub_video, out_path, trace, fps_dub=fps_dub, ffmpeg=ffmpeg,
+                            progress=progress, should_stop=should_stop, progress_meta=progress_meta,
+                            low_mem=low_mem, cache_dir=cache_dir, keep_tmp=keep_tmp, **opts)
+    except Exception as e:  # noqa: BLE001 — one pair must not take the episode down
+        logger.exception("conform: озвучка {} упала на серии {}", dub_video.name, ref.src)
+        trace.event("exception", state="error", type=type(e).__name__, error=str(e)[:500])
+        res = PairResult(dub=dub_video.name, out_path=None, ok=False, error=str(e), trace=trace.to_list())
+    trace.save(out_path)
+    return res
+
+
+def _conform_pair(ref, dub_video: Path, out_path: Path, trace: Trace, *, fps_dub, ffmpeg, progress,
+                  should_stop, progress_meta, low_mem, cache_dir, keep_tmp, **opts) -> PairResult:
+    # A dub without a video stream cannot be matched by vision; the audio-only path lays it down
+    # as is and lets the audio layer do all the alignment. Decided from the file, never a switch.
     if not probe_has_video(dub_video):
-        return _align_audio_only(ref, dub_video, Path(out_path), ffmpeg=ffmpeg,
+        trace.decide("mode", state="probe", verdict="audio", inputs={"has_video": False})
+        return _align_audio_only(ref, dub_video, out_path, ffmpeg=ffmpeg,
                                  progress=progress, progress_meta=progress_meta,
                                  low_mem=low_mem, cache_dir=cache_dir, keep_tmp=keep_tmp,
-                                 dub_name=dub_video.name, should_stop=should_stop, **opts)
+                                 dub_name=dub_video.name, should_stop=should_stop, trace=trace, **opts)
+    trace.decide("mode", state="probe", verdict="av", inputs={"has_video": True})
     _decode = Reporter.of(progress, "decode", progress_meta, "разбор файла")
     if _decode is not None:
         _decode.mark(0.0)
     # CK1: попытка взять SRM дубля из кэша серии (пропуск GPU-декода).
     dub = cache_mod.load_srm(cache_dir, dub_video) if (keep_tmp and cache_dir is not None) else None
+    trace.decide("ck1_srm", state="cache", source="cache", verdict="hit" if dub is not None else "miss",
+                 inputs={"checkpoints": bool(keep_tmp and cache_dir is not None)})
     if dub is not None:
         if fps_dub is not None:
             dub.fps = float(fps_dub)
-        return conform_features(ref, dub, dub_video, Path(out_path), ffmpeg=ffmpeg,
+        return conform_features(ref, dub, dub_video, out_path, ffmpeg=ffmpeg,
                                 progress=progress, dub_name=dub_video.name,
                                 progress_meta=progress_meta, low_mem=low_mem,
-                                cache_dir=cache_dir, keep_tmp=keep_tmp, **opts)
+                                cache_dir=cache_dir, keep_tmp=keep_tmp, trace=trace, **opts)
     # Нет валидного CK1 → строим SRM. В tmp — ПРЯМО в кэш (не удаляем); иначе в _tmp (удаляем).
     mp = None; into_cache = False
     if keep_tmp and cache_dir is not None:
@@ -1444,13 +1761,15 @@ def conform_pair(
     with decode_backend(probe_resolution(dub_video), ffmpeg) as _be:   # 1080+ → GPU (потолок NVDEC), иначе CPU
         dub = build_srm(dub_video, fps_dub, ffmpeg=ffmpeg, reporter=_decode,
                         should_stop=should_stop, mmap_path=mp, backend=_be)
+    trace.event("srm_dub", state="plain", source="decoded", frames=len(dub.srm), fps=dub.fps,
+                vfr=dub.pts is not None, cached=into_cache)
     if into_cache:
         cache_mod.save_meta(cache_dir, dub_video, len(dub.srm), dub.fps)   # CK1 мета (+EMB_VER)
     try:
-        return conform_features(ref, dub, dub_video, Path(out_path), ffmpeg=ffmpeg,
+        return conform_features(ref, dub, dub_video, out_path, ffmpeg=ffmpeg,
                                 progress=progress, dub_name=dub_video.name,
                                 progress_meta=progress_meta, low_mem=low_mem,
-                                cache_dir=cache_dir, keep_tmp=keep_tmp, **opts)
+                                cache_dir=cache_dir, keep_tmp=keep_tmp, trace=trace, **opts)
     finally:
         if mp is not None and not into_cache:   # _tmp-копию удаляем; кэш-копию (CK1) оставляем
             del dub                          # освободить memmap перед удалением файла

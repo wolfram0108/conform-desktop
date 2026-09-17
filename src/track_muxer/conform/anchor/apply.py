@@ -134,23 +134,48 @@ def _warp_by_off0(dub_ch, sr, off0, T=_DEFT):
     return warp_interp(dub_ch, (t + dlt) * sr)            # варп полн.длины — GPU/CPU блочно
 
 
-def _events_step_curve(curve, ts, cuts, inserts, T=_DEFT):
+def _events_outside_vision(inserts, cuts, spans, min_overlap=0.5):
+    """Keep only DTW events the vision map has not already applied: a cut whose zone lies at least
+    min_overlap inside vision silence, or an insert placed inside it, is vision's cut seen again by the
+    audio layer (the DTW curve there is unsupported) — never an audio-only event."""
+    if not spans:
+        return list(inserts), list(cuts)
+    def overlap(a, b):
+        return sum(max(0.0, min(b, sb) - max(a, sa)) for sa, sb in spans)
+    def inside(t):
+        return any(sa <= t <= sb for sa, sb in spans)
+    keep_c = [c for c in cuts if overlap(c[2], c[3]) < min_overlap * max(c[3] - c[2], 1e-9)]
+    keep_i = [i for i in inserts if not inside(i[0])]
+    return keep_i, keep_c
+
+
+def _events_step_curve(curve, ts, cuts, inserts, T=_DEFT, w=None):
     """СТУПЕНЧАТАЯ пред-коррекция СОБЫТИЙ DTW (снять вставки/сдвиги вне окна band ±2.5): off0_ev
     (кадры на сетке T). ПЛОСКАЯ между событиями — дрейф НЕ трогаем, его доберёт band-коарс ниже.
-    Уровни плато = медиана кривой DTW в сегменте между событиями; первый сегмент = опора (0).
+    Уровни плато = медиана кривой DTW в сегменте между событиями; опора (0) = сегмент с наибольшей опорой.
     Знак как off0 (правее=+): off0_ev = −(уровень кривой DTW). Зовётся ТОЛЬКО для event-треков
-    (где DTW нашёл вставку/вырез); где событий нет — вызывающий не строит off0_ev (base=src)."""
+    (где DTW нашёл вставку/вырез); где событий нет — вызывающий не строит off0_ev (base=src).
+
+    w (на сетке ts) — опора кривой DTW; w=0 там, где звука нет (тишина зрения): the curve carries
+    no data there, and a level taken from such a segment would shift the whole track."""
     cv = np.interp(np.asarray(T, float), np.asarray(ts, float), np.asarray(curve, float))
+    wv = (np.interp(np.asarray(T, float), np.asarray(ts, float), np.asarray(w, float))
+          if w is not None else np.ones(len(T)))
     ev = sorted([float(tc) for tc, _ in inserts] + [float(tc) for tc, _, _, _ in cuts])
     if not ev:
         return np.zeros(len(T), np.float32)
-    bnds = [-1e9] + ev + [1e9]; off = np.zeros(len(T))
+    bnds = [-1e9] + ev + [1e9]; off = np.zeros(len(T)); last = None; ref = None; ref_sup = -1.0
     for k in range(len(bnds) - 1):
-        m = (T > bnds[k]) & (T <= bnds[k + 1])
-        if m.any():
-            off[m] = float(np.median(cv[m]))
-    off = off - off[0]                          # первый сегмент = опора (0); дальше кумулятивные ступени событий
-    return (-off).astype(np.float32)
+        m = (T > bnds[k]) & (T <= bnds[k + 1]); sup = m & (wv > 0)
+        if sup.any():
+            last = float(np.median(cv[sup]))
+            if float(wv[sup].sum()) > ref_sup:  # reference = the segment with the most support (the bulk)
+                ref, ref_sup = last, float(wv[sup].sum())
+        if m.any() and last is not None:
+            off[m] = last                       # unsupported segment keeps the neighbour's level: no step
+    if ref is None:
+        return np.zeros(len(T), np.float32)
+    return (-(off - ref)).astype(np.float32)
 
 
 def _smooth_drift_curve(o_total, w, cut_times, qpow=3.0, sigma_s=3.0, max_pct_s=1.25,
@@ -393,6 +418,10 @@ _PRE_FPS = _PRE_SR / _PRE_HOP                                 # 62.5 env-fps (б
 _PRE_HW_S, _PRE_ML_S, _PRE_STEP_S = 20.0, 70.0, 15.0          # окно-шаблон / диапазон лага / шаг центров
 _PRE_HEAD_K = 6                                               # голова = первые K окон
 _PRE_MIN_S, _PRE_FLAT_MIN, _PRE_TOL_S = 2.5, 0.9, 1.5         # гейт |head|>2.5с (вне band) И flat>0.9
+_STRUCT_HW_S, _STRUCT_STEP_S = 20.0, 15.0                     # structure probe: window ±hw / step on the laid stream
+_STRUCT_FINE_HW_S = 1.0                                       # smoothing (s) of the frame-wise agreement at a jump
+_STRUCT_MIN_WIN = 3                                           # agreeing windows per plateau: two neighbours share 25 s of sound and can share a false lag, three share 10 s
+_STRUCT_BATCH = 6                                             # windows per GPU batch (cc is [B, 48, nfft])
 
 
 def _pre_bands():
@@ -439,6 +468,148 @@ def _pre_window_lags(er, ed):
         lags[b0:b0 + len(ci)] = (med / _PRE_FPS).cpu().numpy()
         conf[b0:b0 + len(ci)] = prom.median(1).values.cpu().numpy()
     return lags, conf
+
+
+@torch.no_grad()
+def _structure_window_lags(er, ed, centers, hw):
+    """Windows ±hw (env frames) of the laid stream at `centers`, each searched over the WHOLE ref:
+    per-band argmax, prominence-weighted median across bands (as _pre_window_lags).
+    -> (lag_s, conf); lag > 0: the window's sound sits later in the ref than where it lies now."""
+    Nf = min(er.shape[1], ed.shape[1]); er = er[:, :Nf]; ed = ed[:, :Nf]
+    nf = 1 << int(np.ceil(np.log2(Nf + 2 * hw)))
+    FR = torch.fft.rfft(er, nf, dim=1)
+    n_pos = Nf - 2 * hw + 1
+    lags = np.full(len(centers), np.nan); conf = np.zeros(len(centers))
+    for b0 in range(0, len(centers), _STRUCT_BATCH):
+        ci = centers[b0:b0 + _STRUCT_BATCH]
+        D = torch.stack([ed[:, c - hw:c + hw] for c in ci])
+        FD = torch.fft.rfft(D, nf, dim=2)
+        cc = torch.fft.irfft(FR.unsqueeze(0) * torch.conj(FD), nf, dim=2)[:, :, :n_pos]
+        starts = torch.tensor([float(c - hw) for c in ci], device=cc.device).unsqueeze(1)
+        band_lag = torch.argmax(cc, 2).float() - starts
+        prom = (cc.amax(2) - cc.median(2).values).clamp(min=0)
+        order = torch.argsort(band_lag, 1)
+        bl = torch.gather(band_lag, 1, order); pw = torch.gather(prom, 1, order)
+        cw = torch.cumsum(pw, 1); mi = (cw < cw[:, -1:] * 0.5).sum(1).clamp(0, 47)
+        med = bl.gather(1, mi[:, None]).squeeze(1)
+        lags[b0:b0 + len(ci)] = (med / _PRE_FPS).cpu().numpy()
+        conf[b0:b0 + len(ci)] = prom.median(1).values.cpu().numpy()
+        del cc
+    return lags, conf
+
+
+def _structure_plateaus(t_c, lags, conf, hw_s):
+    """Consecutive agreeing windows -> plateaus [(t0, t1, lag_s, n_win, conf_sum)] in laid time.
+    A lone window disagreeing with both neighbours is an outlier and founds no plateau; plateaus
+    whose lags differ by no more than band's reach are one plateau (the fine layers absorb it)."""
+    ok = np.isfinite(lags) & (conf > 0)
+    runs = []; cur = None
+    for i in np.where(ok)[0]:
+        if cur is not None and abs(lags[i] - cur["lag"]) <= _PRE_TOL_S:
+            cur["idx"].append(int(i)); cur["lag"] = _wmedian(lags[cur["idx"]], conf[cur["idx"]])
+        else:
+            if cur is not None:
+                runs.append(cur)
+            cur = {"idx": [int(i)], "lag": float(lags[i])}
+    if cur is not None:
+        runs.append(cur)
+    merged = []
+    for r in runs:
+        if len(r["idx"]) < _STRUCT_MIN_WIN:
+            continue
+        if merged and abs(r["lag"] - merged[-1]["lag"]) <= COARSE_LAG_S:
+            merged[-1]["idx"] += r["idx"]
+            merged[-1]["lag"] = _wmedian(lags[merged[-1]["idx"]], conf[merged[-1]["idx"]])
+        else:
+            merged.append(r)
+    return [(float(t_c[r["idx"][0]] - hw_s), float(t_c[r["idx"][-1]] + hw_s), float(r["lag"]),
+             len(r["idx"]), float(conf[r["idx"]].sum())) for r in merged]
+
+
+@torch.no_grad()
+def _refine_jump(er, ed, lo, hi, la_f, lb_f, smooth):
+    """Change point between two known lags inside env frames [lo, hi): before it the laid stream
+    agrees with the ref at lag A, after it at lag B. Frame-wise band agreement (z-normalised
+    envelopes) is box-smoothed over `smooth` frames; the split maximising (A before) + (B after)
+    is returned as an env-frame index, or None when the zone is empty."""
+    Nf = min(er.shape[1], ed.shape[1])
+    lo = max(lo, 0, -la_f, -lb_f); hi = min(hi, Nf, Nf - la_f, Nf - lb_f)
+    if hi - lo < 2 * smooth:
+        return None
+    t = torch.arange(lo, hi, device=ed.device)
+    d = (ed[:, t] * er[:, t + la_f]).mean(0) - (ed[:, t] * er[:, t + lb_f]).mean(0)
+    k = torch.ones(1, 1, smooth, device=d.device) / smooth
+    d = torch.nn.functional.conv1d(d.view(1, 1, -1), k, padding=smooth // 2).view(-1)[: hi - lo]
+    c = torch.cumsum(d, 0)
+    score = 2 * c - c[-1]                              # sum(d before j) - sum(d after j)
+    return int(lo + torch.argmax(score).item())
+
+
+def _audio_structure(ref16, out16, T, vision_spans=None, ref_dsp=None):
+    """Piecewise map of the laid stream's sound onto the ref: plateaus of constant lag found by a
+    whole-track search, jumps refined to a few seconds. A single plateau within band's reach is
+    nothing to do. -> None | dict(off0 [frames on T], gaps [(ref_a, ref_b)], plateaus, jumps)."""
+    er = None
+    if ref_dsp:
+        from pathlib import Path as _P
+        if _P(ref_dsp).exists():
+            try:
+                er = torch.from_numpy(np.load(str(ref_dsp))).to(_PRE_DEV)
+            except Exception:  # noqa: BLE001 — a broken cache is recomputed
+                er = None
+    if er is None:
+        er = _pre_benv(ref16)
+    ed = _pre_benv(out16)
+    fps = _PRE_FPS; Nf = min(er.shape[1], ed.shape[1])
+    hw = int(_STRUCT_HW_S * fps); step = int(_STRUCT_STEP_S * fps)
+    centers = np.arange(hw, Nf - hw, step)
+    if len(centers) < _STRUCT_MIN_WIN:
+        return None
+    lags, conf = _structure_window_lags(er, ed, centers, hw)
+    t_c = centers / fps
+    for a, b in (vision_spans or []):                    # no dub sound there: the window measures nothing
+        conf[(t_c >= a) & (t_c <= b)] = 0.0
+    plateaus = _structure_plateaus(t_c, lags, conf, _STRUCT_HW_S)
+    if not plateaus:
+        return None
+    if len(plateaus) == 1 and abs(plateaus[0][2]) <= COARSE_LAG_S:
+        return None
+    dur = Nf / fps
+    # Jumps: the coarse windows straddle each boundary; the exact point is the change point between
+    # the two known lags, searched from the last A centre minus a window to the first B centre plus one.
+    smooth = int(_STRUCT_FINE_HW_S * fps)
+    bounds = [0.0]; jumps = []
+    for k in range(1, len(plateaus)):
+        a_end = plateaus[k - 1][1] - _STRUCT_HW_S; b_beg = plateaus[k][0] + _STRUCT_HW_S
+        la, lb = plateaus[k - 1][2], plateaus[k][2]
+        j = _refine_jump(er, ed, int((a_end - _STRUCT_HW_S) * fps), int((b_beg + _STRUCT_HW_S) * fps),
+                         int(round(la * fps)), int(round(lb * fps)), smooth)
+        t_j = j / fps if j is not None else 0.5 * (a_end + b_beg)
+        bounds.append(float(t_j)); jumps.append((float(t_j), float(lb - la)))
+    bounds.append(dur)
+    # Plateau k owns laid [bounds[k], bounds[k+1]) -> ref [.. + lag]; later plateaus override overlaps.
+    ranges = []
+    for k, (_, _, lag, _, _) in enumerate(plateaus):
+        ra, rb = max(0.0, bounds[k] + lag), min(dur, bounds[k + 1] + lag)
+        if rb > ra:
+            ranges.append((ra, rb, lag))
+    off0 = np.full(len(T), np.nan)
+    for ra, rb, lag in ranges:
+        off0[(T >= ra) & (T < rb)] = -lag * 1000.0 / FRAME
+    covered = ~np.isnan(off0)
+    if not covered.any():
+        return None
+    off0 = np.interp(np.arange(len(T)), np.where(covered)[0], off0[covered])
+    gaps = []; edge = 0.0
+    for ra, rb, _ in sorted(ranges):
+        if ra - edge >= STEP:
+            gaps.append((float(edge), float(ra)))
+        edge = max(edge, rb)
+    if dur - edge >= STEP:
+        gaps.append((float(edge), float(dur)))
+    return {"off0": off0.astype(np.float32), "gaps": gaps, "jumps": jumps,
+            "plateaus": [(round(bounds[k], 2), round(bounds[k + 1], 2), round(p[2], 3), p[3]) for k, p in enumerate(plateaus)],
+            "windows": int(len(centers)), "windows_used": int(sum(p[3] for p in plateaus))}
 
 
 def _global_prealign(ref16, dub16, ref_dsp=None):
@@ -549,19 +720,25 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     ref16 = _mono_sr(ref_buf, sr_audio, 16000)       # реф@16к ОДИН раз на весь band-путь (дедуп: DTW
     dub16d = _mono_sr(src, sr_audio, 16000)          # + широкий/тонкий проходы + resid); дубль — свой
     _memlog('моно 16к рефа и дубля')
-    # Глобальная пред-синхронизация constant A/V-десинка озвучки (весь звук равномерно съехал
-    # относит. своего видео; вне окна ±2.5с — band/dtw не достают). ГЕЙТ строгий → на здоровых no-op
-    # (src не трогается) → весь путь ниже БИТ-В-БИТ. ref_dsp=CK4 → benv рефа из кэша (без пересчёта).
+    # Audio structure: the laid stream's sound may sit elsewhere in the ref than its video says
+    # (a constant studio delay, or a broken encode whose sound jumps while the picture freezes).
+    # A whole-track window search gives plateaus of constant lag; the stream is laid by them and
+    # ref zones without dub sound become silence (filled from the ref later). One plateau within
+    # band's reach is a no-op, so healthy pairs pass untouched.
     if progress is not None:
-        progress.mark(0.16, "предварительная синхронизация")
-    g_head, g_flat = _global_prealign(ref16, dub16d, ref_dsp=dsp_cache)
-    if abs(g_head) > _PRE_MIN_S and g_flat > _PRE_FLAT_MIN:
+        progress.mark(0.16, "карта структуры звука")
+    struct = _audio_structure(ref16, dub16d, T, vision_spans=vision_spans, ref_dsp=dsp_cache)
+    if struct is not None:
         prev = src
-        src = _map_channels(src, lambda ch: _shift_channel(ch, sr_audio, g_head))
+        src = _map_channels(src, lambda ch: _warp_by_off0(ch, sr_audio, struct["off0"], T=T))
+        for a, b in struct["gaps"]:
+            src[int(a * sr_audio):int(b * sr_audio)] = 0.0
         _drop_tmp(prev)
-        dub16d = _mono_sr(src, sr_audio, 16000)      # выровненный дубль → coarse_dtw/широкий проход на нём
+        dub16d = _mono_sr(src, sr_audio, 16000)      # laid stream → coarse_dtw / wide pass measure it
+        vision_spans = list(vision_spans or []) + [tuple(g) for g in struct["gaps"]]
         if info is not None:
-            info["audio_global_offset_ms"] = round(g_head * 1000.0, 1)
+            info["audio_structure"] = {k: struct[k] for k in ("plateaus", "jumps", "gaps", "windows", "windows_used")}
+            info["audio_global_offset_ms"] = round(-struct["plateaus"][0][2] * 1000.0, 1)
     # ГРУБЫЙ детектор СОБЫТИЙ на DTW (вставки/вырезы вне окна band ±2.5, post-vision). Sparse +
     # валидирован (1 реал/0 ложных на 340). НЕТ события (почти вся выборка) → base=src → ВСЯ доводка НИЖЕ
     # идёт БИТ-В-БИТ со старым прод. Событие → пред-коррекция дубля (снять вставку), дальше та же доводка.
@@ -571,14 +748,14 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     dres = coarse_dtw.detect(ref16, dub16d, vspans=vision_spans, ref_cache=dsp_cache,
                              on_prog=part(progress, 0.24, 0.56))
     _memlog('после детектора событий')
-    dtw_ins = dres["events_inserts"]; dtw_cuts = dres["events_cuts"]
+    dtw_ins, dtw_cuts = _events_outside_vision(dres["events_inserts"], dres["events_cuts"], vision_spans)
     oc = wc = None                                   # широкое измерение band ±2.5 (единожды на дубль)
     if dtw_cuts:                                     # ГЕЙТ band-подтверждения: отсеять ЛОЖНЫЕ ВЫРЕЗЫ (drop-побег)
         oc, wc = band.build_arr(ref16, dub16d, T, maxlag=COARSE_LAG_S,
                                 on_prog=part(progress, 0.56, 0.60))   # band на pre-DTW дубле (сетка T)
         dtw_cuts = [c for c in dtw_cuts if not _band_confirms_sync(oc, wc, T, c[2], c[3])]
     if dtw_ins or dtw_cuts:
-        off0_ev = _events_step_curve(dres["curve"], dres["ts"], dtw_cuts, dtw_ins, T=T)
+        off0_ev = _events_step_curve(dres["curve"], dres["ts"], dtw_cuts, dtw_ins, T=T, w=dres["w"])
         base = _map_channels(src, lambda ch: _warp_by_off0(ch, sr_audio, off0_ev, T=T))
         dub16b = _mono_sr(base, sr_audio, 16000)     # события сдвинули дубль → mono16 и измерение заново
         oc = wc = None
@@ -599,11 +776,11 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     if progress is not None:
         progress.mark(0.60, "измерение сдвига по частотным полосам" if method == "band"
                        else "измерение сдвига моделью MuQ")
-    # Тонкий проход (±0.7с) СЛЕДИТ за off0 — ПЕРЕИЗМЕРЯЕТ остаток на пред-варпленном дубле. Детектор
-    # резов со-адаптирован с этим переизмерением (o И w) — статистикой поверх широкого прохода оно НЕ
-    # заменяется (доказано на case/, см. ROADMAP recreate-sluh). Варпится ТОЛЬКО mono@MAP_SR: измеритель
-    # другого не слушает, а варп полного стерео 44.1к (буфер pre) — лишний. Эквивалентность A/B-доказана
-    # на 180 дублях case/ (резы бит-в-бит 160/163, 3 пограничных флипа у порога MIN_FR).
+    # The fine pass (±0.7 s) FOLLOWS off0: it RE-MEASURES the residual on the pre-warped dub. The cut
+    # detector is co-adapted with this re-measurement (both o and w): statistics over the wide pass do
+    # not replace it, as shown on the regression library. Only mono@MAP_SR is warped: the meter listens
+    # to nothing else, so warping full 44.1 kHz stereo is wasted. The A/B equivalence holds on 180 dubs:
+    # cuts are bit-exact in 160 of 163, with 3 borderline flips at the MIN_FR threshold.
     sr_map = MAP_SR[method]
     ref_map = ref16 if sr_map == 16000 else _mono_sr(ref_buf, sr_audio, sr_map)
     dub_map = dub16b if sr_map == 16000 else _mono_sr(base, sr_audio, sr_map)
@@ -670,6 +847,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
     span_ms = float((sm.max() - sm.min()) * FRAME) if len(sm) else 0.0
     max_step_ms = float(max((abs(v) for _, v in det_cuts), default=0.0) * FRAME)
     sum_ms = float(sum(abs(v) for _, v in det_cuts) * FRAME)
+    net_ms = float(sum(v for _, v in det_cuts) * FRAME)          # signed total: sum − |net| = movement that cancelled out
     drift_ms = float((sm[-1] - sm[0]) * FRAME - sum(v for _, v in det_cuts) * FRAME) if len(sm) else 0.0
     wmed = float(np.median(w[w > 0])) if np.any(w > 0) else 1.0
     coverage = float(np.mean((w / (wmed if wmed > 1e-9 else 1.0)) >= 0.5))
@@ -736,7 +914,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
                 "params": {"QPOW": detect.QPOW, "PEN": detect.PEN, "SMAX": SMAX,
                            "MIN_FR": detect.MIN_FR, "MSIZE_S": detect.MSIZE_S},
                 "metrics": {"audio_cuts": len(det_cuts), "max_step_ms": max_step_ms,
-                            "sum_ms": sum_ms, "drift_ms": drift_ms, "span_ms": span_ms,
+                            "sum_ms": sum_ms, "net_ms": net_ms, "drift_ms": drift_ms, "span_ms": span_ms,
                             "coverage": coverage, "n_segments": len(seglines),
                             "resid_med_frames": resid_fr},
                 "seglines": [[float(x) for x in s] for s in seglines],
@@ -774,6 +952,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
             # D6: ВСТАВКА озвучки (зелёная вертикаль+длит.) / НЕДОСТАЧА дубля (оранжевая зона) — маркеры графика
             "dtw_inserts": [(float(tc), float(ln)) for tc, ln in dtw_ins],
             "dtw_cut_zones": [(float(te), float(tn)) for _tc, _dv, te, tn in dtw_cuts],
+            "struct_gaps": [(float(a), float(b)) for a, b in (struct["gaps"] if struct else [])],
             "gcc": (gl if gl is not None else None)}
         info["anchor_method"] = method; info["apply_cuts"] = apply_cuts
         info["cuts"] = [(round(t, 1), round(v, 1)) for t, v in cuts]
@@ -781,6 +960,7 @@ def audio_anchor(out, ref_buf, fps_ref=None, *, method="band", apply_cuts=True,
         info["audio_cuts"] = len(det_cuts)
         info["audio_max_step_ms"] = max_step_ms
         info["audio_sum_ms"] = sum_ms
+        info["audio_net_ms"] = net_ms
         info["audio_drift_ms"] = drift_ms
         info["audio_span_ms"] = span_ms
         info["audio_coverage"] = coverage

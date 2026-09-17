@@ -66,7 +66,7 @@ def _loftr():
         _LOFTR = _KF.LoFTR(pretrained="outdoor").eval().to(_device())
     return _LOFTR
 
-# ── параметры (обоснованы на стенде research/geom_align; см. project-geom-align-feasibility) ──
+# ── parameters ──
 GRID_HZ = 10.0          # общая сетка времени для слепков (fps-инвариант)
 WIN_S = 12.0            # длина слепка-участка, с (уникальность временно́го паттерна)
 K_POINTS = 12           # опорных участков рефа
@@ -131,11 +131,11 @@ def crop_detect(video: Path, *, thr: int = 20, samples=(120, 300, 500, 700, 900)
 
 
 # ── ШАГ 1: слепки → якоря без модели времени ──
-def _decode_sig(video: Path, crop: str, on_prog=None):
+def _decode_sig(video: Path, crop: str, on_prog=None, flip: bool = False):
     """Потоковый декод (после среза полей) → дескриптор кадра [N,22]:
     6 гор.зон×RGB(18) + Y-перцентили p10/p50/p90(3) + новизна(1). + fps. Память O(блока)."""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(video), "-an",
-           "-vf", f"crop={crop},scale={DESC_W}:{DESC_H},format=rgb24", "-vsync", "0",
+           "-vf", f"crop={crop},{'hflip,' if flip else ''}scale={DESC_W}:{DESC_H},format=rgb24", "-vsync", "0",
            "-f", "rawvideo", "-"]
     fb = DESC_W * DESC_H * 3
     fps = probe_fps(video)
@@ -217,11 +217,12 @@ def _fine_check(G_r, ci_s, G_d, td_coarse, w):
     return float(seg[jj]), (lo + jj + half) / GRID_HZ
 
 
-def _find_anchors(ref: Path, dub: Path, on_prog=None):
-    """Кандидаты якорей [(t_ref, t_dub, prom, fine)] после prominence+mutual+fine."""
+def _find_anchors(ref: Path, dub: Path, on_prog=None, flip: bool = False):
+    """Кандидаты якорей [(t_ref, t_dub, prom, fine)] после prominence+mutual+fine.
+    flip — дубль зеркальный: его кадры отражаются после среза полей."""
     cr_ref = crop_detect(ref); cr_dub = crop_detect(dub)
     sig_r, fps_r = _decode_sig(ref, cr_ref, part(on_prog, 0.05, 0.55)); G_r = _to_grid(sig_r, fps_r)
-    sig_d, fps_d = _decode_sig(dub, cr_dub, part(on_prog, 0.55, 0.95)); G_d = _to_grid(sig_d, fps_d)
+    sig_d, fps_d = _decode_sig(dub, cr_dub, part(on_prog, 0.55, 0.95), flip=flip); G_d = _to_grid(sig_d, fps_d)
     G_r = (G_r - G_r.mean(0)) / (G_r.std(0) + 1e-9)
     G_d = (G_d - G_d.mean(0)) / (G_d.std(0) + 1e-9)
     w = np.ones(G_r.shape[1]); w[-1] = W_NOV
@@ -249,14 +250,14 @@ def _find_anchors(ref: Path, dub: Path, on_prog=None):
 
 
 # ── ШАГ 2: геометрия на якорях (ORB+RANSAC) ──
-def _decode_frame(video: Path, t: float, crop: str):
+def _decode_frame(video: Path, t: float, crop: str, flip: bool = False):
     """Точный серый кадр в момент t (select+copyts — ffmpeg -ss врёт на длинных GOP),
     после среза полей, высота FRAME_H, ширина по AR → np.uint8 [h,tw] или None."""
     W, H = map(int, crop.split(":")[:2])
     tw = max(2, round(W / H * FRAME_H)); tw -= tw % 2
     coarse = max(0, int(t - 4))
     out = procreg.run([FFMPEG, "-ss", f"{coarse}", "-copyts", "-i", str(video),
-                          "-vf", f"crop={crop},select=gte(t\\,{t}),scale={tw}:{FRAME_H},format=gray",
+                          "-vf", f"crop={crop},{'hflip,' if flip else ''}select=gte(t\\,{t}),scale={tw}:{FRAME_H},format=gray",
                           "-frames:v", "1", "-f", "rawvideo", "-", "-loglevel", "error"],
                          capture_output=True).stdout
     if len(out) < tw * FRAME_H:
@@ -325,14 +326,20 @@ def _consensus_crop(recs, ref_wh, dub_wh):
                 sy=float(np.median([r["sy"] for r in recs])), n=len(recs))
 
 
-def consensus_G(ref: Path, dub: Path, on_prog=None):
+def _mirror_crop(crop: str, width: int) -> str:
+    """Crop box found on mirrored frames -> the same box in native coordinates."""
+    w, h, x, y = map(int, crop.split(":"))
+    return "%d:%d:%d:%d" % (w, h, _even(width - x - w), y)
+
+
+def consensus_G(ref: Path, dub: Path, on_prog=None, flip: bool = False):
     """ПОЛНЫЙ конвейер шаг1+шаг2 → готовые crop для build_srm.
     -> dict(crop_ref, crop_dub, sx, sy, n_in) или None если геометрия не восстановлена.
        crop_ref = 'W:H:X:Y' области рефа, видимой дублем (ROI, native ref-координаты);
        crop_dub = 'W:H:X:Y' среза полей дубля. Оба → build_srm(crop=...)."""
     if not (_HAS_CV2 and _HAS_LOFTR):
         return None
-    good, _, _ = _find_anchors(ref, dub, part(on_prog, 0.0, 0.6))   # ШАГ 1: синхронизация (якорные времена)
+    good, _, _ = _find_anchors(ref, dub, part(on_prog, 0.0, 0.6), flip=flip)   # ШАГ 1: синхронизация (якорные времена)
     if not good:
         return None
     Wr, Hr = probe_wh(ref); Wd, Hd = probe_wh(dub)
@@ -340,7 +347,7 @@ def consensus_G(ref: Path, dub: Path, on_prog=None):
     recs = []                                        # ШАГ 2: LoFTR-аффин на RAW-кадрах (полосы=часть аффина)
     lp = part(on_prog, 0.6, 1.0)
     for k, (tc, td, _, _) in enumerate(good):
-        rg = _decode_frame(ref, tc, raw_ref); dg = _decode_frame(dub, td, raw_dub)
+        rg = _decode_frame(ref, tc, raw_ref); dg = _decode_frame(dub, td, raw_dub, flip=flip)
         if lp is not None:
             lp((k + 1) / len(good))
         if rg is None or dg is None:
@@ -351,5 +358,6 @@ def consensus_G(ref: Path, dub: Path, on_prog=None):
     if len(recs) < 2:
         return None
     con = _consensus_crop(recs, (Wr, Hr), (Wd, Hd))   # консенсус-медиана по якорям
-    return dict(crop_ref=con["crop_ref"], crop_dub=con["crop_dub"],
-                sx=con["sx"], sy=con["sy"], n_in=con["n"])
+    crop_dub = _mirror_crop(con["crop_dub"], Wd) if flip else con["crop_dub"]   # box back to native frames
+    return dict(crop_ref=con["crop_ref"], crop_dub=crop_dub,
+                sx=con["sx"], sy=con["sy"], n_in=con["n"], flip=bool(flip))
