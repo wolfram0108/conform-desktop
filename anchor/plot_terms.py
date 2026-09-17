@@ -4,8 +4,8 @@ catalog per language. Values are str.format templates; the chart code only asks 
 from __future__ import annotations
 
 _RU = {
-    "panel.vision": "ЗРЕНИЕ — укладка озвучки на референс (отклонение от масштаба, кадры)",
-    "panel.audio": "СЛУХ — остаток после доводки (кадры)",
+    "panel.vision": "ЗРЕНИЕ — укладка озвучки на референс",
+    "panel.audio": "СЛУХ — остаток после доводки",
     "axis.time": "время референса, с",
     "axis.time.mmss": "мм:сс",
     "axis.vision_y": "Δ укладки, кадры",
@@ -24,6 +24,7 @@ _RU = {
     "event.audio_cut": "рез слуха {value:+.0f} мс",
     "event.audio_jump": "скачок структуры звука {value:+.1f} с",
     "event.dtw_insert": "вставка звука +{value:.0f} с",
+    "list.events": "события на графике: {value}",
     "legend.vision_step": "ступень укладки",
     "legend.audio_cut": "рез слуха",
     "legend.audio_jump": "скачок структуры звука",
@@ -66,8 +67,8 @@ _RU = {
 }
 
 _EN = {
-    "panel.vision": "VISION — dub layout on the reference (deviation from scale, frames)",
-    "panel.audio": "HEARING — residual after refinement (frames)",
+    "panel.vision": "VISION — dub layout on the reference",
+    "panel.audio": "HEARING — residual after refinement",
     "axis.time": "reference time, s",
     "axis.time.mmss": "mm:ss",
     "axis.vision_y": "Δ layout, frames",
@@ -86,6 +87,7 @@ _EN = {
     "event.audio_cut": "hearing cut {value:+.0f} ms",
     "event.audio_jump": "sound structure jump {value:+.1f} s",
     "event.dtw_insert": "sound insert +{value:.0f} s",
+    "list.events": "events on the chart: {value}",
     "legend.vision_step": "layout step",
     "legend.audio_cut": "hearing cut",
     "legend.audio_jump": "sound structure jump",
