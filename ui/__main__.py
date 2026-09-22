@@ -105,6 +105,11 @@ def _start_server() -> None:
 
 def main() -> int:
     global _APP
+    # The conform core runs its jobs in a child process started with `spawn`. In a frozen exe that
+    # child is this very executable: without this call it would open a second application instead of
+    # becoming the worker. From source it does nothing. It must come before anything else in main().
+    import multiprocessing
+    multiprocessing.freeze_support()
     # OS-level guard: every child dies with this process however it ends, including
     # taskkill /F and crashes, when our own exit code never gets to run.
     winjob.enable_kill_on_close()
@@ -138,8 +143,8 @@ def main() -> int:
     win.show()
     rc = app.exec()
     _shutdown()
-    # Hard exit: ConformQueue holds a non-daemon ThreadPoolExecutor, a plain return
-    # would leave the process alive after the window closes.
+    # Hard exit: _shutdown() has already stopped the queue, its worker process and their
+    # subprocesses; nothing is left to wait for, and a plain return would wait on library threads.
     os._exit(rc)
 
 
