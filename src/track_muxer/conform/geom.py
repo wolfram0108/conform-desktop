@@ -1,29 +1,35 @@
-"""Геометрическая регистрация дубля к рефу — для зрения, когда SRM слепнет от
-геометрического рассинхрона (кроп / зум / анаморф / чёрные полосы / произвольный fps).
+"""Geometric registration of a dub to the reference -- for the vision layer, when the SRM
+goes blind on a geometric mismatch (crop / zoom / anamorphic / letterbox bars / an
+arbitrary fps).
 
-Вызывается из conform_features ТОЛЬКО при слепоте грубого прохода (coarse n_keep≈0):
-обычное зрение строит SRM на жёсткой сетке 128×72 (анизотропный scale, дескриптор
-привязан к позиции пикселя) и слепнет, если контент дубля геометрически сдвинут
-относительно рефа. Здесь восстанавливается ГЛОБАЛЬНОЕ преобразование (одно на файл):
+Called from conform_features ONLY when the coarse pass is blind (coarse n_keep=~0): the
+regular vision layer builds the SRM on a fixed 128x72 grid (anisotropic scale, the
+descriptor is tied to pixel position) and goes blind when the dub's content is
+geometrically shifted relative to the reference. This module recovers a GLOBAL transform
+(one per file):
 
-  ШАГ 1 — синхронизация БЕЗ модели времени: слепки кадра (геом-инвариантные агрегаты
-    цвет/яркость/новизна, срез полей, ресэмпл во ВРЕМЯ → fps исчезает) → локальные
-    якоря (NCC участка по всей длине; prominence + mutual + fine отсекают ложные).
-  ШАГ 2 — геометрия: на якорях LoFTR (detector-free матчер, kornia) → плотные соответствия →
-    RANSAC-аффин dub↔ref в долях кадра → консенсус-МЕДИАНА bbox по якорям (а не один лучший:
-    высоко-inlier якорь бывает рассинхронизирован по fps). Доказано на реальном кросс-источнике
-    BD↔Web там, где ORB слеп (плоское аниме): zoom/letterbox/identity из одного аффина.
+  STEP 1 -- synchronization WITHOUT a time model: frame fingerprints (geometry-invariant
+    color/brightness/novelty aggregates, taken after the border crop, resampled onto a
+    TIME axis so fps drops out) give local anchors (NCC of a window across the full
+    length; prominence + mutual + fine checks reject false matches).
+  STEP 2 -- geometry: LoFTR (a detector-free matcher, kornia) on the anchors gives dense
+    correspondences -> a RANSAC affine dub<->ref in frame fractions -> a consensus MEDIAN
+    bbox across anchors (not a single best one: a high-inlier anchor can still be
+    misaligned in fps). This handles cross-source content (Blu-ray vs web) where a
+    detector like ORB goes blind on flat, low-texture anime frames: zoom/letterbox/
+    identity all fall out of one affine.
 
-Итог consensus_G → crop для рефа (ROI = видимая дублем область) и для дубля (срез
-полей): обе подаются в build_srm(crop=...). Осевой аффин (поворота нет) раскладывается
-на crop+анизотропный scale, поэтому warp не нужен — это нативная vf-цепочка ffmpeg.
+The consensus_G result gives a crop for the reference (ROI = the area visible in the dub)
+and for the dub (the border crop): both feed build_srm(crop=...). The transform is an
+axis-aligned affine (no rotation), which decomposes into crop + anisotropic scale, so no
+warp is needed -- it maps onto ffmpeg's native vf chain.
 
-GPU-first (LoFTR на CUDA), но CPU-fallback есть (медленно). Память O(блока): слепки потоково,
-LoFTR по точечным кадрам якорей. Требует cv2 (Apache-2.0) + kornia (Apache-2.0, LoFTR).
+GPU-first (LoFTR on CUDA), with a CPU fallback (slow). Memory is O(block): fingerprints
+stream, LoFTR runs on individual anchor frames. Requires cv2 (Apache-2.0) + kornia
+(Apache-2.0, LoFTR).
 """
 from __future__ import annotations
 
-import re
 import subprocess
 from pathlib import Path
 
@@ -38,14 +44,14 @@ from track_muxer.conform.progress import part
 try:
     import cv2
     _HAS_CV2 = True
-except ImportError:  # geom недоступен без cv2 → conform_features откатится на обычный путь
+except ImportError:  # geom unavailable without cv2: conform_features falls back to the regular path
     _HAS_CV2 = False
 
 try:
     import torch
     import kornia.feature as _KF
     _HAS_LOFTR = True
-except ImportError:  # без torch/kornia geom недоступен → обычный путь
+except ImportError:  # without torch/kornia geom is unavailable: regular path
     _HAS_LOFTR = False
 
 _LOFTR = None
@@ -60,28 +66,26 @@ def _device():
 
 
 def _loftr():
-    """Ленивая загрузка detector-free матчера LoFTR (kornia, Apache). GPU если есть, иначе CPU."""
+    """Lazily loads the detector-free LoFTR matcher (kornia, Apache). Uses the GPU when available, otherwise the CPU."""
     global _LOFTR
     if _LOFTR is None:
         _LOFTR = _KF.LoFTR(pretrained="outdoor").eval().to(_device())
     return _LOFTR
 
 # ── parameters ──
-GRID_HZ = 10.0          # общая сетка времени для слепков (fps-инвариант)
-WIN_S = 12.0            # длина слепка-участка, с (уникальность временно́го паттерна)
-K_POINTS = 12           # опорных участков рефа
-EDGE_S = 40.0           # отступ от краёв (опенинг/эндинг/титры)
-DESC_W, DESC_H = 32, 18  # размер декода слепка (H кратно NZONES)
-NZONES = 6              # горизонтальных зон (профиль по вертикали) — композиция, X-инвариант
-W_NOV = 3.0            # вес канала новизны (склейки) в NCC
-MUTUAL_TOL = 6.0       # допуск возврата backward-матча к t_ref, с
-FINE_S, FINE_RNG, FINE_THR = 4.0, 6.0, 0.55  # узкая проверка синхронности ЦЕНТРА якоря
-FRAME_H = 540          # общая высота кадров для ORB (после среза полей)
-DELTAS = (0.0, 0.4, 0.8)   # кадров на якорь (медиана) — устойчивость ORB
-SCALE_TOL = 0.04       # допуск |sx-med|,|sy-med| для inlier-якоря (RANSAC-консенсус)
-LOFTR_W, LOFTR_H = 640, 384  # вход LoFTR (кратно 8)
-LOFTR_CONF = 0.5       # порог уверенности матча LoFTR
-AFFINE_MIN_INL = 300   # минимум RANSAC-inlier'ов аффина, чтобы якорь шёл в консенсус
+GRID_HZ = 10.0          # common time grid for the fingerprints (fps-invariant)
+WIN_S = 12.0            # fingerprint window length, s (uniqueness of the time pattern)
+K_POINTS = 12           # reference anchor points
+EDGE_S = 40.0           # margin from the edges (opening/ending/credits)
+DESC_W, DESC_H = 32, 18  # fingerprint decode size (H is a multiple of NZONES)
+NZONES = 6              # horizontal zones (vertical profile) — composition, X-invariant
+W_NOV = 3.0            # weight of the novelty (cut) channel in NCC
+MUTUAL_TOL = 6.0       # tolerance for the backward match's return to t_ref, s
+FINE_S, FINE_RNG, FINE_THR = 4.0, 6.0, 0.55  # narrow check of the anchor CENTER's sync
+FRAME_H = 540          # common frame height for ORB (after cropping the borders)
+LOFTR_W, LOFTR_H = 640, 384  # LoFTR input (multiple of 8)
+LOFTR_CONF = 0.5       # LoFTR match confidence threshold
+AFFINE_MIN_INL = 300   # minimum RANSAC affine inliers for an anchor to enter the consensus
 
 
 def available() -> bool:
@@ -105,9 +109,10 @@ def probe_wh(video: Path) -> tuple[int, int]:
 
 
 def crop_detect(video: Path, *, thr: int = 20, samples=(120, 300, 500, 700, 900)) -> str:
-    """РОБАСТНЫЙ детект чёрных полей: max яркости каждой строки/столбца по выборке кадров
-    (полоса = пиксель, чёрный ВО ВСЕХ кадрах; контент хоть раз светлый → не обманывается
-    тёмными краями, как ffmpeg cropdetect). -> 'W:H:X:Y' (полный кадр, если полей нет)."""
+    """Robust black-border detection: takes the max brightness of each row/column across a
+    sample of frames (a border pixel must be black in ALL sampled frames; content that is
+    bright even once is not mistaken for a border, unlike ffmpeg's cropdetect). Returns
+    'W:H:X:Y' (the full frame if there are no borders)."""
     W, H = probe_wh(video)
     mrow = np.zeros(H, np.float32); mcol = np.zeros(W, np.float32); got = 0
     for t in samples:
@@ -130,10 +135,11 @@ def crop_detect(video: Path, *, thr: int = 20, samples=(120, 300, 500, 700, 900)
     return f"{cw}:{ch}:{x0}:{y0}"
 
 
-# ── ШАГ 1: слепки → якоря без модели времени ──
+# ── STEP 1: fingerprints → anchors without a time model ──
 def _decode_sig(video: Path, crop: str, on_prog=None, flip: bool = False):
-    """Потоковый декод (после среза полей) → дескриптор кадра [N,22]:
-    6 гор.зон×RGB(18) + Y-перцентили p10/p50/p90(3) + новизна(1). + fps. Память O(блока)."""
+    """Streaming decode (after the border crop) into a per-frame descriptor [N,22]:
+    6 horizontal zones x RGB (18) + Y percentiles p10/p50/p90 (3) + novelty (1). Also
+    returns fps. Memory is O(block)."""
     cmd = [FFMPEG, "-hide_banner", "-loglevel", "error", "-i", str(video), "-an",
            "-vf", f"crop={crop},{'hflip,' if flip else ''}scale={DESC_W}:{DESC_H},format=rgb24", "-vsync", "0",
            "-f", "rawvideo", "-"]
@@ -167,7 +173,7 @@ def _decode_sig(video: Path, crop: str, on_prog=None, flip: bool = False):
             on_prog(min(0.999, n_done / n_expect))
     p.stdout.close()
     rc_geom = p.wait(); procreg.done(p)
-    if rc_geom not in (0, None):   # обрыв декода слепков — не молчать (класс dr-stone ep09)
+    if rc_geom not in (0, None):   # a fingerprint decode failure must not pass silently
         raise RuntimeError(f"geom: декод слепков упал (ffmpeg rc={p.returncode}): {Path(video).name}")
     sig = np.concatenate(rows) if rows else np.zeros((0, NZONES * 3 + 4), np.float32)
     return sig, fps
@@ -180,7 +186,7 @@ def _to_grid(sig: np.ndarray, fps: float):
 
 
 def _ncc_full(T: np.ndarray, D: np.ndarray, w: np.ndarray) -> np.ndarray:
-    """Взвешенная нормированная кросс-корреляция участка T по всей длине D (per-channel)."""
+    """Weighted normalized cross-correlation of window T against the full length of D (per-channel)."""
     Lw = len(T); acc = np.zeros(len(D) - Lw + 1)
     for c in range(T.shape[1]):
         Tz = T[:, c] - T[:, c].mean(); Tn = float(np.linalg.norm(Tz)) + 1e-9
@@ -218,8 +224,8 @@ def _fine_check(G_r, ci_s, G_d, td_coarse, w):
 
 
 def _find_anchors(ref: Path, dub: Path, on_prog=None, flip: bool = False):
-    """Кандидаты якорей [(t_ref, t_dub, prom, fine)] после prominence+mutual+fine.
-    flip — дубль зеркальный: его кадры отражаются после среза полей."""
+    """Anchor candidates [(t_ref, t_dub, prom, fine)] after the prominence+mutual+fine checks.
+    flip -- the dub is mirrored: its frames are flipped after the border crop."""
     cr_ref = crop_detect(ref); cr_dub = crop_detect(dub)
     sig_r, fps_r = _decode_sig(ref, cr_ref, part(on_prog, 0.05, 0.55)); G_r = _to_grid(sig_r, fps_r)
     sig_d, fps_d = _decode_sig(dub, cr_dub, part(on_prog, 0.55, 0.95), flip=flip); G_d = _to_grid(sig_d, fps_d)
@@ -249,10 +255,11 @@ def _find_anchors(ref: Path, dub: Path, on_prog=None, flip: bool = False):
     return good, cr_ref, cr_dub
 
 
-# ── ШАГ 2: геометрия на якорях (ORB+RANSAC) ──
+# ── STEP 2: geometry on anchors (ORB+RANSAC) ──
 def _decode_frame(video: Path, t: float, crop: str, flip: bool = False):
-    """Точный серый кадр в момент t (select+copyts — ffmpeg -ss врёт на длинных GOP),
-    после среза полей, высота FRAME_H, ширина по AR → np.uint8 [h,tw] или None."""
+    """Exact grayscale frame at time t (select+copyts, since ffmpeg -ss is inaccurate on
+    long GOPs), after the border crop, height FRAME_H, width from the aspect ratio.
+    Returns np.uint8 [h,tw] or None."""
     W, H = map(int, crop.split(":")[:2])
     tw = max(2, round(W / H * FRAME_H)); tw -= tw % 2
     coarse = max(0, int(t - 4))
@@ -275,7 +282,7 @@ def _to_dev(img_gray, w, h):
 
 
 def _match(ref_gray, dub_gray):
-    """LoFTR: плотные соответствия dub↔ref в сетке LOFTR_W×LOFTR_H. -> (k_dub, k_ref, conf)."""
+    """LoFTR: dense correspondences dub<->ref on a LOFTR_W x LOFTR_H grid. Returns (k_dub, k_ref, conf)."""
     m = _loftr()
     with torch.no_grad():
         out = m({"image0": _to_dev(dub_gray, LOFTR_W, LOFTR_H),
@@ -285,8 +292,9 @@ def _match(ref_gray, dub_gray):
 
 
 def _affine_frac(ref_gray, dub_gray):
-    """RANSAC-аффин dub↔ref по LoFTR-матчам (в ДОЛЯХ кадра) → дробные bbox для консенсуса.
-    -> dict(sx, sy, n_inl, dub_in_ref, ref_in_dub) или None. Доли [0,1] → не зависят от размеров."""
+    """RANSAC affine dub<->ref from the LoFTR matches (in frame FRACTIONS) -> fractional
+    bboxes for the consensus. Returns dict(sx, sy, n_inl, dub_in_ref, ref_in_dub) or None.
+    Fractions [0,1] are resolution-independent."""
     k_dub, k_ref, conf = _match(ref_gray, dub_gray)
     pd = (k_dub / np.array([LOFTR_W, LOFTR_H], np.float32)).astype(np.float32)
     pr = (k_ref / np.array([LOFTR_W, LOFTR_H], np.float32)).astype(np.float32)
@@ -299,8 +307,8 @@ def _affine_frac(ref_gray, dub_gray):
     sx = float(np.hypot(M[0, 0], M[1, 0])); sy = float(np.hypot(M[0, 1], M[1, 1]))
     corners = np.array([[0, 0], [1, 0], [1, 1], [0, 1]], np.float32)
     Mi = cv2.invertAffineTransform(M)
-    dr = corners @ M[:, :2].T + M[:, 2]        # дубль в долях рефа
-    rd = corners @ Mi[:, :2].T + Mi[:, 2]      # реф в долях дубля
+    dr = corners @ M[:, :2].T + M[:, 2]        # dub in fractions of the ref
+    rd = corners @ Mi[:, :2].T + Mi[:, 2]      # ref in fractions of the dub
 
     def bb(fr):
         return (float(fr[:, 0].min()), float(fr[:, 1].min()), float(fr[:, 0].max()), float(fr[:, 1].max()))
@@ -308,9 +316,11 @@ def _affine_frac(ref_gray, dub_gray):
 
 
 def _consensus_crop(recs, ref_wh, dub_wh):
-    """Медиана дробных bbox по якорям → crop_ref/crop_dub (native, авто-направление).
-    Кропается тот, у кого видимая область ДРУГОГО < полной (он шире). Урок: судья = консенсус
-    по якорям, не один лучший (высоко-inlier якорь бывает рассинхронизирован по fps)."""
+    """Median of the fractional bboxes across anchors -> crop_ref/crop_dub (native
+    coordinates, direction picked automatically). The side that gets cropped is whichever
+    one shows the OTHER side's full extent as less than the whole frame (i.e. it is the
+    wider one). The decision is a consensus across anchors, not a single best one: a
+    high-inlier anchor can still be misaligned in fps."""
     Wr, Hr = ref_wh; Wd, Hd = dub_wh
     dr = np.median(np.array([r["dub_in_ref"] for r in recs]), axis=0)
     rd = np.median(np.array([r["ref_in_dub"] for r in recs]), axis=0)
@@ -333,18 +343,19 @@ def _mirror_crop(crop: str, width: int) -> str:
 
 
 def consensus_G(ref: Path, dub: Path, on_prog=None, flip: bool = False):
-    """ПОЛНЫЙ конвейер шаг1+шаг2 → готовые crop для build_srm.
-    -> dict(crop_ref, crop_dub, sx, sy, n_in) или None если геометрия не восстановлена.
-       crop_ref = 'W:H:X:Y' области рефа, видимой дублем (ROI, native ref-координаты);
-       crop_dub = 'W:H:X:Y' среза полей дубля. Оба → build_srm(crop=...)."""
+    """FULL pipeline, step 1 + step 2, producing crops ready for build_srm.
+    Returns dict(crop_ref, crop_dub, sx, sy, n_in), or None if the geometry could not be
+    recovered. crop_ref = 'W:H:X:Y' of the reference area visible in the dub (ROI, native
+    reference coordinates); crop_dub = 'W:H:X:Y' of the dub's border crop. Both feed
+    build_srm(crop=...)."""
     if not (_HAS_CV2 and _HAS_LOFTR):
         return None
-    good, _, _ = _find_anchors(ref, dub, part(on_prog, 0.0, 0.6), flip=flip)   # ШАГ 1: синхронизация (якорные времена)
+    good, _, _ = _find_anchors(ref, dub, part(on_prog, 0.0, 0.6), flip=flip)   # STEP 1: synchronization (anchor times)
     if not good:
         return None
     Wr, Hr = probe_wh(ref); Wd, Hd = probe_wh(dub)
     raw_ref = "%d:%d:0:0" % (Wr, Hr); raw_dub = "%d:%d:0:0" % (Wd, Hd)
-    recs = []                                        # ШАГ 2: LoFTR-аффин на RAW-кадрах (полосы=часть аффина)
+    recs = []                                        # STEP 2: LoFTR affine on RAW frames (letterbox bars are part of the affine)
     lp = part(on_prog, 0.6, 1.0)
     for k, (tc, td, _, _) in enumerate(good):
         rg = _decode_frame(ref, tc, raw_ref); dg = _decode_frame(dub, td, raw_dub, flip=flip)
@@ -357,7 +368,7 @@ def consensus_G(ref: Path, dub: Path, on_prog=None, flip: bool = False):
             recs.append(r)
     if len(recs) < 2:
         return None
-    con = _consensus_crop(recs, (Wr, Hr), (Wd, Hd))   # консенсус-медиана по якорям
+    con = _consensus_crop(recs, (Wr, Hr), (Wd, Hd))   # consensus median across anchors
     crop_dub = _mirror_crop(con["crop_dub"], Wd) if flip else con["crop_dub"]   # box back to native frames
     return dict(crop_ref=con["crop_ref"], crop_dub=crop_dub,
                 sx=con["sx"], sy=con["sy"], n_in=con["n"], flip=bool(flip))

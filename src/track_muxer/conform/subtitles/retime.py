@@ -1,6 +1,6 @@
 """Transfer subtitle cues from a source timeline onto the reference timeline.
 
-The time map is the one conform lays the audio by: between cuts the source plays
+The time map is a layout conform has found for the pair: between cuts the source plays
 continuously, at a cut the reference either has content the source lacks (a hole)
 or the source has content the reference lacks (dropped). Cues follow the same law.
 """
@@ -40,7 +40,7 @@ def _shift_at(t: float, tn: np.ndarray, sn: np.ndarray, hold_head: bool, hold_ta
 
 
 def build_time_map(T, curve, cuts, fps_ref: float, dur_ref: float) -> TimeMap:
-    """Vision layout (shift in reference frames on grid T, cuts [(tc, dv, t_end, t_nxt)]) -> TimeMap.
+    """A layout (shift in reference frames on grid T, cuts [(tc, dv, t_end, t_nxt)]) -> TimeMap.
 
     Segments are split exactly where the layout splits them; a negative cut leaves the hole
     [t_end, t_nxt] the audio is silenced in, a positive cut joins the two sides at tc.

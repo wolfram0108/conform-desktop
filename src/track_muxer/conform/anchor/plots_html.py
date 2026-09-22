@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Интерактивный HTML-график укладки band/muq (plotly, self-contained — открывается офлайн).
-Read-only. GCC-свидетель + грубая off0 + точки o по уверенности + кривая варпа (дрейф+горки) +
-резы. Знак: правее=+; кадр=41.708мс. Проброс в веб-интерфейс — отдельно (позже)."""
+"""Interactive HTML alignment plot for band/muq (plotly, self-contained — opens offline). Read-only.
+GCC witness + coarse off0 + o points colored by confidence + the warp curve (drift and bumps) +
+cuts. Sign convention: rightward = +; frame = 41.708 ms."""
 import numpy as np
 
 from .params import T as _DEFT, FRAME
@@ -17,8 +17,9 @@ def _wc_breaks(wcurve, cuts, T):
 
 
 def render_track_html(path, o, w, off0, gl, wcurve, cuts, *, title="", T=None):
-    """Самодостаточный HTML (plotly inline). Падение импорта plotly не роняет conform — ловит вызывающий.
-    T — сетка времени длины o/w (make_T реальной длительности); None → дефолт params.T (как было)."""
+    """Self-contained HTML (plotly inline). A failed plotly import does not bring down conform — the
+    caller catches it. T is the time grid matching the length of o/w (make_T at the real duration);
+    None uses the default params.T."""
     import plotly.graph_objects as go
     T = _DEFT if T is None else np.asarray(T, float)
     o = np.asarray(o, float); off0 = np.asarray(off0, float); wcurve = np.asarray(wcurve, float)

@@ -1,15 +1,15 @@
-"""Модуль аудио-conform: выравнивание озвучки по таймлайну референса.
+"""The audio-conform module: aligns a dub to the reference's timeline.
 
-Слои:
-  • kernel/   — числовое ЯДРО (перенос 1-в-1 из исследовательского прототипа, НЕ трогаем);
-  • features  — видео → SRM-вектора (декод + свёртка);
-  • align     — одна ПАРА ref↔dub → выходной аудиофайл (вычищенный conform v8);
-  • episode   — одна СЕРИЯ (реф 1 раз + список озвучек);
-  • cache     — переиспользование SRM (реф в RAM, диск опционально);
-  • models    — датаклассы результата/прогресса;
-  • config    — пути (ffmpeg/ffprobe, кэш).
+Layers:
+  • kernel/   — the numeric CORE: thresholds and dynamics tuned together, a change to one changes every output;
+  • features  — video → SRM vectors (decode plus convolution);
+  • align     — one PAIR ref↔dub → the output audio file;
+  • episode   — one EPISODE (the reference decoded once, plus the list of dubs);
+  • cache     — reuse of SRM data (reference held in RAM, disk optional);
+  • models    — dataclasses for the result and progress;
+  • config    — paths (ffmpeg/ffprobe, cache).
 
-Очередь и HTTP-API (Этапы 2–3) добавляются поверх как отдельные слои.
+The queue and the HTTP API sit on top as separate layers.
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name: str):  # noqa: D401 — ленивая загрузка тяжёлых слоёв (torch/numba/scipy)
+def __getattr__(name: str):  # noqa: D401 — lazy loading of heavy layers (torch/numba/scipy)
     if name == "build_srm":
         from track_muxer.conform.features import build_srm
         return build_srm

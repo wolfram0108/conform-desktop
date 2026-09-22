@@ -1,19 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Отметки расхода памяти по шагам конвейера (диагностика, по умолчанию выключена).
+"""Memory-usage markers at pipeline steps (diagnostics, off by default).
 
-Зачем отдельный модуль. Закон проекта: расход памяти НЕ должен расти с длительностью
-входа. Нарушения этого закона вылезают только на длинных файлах и выглядят одинаково —
-«процесс съел всю память», без указания на виновника. Рабочий набор процесса тут не
-помощник: он смешивает собственные массивы со страницами отображённых файлов и растёт
-даже там, где данные честно лежат на диске.
+Why a separate module. Memory use must not grow with the input's duration. Violations of this
+surface only on long files and all look the same -- "the process ate all the memory" -- with
+nothing pointing at the culprit. The process's working set is no help here: it mixes its own
+arrays with the pages of memory-mapped files and grows even where the data genuinely lives on
+disk.
 
-Поэтому меряем СОБСТВЕННУЮ память процесса (PrivateUsage) в конкретных точках
-конвейера. Включается переменной окружения `CONFORM_MEMLOG=1`, в обычной работе не
-стоит ничего.
+So this measures the process's OWN memory (PrivateUsage) at specific points in the pipeline.
+Enabled by the environment variable `CONFORM_MEMLOG=1`; costs nothing in ordinary operation.
 
-Использование:
+Usage:
     from track_muxer.conform.memlog import memlog
-    memlog("после декода аудио")
+    memlog("<what has just happened>")
 """
 
 from __future__ import annotations
@@ -30,14 +29,14 @@ def enabled() -> bool:
 
 
 def memlog(tag: str) -> None:
-    """Записать в журнал собственную память процесса и рабочий набор."""
+    """Log the process's own memory and its working set."""
     if not enabled() or os.name != "nt":
         return
     try:
         import ctypes
         from ctypes import wintypes
 
-        class _PMCEX(ctypes.Structure):      # PROCESS_MEMORY_COUNTERS_EX — нужен PrivateUsage
+        class _PMCEX(ctypes.Structure):      # PROCESS_MEMORY_COUNTERS_EX — PrivateUsage needed
             _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
                         ("PeakWorkingSetSize", ctypes.c_size_t),
                         ("WorkingSetSize", ctypes.c_size_t),
@@ -49,8 +48,8 @@ def memlog(tag: str) -> None:
                         ("PeakPagefileUsage", ctypes.c_size_t),
                         ("PrivateUsage", ctypes.c_size_t)]
 
-        # ⚠ Типы обязательны: без них дескриптор процесса усекается до 32 бит и вызов
-        # молча возвращает ноль (наступал на это 2026-08-07).
+        # ⚠ Types are mandatory: without them the process handle is truncated to 32 bits
+        # and the call silently returns zero.
         k = ctypes.windll.kernel32
         k.GetCurrentProcess.restype = wintypes.HANDLE
         fn = getattr(k, "K32GetProcessMemoryInfo", None) or ctypes.windll.psapi.GetProcessMemoryInfo
@@ -61,5 +60,5 @@ def memlog(tag: str) -> None:
             return
         logger.info("[память] {:<38} своя {:6.2f} ГБ | рабочий набор {:6.2f} ГБ", tag,
                     c.PrivateUsage / 2**30, c.WorkingSetSize / 2**30)
-    except Exception:  # noqa: BLE001 — диагностика не должна ронять работу
+    except Exception:  # noqa: BLE001 — diagnostics must not break the pipeline
         pass

@@ -17,7 +17,6 @@ from track_muxer.conform.kernel.coarse import CMIN, DEV, K, VHI, W
 GW, GH = 128, 72                 # SRM grid (features.GW/GH); imported here to keep the kernel package standalone
 PROBE_SAMPLE = 300               # dub frames sampled for the orientation probe
 PROBE_BLOCK = 1 << 14            # frames per block when mirroring a full feature file
-ORIENTATIONS = ("plain", "mirror")
 
 
 def mirror_srm(v: np.ndarray, out: np.ndarray | None = None) -> np.ndarray:

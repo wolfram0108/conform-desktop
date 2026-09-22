@@ -1,49 +1,45 @@
 # -*- coding: utf-8 -*-
-"""Анализатор зрения: ЧИСТЫЙ построитель видео-карты (укладка на якорях + резы). Заменил
-прежний «гербарий» detect+piecewise (~15 порогов: MSIZE/PEN/VC_*/EDGE_*), который СХЛОПЫВАЛ
-короткие уверенные плато — линия уходила «в космос» мимо якорей на 40-90 кадров (узким местом
-был video_cut_filter: буфер ±6с отбрасывал рез у короткого плато).
+"""Vision-layer analyzer: the sole video-map builder in conform (anchor-based layout plus cuts).
+Vision reads the shift structure (plateaus/steps) more precisely than audio; the goal is to sit
+on CONFIDENT anchors and place a cut only where the shift level actually changed.
 
-ЕДИНСТВЕННЫЙ построитель видео-карты в conform (вытеснил и «скат», и гербарий). Зрение видит
-структуру сдвига (плато/ступени) точнее аудио; задача — лечь на УВЕРЕННЫЕ якоря и поставить
-резы там, где сдвиг РЕАЛЬНО изменился.
+Pipeline: video anchors (pred/cos) -> (o, w) on grid T (weight = cos . agree) -> removal of the
+dub's real scale (`global_trend`, PAL/speed-up, no ceiling) -> `clean_cuts` (the DELTA decides:
+cuts on a jump exceeding drift, transient islands bridged, edge filter) -> `build_curve` (robust
+line between cuts) -> tg_s, monotonic by construction (a dub can never play backward). Cuts and
+an unsupported head/tail are filled with SILENCE (spacing out content / no dub there) by the
+caller; the final reference fill overlays it in sync.
 
-Конвейер: видео-якоря (pred/cos) → (o,w) на сетке T (вес=cos·agree) → СНЯТИЕ реального масштаба
-(`global_trend`, PAL/ускорение без потолка) → `clean_cuts` (РЕШАЕТ ДЕЛЬТА: руны по скачку>дрейфа,
-острова-транзиенты в мост, фильтр краёв) → `build_curve` (робастная прямая между резами) →
-tg_s + МОНОТОНИЗАЦИЯ (дубль нельзя играть назад). Резы/голова/хвост применяются ТИШИНОЙ
-(разнести контент / нет дубля) вызывающим; финальная заливка рефом перекроет синхронно.
-
-Принцип чистого алгоритма (зафиксирован пользователем 2026-06-22):
-  - УВЕРЕННЫЕ якоря (w≥W_CONF) = истина, карта обязана лежать на них;
-  - РЕШАЕТ ДЕЛЬТА (уровень сдвига), не длина: рез — только при ПОСТОЯННОМ изменении дельты;
-    дельта ВЕРНУЛАСЬ (экскурсия вниз-вверх) = слепой выброс → мост, НЕ рез (сколько бы якорей);
-  - край без опоры (голова/хвост) → экстраполяция плато + ТИШИНА (заливка рефом).
-5 честных параметров (W_CONF/SMAX/TOL/ISLAND_MAX/EDGE_MAX) вместо ~15. Знак: правее=+;
-кадр=41.708мс.
+Design principles:
+  - CONFIDENT anchors (w>=W_CONF) are ground truth: the map must sit on them.
+  - The DELTA (shift level) decides, not duration: a cut fires only on a SUSTAINED delta change;
+    a delta that RETURNS (a down-up excursion) is a blind outlier -> bridged, not cut, regardless
+    of how many anchors it spans.
+  - An edge without support (head/tail) extrapolates the plateau and is filled with SILENCE
+    (reference fill).
+Sign convention: right = positive; frame = 41.708 ms.
 """
 from __future__ import annotations
 
 import numpy as np
 
-from track_muxer.conform.anchor.params import T as GT, SMAX, make_T  # noqa: F401
+from track_muxer.conform.anchor.params import T as GT, make_T
 
-# Сетка/вес якорей (центры плато нечувствительности, sweep на 36 дорожках 2026-06-18)
-VIS_WIN = 0.3             # окно агрегации якорей, с (плато 0.2-0.5)
-VIS_SMAX = 0.45          # потолок наклона прямых = предел СКОРОСТИ ДРЕЙФА, к/с (физика проигрывания)
-VIS_MAX_SCALE_PCT = 15.0  # санити-гард доверия глобальному наклону, %/с (реальные PAL/NTSC ≤±5%;
-                          # >15% = якоря мусорные → масштаб не снимаем)
-VIS_SCALE_BIN_S = 25.0    # бин оценки масштаба, с (плато 15-40): давит шум якорей перед медианой
+# Anchor grid/weight (insensitivity-plateau centers; tuned by a sweep over 36 tracks)
+VIS_WIN = 0.3             # anchor aggregation window, s (plateau 0.2-0.5)
+VIS_SMAX = 0.45          # slope ceiling for lines = drift SPEED limit, frames/s (playback physics)
+VIS_MAX_SCALE_PCT = 15.0  # sanity guard for trusting the global slope, %/s (real PAL/NTSC <=+-5%;
+                          # >15% means anchors are garbage -> scale is not removed)
+VIS_SCALE_BIN_S = 25.0    # scale-estimation bin, s (plateau 15-40): suppresses anchor noise before the median
 
 # Clean builder: 5 honest parameters
-VIS_W_CONF = 0.5         # порог уверенности якоря (надёжность измерения; w≈0 шум ↔ w≈1 уверен)
-VIS_TOL = 6.0           # джиттер якоря, к (внутри плато якоря дрожат ~1.5к)
-VIS_EDGE_MAX = 12       # короткий первый/последний рун без опоры с краю (якорей) = краевой скачок → фильтр
+VIS_W_CONF = 0.5         # anchor confidence threshold (measurement reliability; w~=0 noise <-> w~=1 confident)
+VIS_TOL = 6.0           # anchor jitter, frames (anchors jitter ~1.5 frames within a plateau)
 
-# Адаптивная прокладка кривой МЕЖДУ резами: прод-прямая (Тейл-Сен) если ложится, иначе RDP-ломаная.
-VIS_RDP_EPS = 3.0       # RDP: макс отклонение ломаной от сглаженных якорей, к (минимум вершин)
-VIS_SMOOTH_WIN = 8      # окно робастного сглаживания якорей перед RDP, узлов (давит выбросы)
-VIS_ADAPT_THR = 8.0     # адаптив: 90%-невязка прод-прямой ≤ порога → прямая (ступени бит-в-бит), иначе RDP
+# Adaptive curve fit BETWEEN cuts: production line (Theil-Sen) if it fits, otherwise an RDP polyline.
+VIS_RDP_EPS = 3.0       # RDP: max deviation of the polyline from smoothed anchors, frames (fewest vertices)
+VIS_SMOOTH_WIN = 8      # robust anchor smoothing window before RDP, nodes (suppresses outliers)
+VIS_ADAPT_THR = 8.0     # adaptive: 90th-pct residual of the production line <= threshold -> line (bit-exact steps), else RDP
 
 # Vision noise on ambiguous content (dark or repeated scenes, NTSC sources): the layout uses
 # TV denoising (1D total variation / fused lasso). A short excursion, even a tall one, does not pay
@@ -51,13 +47,13 @@ VIS_ADAPT_THR = 8.0     # адаптив: 90%-невязка прод-прямо
 # global over the track, so neighbouring excursions cannot contaminate each other locally.
 # Validated on 690 cached dubs: 0 regressions against the greedy scan, 20 fewer false cuts;
 # the lambda sweep shows a wide plateau [1200,3000].
-VIS_TV_LAM = 1800.0     # порог окупаемости скачка TV, к·сэмпл (плато 1200-3000)
-VIS_TV_STEP_MIN = 8.0   # |Δ уровня| рез, к (>8 убирает мелкую TV-лестницу на гладком гулянии)
-VIS_OUT_THR = 12.0      # |o_res − B(TV)| = выброс → исключить из подгонки кривой, к
+VIS_TV_LAM = 1800.0     # TV jump payoff threshold, frame*sample (plateau 1200-3000)
+VIS_TV_STEP_MIN = 8.0   # |level delta| for a cut, frames (>8 removes fine TV staircasing on smooth wander)
+VIS_OUT_THR = 12.0      # |o_res - B(TV)| outlier threshold -> excluded from the curve fit, frames
 
 
 def _wmedian(x, wts):
-    """Взвешенная медиана (робастная статистика, без порогов)."""
+    """Weighted median (a robust statistic, no thresholds)."""
     if len(x) == 0:
         return 0.0
     o = np.argsort(x); x = x[o]; wts = wts[o]; cw = np.cumsum(wts)
@@ -72,13 +68,14 @@ def _wmedian(x, wts):
 #    128x72 SRM and therefore resolution-invariant. The reaction is a soft IVTC: the redundant
 #    frame of each five is dropped, giving ~23.976 and clean matching. Non-NTSC and non-telecine
 #    input is a bit-exact no-op. Proven on 132 synthetic clips and both seasons of an NTSC-sourced series.
-VIS_TC_NTSC = (29.0, 30.5)      # fps NTSC → кандидат на 3:2-телесин (PAL/film период-5 не дают)
-VIS_TC_FLOOR = 0.05             # мин выступ периода-5 (защита от случайного argmax=5 на шуме)
-_TC_SAMPLE = 6000               # кадров фикс-сэмпла детекта (память O(const), не растёт с длиной)
+VIS_TC_NTSC = (29.0, 30.5)      # NTSC fps range -> candidate for 3:2 telecine (PAL/film has no period-5)
+VIS_TC_FLOOR = 0.05             # min period-5 prominence (guards against accidental argmax=5 on noise)
+_TC_SAMPLE = 6000               # fixed detection sample size, frames (memory O(const), does not grow with length)
 
 
 def _tele_signature(srm):
-    """(выступ периода-5 автокорр несхожести соседей над фоном, argmax 2..12) на фикс-сэмпле."""
+    """(period-5 prominence of the neighbour-frame dissimilarity autocorrelation over background,
+    argmax over 2..12), on a fixed-size sample."""
     n = len(srm)
     off = min(_TC_SAMPLE, n // 4)
     a = np.asarray(srm[off:off + _TC_SAMPLE], np.float32)
@@ -96,8 +93,9 @@ def _tele_signature(srm):
 
 
 def is_baked_telecine(srm, fps):
-    """Дёшево (фикс-сэмпл, БЕЗ прореживания): (telecine, tele_score, argmax). Гейт = NTSC fps И
-    argmax период-5 И выступ ≥ порога. Используется для гейта CK3/паспорта ДО матчинга."""
+    """Cheap (fixed-size sample, NO thinning): returns (telecine, tele_score, argmax). The gate is
+    NTSC fps AND argmax at period 5 AND prominence >= floor. Used for the CK3/passport gate
+    before matching."""
     n = 0 if srm is None else len(srm)
     if n < 1000 or not (VIS_TC_NTSC[0] <= float(fps) <= VIS_TC_NTSC[1]):
         return False, 0.0, 0
@@ -106,8 +104,9 @@ def is_baked_telecine(srm, fps):
 
 
 def _cadence_keep(srm, blk=4096):
-    """Маска кадров на оставление: в каждом окне из 5 дроп самого избыточного (макс cos к
-    предыдущему = pulldown-повтор). Сходство соседей ПОБЛОЧНО (память O(блока))."""
+    """Keep-frame mask: in each window of 5, drop the most redundant frame (max cos to the
+    previous frame = a pulldown repeat). Neighbour similarity is computed block by block
+    (memory O(block))."""
     n = len(srm)
     d = np.empty(n, np.float32); d[0] = -1.0
     for s in range(0, n, blk):
@@ -125,19 +124,18 @@ def _cadence_keep(srm, blk=4096):
     return keep
 
 
-def detelecine(srm, fps, *, tmp_dir=None):
-    """Запечённый 3:2-телесин (NTSC) → прорежает каденс на уровне SRM-фич (мягкий IVTC → ~23.976)
-    для ЧИСТОГО матчинга. Иначе НО-ОП (тот же srm/fps бит-в-бит). tmp_dir задан → прореженный SRM
-    в temp-memmap (память O(блока), low_mem); иначе RAM. -> (srm, fps, info)."""
+def detelecine(srm, fps, *, scratch=None):
+    """Baked 3:2 telecine (NTSC): thin the cadence at the level of SRM features (a soft IVTC to
+    ~23.976) for clean matching; otherwise a no-op returning the same srm and fps bit for bit.
+    With `scratch` (the owner of the run's temporary files) the thinned SRM is a file-backed
+    array, memory O(block); otherwise RAM. -> (srm, fps, info)."""
     is_tc, ts, am = is_baked_telecine(srm, fps)
     info = {"telecine": is_tc, "tele_score": ts, "argmax": am, "dropped": 0}
     if not is_tc:
         return srm, fps, info
     n = len(srm); keep = _cadence_keep(srm); n2 = int(keep.sum()); D = int(srm.shape[1])
-    if tmp_dir is not None:
-        import tempfile
-        from pathlib import Path as _P
-        mp = _P(tempfile.mkdtemp(prefix="detc_", dir=str(tmp_dir))) / "f.f16"
+    if scratch is not None:
+        mp = scratch.sub("detc") / "f.f16"
         out = np.memmap(mp, dtype=np.float16, mode="w+", shape=(n2, D)); j = 0
         for s in range(0, n, 8192):
             sel = np.asarray(srm[s:s + 8192])[keep[s:s + 8192]]
@@ -152,20 +150,22 @@ def detelecine(srm, fps, *, tmp_dir=None):
 
 def vision_ow(pred, asg, cos, fps_ref, fps_dub, *, win_s=VIS_WIN, tol_fr=2.0, T=GT,
               ax_ref=None, ax_dub=None):
-    """Видео-якоря → (o,w) на сетке params.T. o = взвеш.медиана сдвига (вес=cos) в окне
-    ±win_s; w = медиана(cos)·доля согласных (|сдвиг−o|≤tol_fr — аналог band-«agree»).
-    Пустые узлы: o интерполируется, w=0. Нормировка w по медиане положительных.
+    """Video anchors -> (o, w) on the params.T grid. o = weighted median shift (weight=cos) within
+    a window of +-win_s; w = median(cos) times the fraction of agreeing anchors
+    (|shift-o|<=tol_fr, the band-layer's "agree" analogue). Empty nodes: o is interpolated, w=0.
+    w is normalized by the median of its positive values.
 
-    ax_ref/ax_dub — РЕАЛЬНАЯ ось времени кадров (SrmFeatures.pts, только VFR): время кадра
-    тогда = ax[индекс], а не индекс/fps (на VFR ложь до сотен секунд — замер s01e06 encoded:
-    уход 713с). None → старый путь бит-в-бит. ЕДИНСТВЕННОЕ место, где индексы кадров
-    превращаются во время для укладки; fps_ref дальше — лишь ЕДИНИЦА «кадры рефа»
-    (сокращается в build_map: ×fps_ref здесь, /fps_ref в tg_s)."""
+    ax_ref/ax_dub is the frame time axis as actually measured (SrmFeatures.pts, VFR only): frame
+    time is then ax[index] rather than index/fps -- on VFR content index/fps is off by up to
+    hundreds of seconds (observed drift: 713 s). None falls back to index/fps, bit-exact with that
+    formula. This is the only place where frame indices turn into time for the layout; fps_ref
+    downstream is only the unit "reference frames" (it cancels out in build_map: multiplied by
+    fps_ref here, divided by fps_ref in tg_s)."""
     t_ref = (ax_ref[pred[asg]] if ax_ref is not None
              else pred[asg].astype(np.float64) / fps_ref)
     t_dub = (ax_dub[asg] if ax_dub is not None
              else asg.astype(np.float64) / fps_dub)
-    sh = (t_dub - t_ref) * fps_ref                       # сдвиг в кадрах рефа (правее=+)
+    sh = (t_dub - t_ref) * fps_ref                       # shift in reference frames (right = +)
     cs = np.asarray(cos, np.float64)
     order = np.argsort(t_ref)
     trs, shs, css = t_ref[order], sh[order], cs[order]
@@ -190,14 +190,18 @@ def vision_ow(pred, asg, cos, fps_ref, fps_dub, *, win_s=VIS_WIN, tol_fr=2.0, T=
 
 
 def global_trend(o, w, T, fps_ref, *, bin_s=VIS_SCALE_BIN_S, max_pct=VIS_MAX_SCALE_PCT):
-    """ГЛОБАЛЬНЫЙ наклон укладки = РЕАЛЬНЫЙ масштаб дубля (PAL/NTSC/любое ускорение), ИЗ ДАННЫХ,
-    БЕЗ потолка и БЕЗ всякого fps. Робастен И к резам, И к шуму якорей:
-      1) грубые БИНЫ ~bin_s, в каждом взвеш. МЕДИАНА o → ДАВИТ ШУМ (у шумных дублей типа kodik
-         per-step дрейф ~0.3 кадра тонет в джиттере соседних узлов сетки);
-      2) МЕДИАНА наклонов СОСЕДНИХ бинов → рез = спайк в одной паре бинов, медиана его отсекает.
-    Почему так: чистая медиана локальных наклонов хрупка к шуму (Amediateka давала 0%); МНК/`wfit`
-    и широкие пары — резы УТЯГИВАЮТ (Reanimedia ep04 −9.4%). Бины+соседи = робастно к обоим.
-    Санити-гард: |масштаб| > max_pct %/с = якоря мусорные → (0,0). Возврат: (a,b) прямой a·T+b."""
+    """The GLOBAL layout slope = the dub's REAL scale (PAL/NTSC/any speed-up), read FROM the data,
+    with no ceiling and no dependence on fps. Robust to both cuts and anchor noise:
+      1) coarse BINS of ~bin_s, weighted MEDIAN of o per bin -> SUPPRESSES NOISE (on a noisy dub
+         a per-step drift of ~0.3 frame would otherwise drown in the jitter of neighbouring grid
+         nodes);
+      2) MEDIAN of NEIGHBOURING bins' slopes -> a cut is a spike confined to one bin pair, and the
+         median cuts it out.
+    Rationale: a plain median of local node slopes is fragile to noise (measured: 0% recovered on
+    a noisy source); least squares/`wfit` with wide pairs let cuts pull the fit (measured: -9.4%
+    on a stepped dub). Binning plus neighbour-median is robust to both failure modes.
+    Sanity guard: |slope| > max_pct %/s means the anchors are garbage -> (0, 0). Returns: (a, b)
+    of the line a*T+b."""
     o = np.asarray(o, float); w = np.asarray(w, float); T = np.asarray(T, float)
     if len(T) < 3:
         return 0.0, 0.0
@@ -210,24 +214,25 @@ def global_trend(o, w, T, fps_ref, *, bin_s=VIS_SCALE_BIN_S, max_pct=VIS_MAX_SCA
             m = (T >= edges[i]) & (T < edges[i + 1]) & (w > 0)
             if int(m.sum()) >= 3:
                 tc.append(0.5 * (edges[i] + edges[i + 1]))
-                oc.append(_wmedian(o[m], w[m]))          # уровень бина (взвеш. медиана — шум подавлен)
+                oc.append(_wmedian(o[m], w[m]))          # bin level (weighted median -- noise suppressed)
                 wc.append(float(w[m].sum()))
-    if len(tc) >= 3:                                      # наклон соседних бинов → медиана (рез отсеян)
+    if len(tc) >= 3:                                      # slope of neighbouring bins -> median (cut filtered out)
         tca = np.asarray(tc); oca = np.asarray(oc); wca = np.asarray(wc)
         a = _wmedian(np.diff(oca) / np.diff(tca), np.minimum(wca[:-1], wca[1:]))
-    else:                                                # мало бинов → откат на локальные наклоны узлов
+    else:                                                # too few bins -> fall back to local node slopes
         sl = np.diff(o) / np.maximum(np.diff(T), 1e-9); we = np.minimum(w[:-1], w[1:]); g = we > 0
         a = _wmedian(sl[g], we[g]) if g.any() else 0.0
     if (not np.isfinite(a)) or abs(a) / max(float(fps_ref), 1e-6) * 100.0 > max_pct:
         return 0.0, 0.0
-    b = _wmedian(o - a * T, np.maximum(w, 1e-6))          # опорный уровень (центр лестницы)
+    b = _wmedian(o - a * T, np.maximum(w, 1e-6))          # reference level (staircase center)
     return float(a), float(b)
 
 
 def tv1d(y, lam):
-    """1D total variation denoising (Condat 2013, прямой O(n)). min 0.5·Σ(y−x)² + lam·Σ|Δx|.
-    Кусочно-постоянная РОБАСТНАЯ база: короткий выброс (даже высокий) не окупает 2 скачка по lam
-    → поглощается; устойчивая ступень окупает → скачок остаётся. Глобально по всей дорожке."""
+    """1D total variation denoising (Condat 2013, direct O(n)). Minimizes 0.5*sum((y-x)^2) +
+    lam*sum(|dx|). A piecewise-constant, ROBUST baseline: a short outlier (even a tall one) does
+    not pay for two jumps of size lam and is absorbed; a sustained step does pay and the jump
+    remains. Applied globally over the whole track."""
     y = np.asarray(y, float); N = len(y)
     x = np.empty(N)
     if N == 0:
@@ -257,11 +262,11 @@ def tv1d(y, lam):
             continue
         umin += y[k + 1] - vmin
         umax += y[k + 1] - vmax
-        if umin < -lam:                                          # отрицательный скачок
+        if umin < -lam:                                          # negative jump
             x[k0:kminus + 1] = vmin
             k = k0 = kminus = kminus + 1
             kplus = k; vmin = y[k]; vmax = y[k] + 2 * lam; umin = lam; umax = -lam
-        elif umax > lam:                                         # положительный скачок
+        elif umax > lam:                                         # positive jump
             x[k0:kplus + 1] = vmax
             k = k0 = kplus = kplus + 1
             kminus = k; vmin = y[k] - 2 * lam; vmax = y[k]; umin = lam; umax = -lam
@@ -276,47 +281,50 @@ def tv1d(y, lam):
 
 def clean_cuts(o, w, T, a_g, b_g, *, w_conf=VIS_W_CONF, smax=VIS_SMAX, tol=VIS_TOL,
                lam=VIS_TV_LAM, step_min=VIS_TV_STEP_MIN, exc_thr=VIS_OUT_THR):
-    """Границы резов видео-карты через TV-DENOISING (глобально, без жадной локальной контаминации
-    соседними экскурсиями). o_res → TV-база B (кусочно-постоянная): короткая экскурсия не окупает
-    скачок → поглощается; устойчивая ступень → B шагает. РЕЗЫ = границы сегментов B, но УРОВНИ/Δ
-    берём из РЕАЛЬНЫХ якорей (медиана сегмента без выбросов — TV занижает Δ усадкой λ/m) + фильтр
-    «резкий локальный скачок» (отсекает мелкую TV-лестницу на гладком гулянии). Выбросы =
-    |o_res − уровень_сегмента| > exc_thr (от ИСТИННОГО уровня сегмента, не усаженной TV-базы B —
-    иначе короткий сегмент перед большой ступенью теряется целиком) → exc_mask: ИСКЛЮЧИТЬ из подгонки.
-    Возврат: (cuts[(tc,Δ,t_end,t_nxt)], o_res, conf, body, exc_mask)."""
+    """Video-map cut boundaries via TV DENOISING (global, so a greedy scan cannot let one excursion
+    contaminate its local neighbourhood). o_res -> TV baseline B (piecewise constant): a short
+    excursion does not pay for a jump and is absorbed; a sustained step makes B step. CUTS are the
+    boundaries of B's segments, but the level/delta at each cut comes from the REAL anchors
+    (segment median with outliers removed -- TV understates delta by shrinking it ~lambda/m),
+    plus a "sharp local jump" filter (removes fine TV staircasing on smooth wander). Outliers are
+    |o_res - segment_level| > exc_thr, measured from the segment's TRUE level rather than the
+    shrunken TV baseline B (otherwise a short segment ahead of a large step would be lost
+    entirely) -> exc_mask marks them EXCLUDED from the curve fit.
+    Returns: (cuts[(tc, delta, t_end, t_nxt)], o_res, conf, body, exc_mask)."""
     o = np.asarray(o, float); w = np.asarray(w, float); T = np.asarray(T, float)
-    o_res = o - (a_g * T + b_g)                                   # детренд масштабом: рябь+ступени без наклона
+    o_res = o - (a_g * T + b_g)                                   # detrend by scale: ripple+steps with the slope removed
     conf = w >= w_conf
     ti = T[conf]; ri = o_res[conf]
     n = len(ti)
     if n < 2:
         return [], o_res, conf, (float(T[0]), float(T[-1])), np.zeros(len(T), bool)
-    B = tv1d(ri, lam)                                            # TV — ТОЛЬКО для СЕГМЕНТАЦИИ (границы резов)
+    B = tv1d(ri, lam)                                            # TV -- ONLY for SEGMENTATION (cut boundaries)
     conf_idx = np.where(conf)[0]
     body = (float(ti[0]), float(ti[-1]))
-    bj = list(np.where(np.abs(np.diff(B)) > 0.5)[0])            # скачок TV между якорями i и i+1
+    bj = list(np.where(np.abs(np.diff(B)) > 0.5)[0])            # TV jump between anchors i and i+1
     seg_b = [0] + [i + 1 for i in bj] + [n]
     segs = [(seg_b[k], seg_b[k + 1]) for k in range(len(seg_b) - 1)]
-    # ВЫБРОС считаем от ИСТИННОГО уровня сегмента (медиана реальных якорей), а НЕ от усаженной TV-базы B.
-    # TV занижает ступень на ~λ/m → КОРОТКИЙ сегмент перед БОЛЬШОЙ ступенью (синхрон-голова перед
-    # рекламной вставкой) иначе целиком уходит в exc → build_curve теряет его → укладка на ГЛОБАЛЬНОМ
-    # уровне (первые секунды дубля сдвинуты на величину вставки). Уровни-из-якорей — заявленная
-    # философия этого детектора; доводим до неё и выброс. (kolpakov ep08: голова 0-58с возвращается.)
+    # The outlier is measured from the segment's TRUE level (median of real anchors), not from the
+    # shrunken TV base B: TV understates a step by ~lambda/m, so a short segment ahead of a large
+    # step (e.g. a synced lead-in before an insert) would otherwise fall entirely into the outlier
+    # set, build_curve would drop it, and the alignment would sit on the global level instead (the
+    # dub's opening seconds shifted by the insert's length). Anchor-derived levels are this
+    # detector's stated design, so the outlier threshold follows the same rule.
     Blvl = np.empty(n)
     for a, b in segs:
         Blvl[a:b] = np.median(ri[a:b])
-    exc = np.abs(ri - Blvl) > exc_thr                          # выбросы: далеко от уровня СВОЕГО сегмента
+    exc = np.abs(ri - Blvl) > exc_thr                          # outliers: far from the level of their OWN segment
 
-    def _lvl(a, b):                                             # уровень сегмента из РЕАЛЬНЫХ якорей (без выбросов)
+    def _lvl(a, b):                                             # segment level from REAL anchors (outliers excluded)
         sl = ri[a:b][~exc[a:b]]
         return float(np.median(sl)) if len(sl) else float(np.median(ri[a:b]))
     seg_lvl = [_lvl(a, b) for a, b in segs]
     cuts = []
     for k in range(len(segs) - 1):
-        i = segs[k][1] - 1                                      # последний якорь сегмента k
-        dv = seg_lvl[k + 1] - seg_lvl[k]                        # ИСТИННЫЙ Δ уровня (без TV-усадки)
-        sharp = any(abs(ri[j + 1] - ri[j]) > smax * (ti[j + 1] - ti[j]) + tol   # резкий локальный скачок
-                    for j in range(max(0, i - 2), min(n - 1, i + 3)))           # (не гладкая лестница гуляния)
+        i = segs[k][1] - 1                                      # last anchor of segment k
+        dv = seg_lvl[k + 1] - seg_lvl[k]                        # TRUE level delta (without TV shrinkage)
+        sharp = any(abs(ri[j + 1] - ri[j]) > smax * (ti[j + 1] - ti[j]) + tol   # sharp local jump
+                    for j in range(max(0, i - 2), min(n - 1, i + 3)))           # (not a smooth staircase from wander)
         if abs(dv) > step_min and sharp:
             cuts.append((0.5 * (ti[i] + ti[i + 1]), dv, float(ti[i]), float(ti[i + 1])))
     exc_mask = np.zeros(len(T), bool)
@@ -325,7 +333,7 @@ def clean_cuts(o, w, T, a_g, b_g, *, w_conf=VIS_W_CONF, smax=VIS_SMAX, tol=VIS_T
 
 
 def _theilsen(tt, yy, smax):
-    """Прод-прямая: разреженный Тейл-Сен, наклон clamp ±smax."""
+    """Production line: sparse Theil-Sen, slope clamped to +-smax."""
     n = len(tt)
     if n < 2:
         return 0.0, float(yy[0]) if n else 0.0
@@ -337,7 +345,7 @@ def _theilsen(tt, yy, smax):
 
 
 def _smooth_w(tt, yy, ww, win):
-    """Робастное сглаживание: взвеш. медиана в окне ±win узлов (давит выбросы перед RDP)."""
+    """Robust smoothing: weighted median within a window of +-win nodes (suppresses outliers before RDP)."""
     n = len(yy); out = np.empty(n); half = max(1, win // 2)
     for i in range(n):
         a, b = max(0, i - half), min(n, i + half + 1)
@@ -346,7 +354,7 @@ def _smooth_w(tt, yy, ww, win):
 
 
 def _rdp(t, y, eps):
-    """Ramer-Douglas-Peucker: ломаная с гарантией макс отклонения ≤ eps, минимум вершин."""
+    """Ramer-Douglas-Peucker: a polyline guaranteed to deviate by at most eps, with the fewest vertices."""
     keep = np.zeros(len(t), bool); keep[0] = keep[-1] = True
     stack = [(0, len(t) - 1)]
     while stack:
@@ -364,17 +372,18 @@ def _rdp(t, y, eps):
 
 
 def build_curve(o, w, T, a_g, b_g, *, smax=VIS_SMAX):
-    """Чистая карта: на каждый отрезок между резами — АДАПТИВНО: прод-прямая (Тейл-Сен ≤smax),
-    если ложится на якоря (90%-невязка ≤ VIS_ADAPT_THR) → ступенчатые/линейные дубли бит-в-бит;
-    не ложится (ГУЛЯЮЩИЙ горками, анти-бан) → RDP-ломаная по сглаженным якорям. Резы +
-    exc_mask = clean_cuts (TV-сегментация, финальные). Подгонка — по базовым якорям (не выбросам).
-    Вне body (голова/хвост) — экстраполяция плато.
-    Возврат: (curve[кадры на T], cuts, fill[(t_end,t_nxt) пролёты тишины], o_res, conf, body)."""
+    """Clean map: on each span between cuts, ADAPTIVELY fit a production line (Theil-Sen,
+    clamped to smax) when it sits on the anchors (90th-pct residual <= VIS_ADAPT_THR), reproducing
+    stepped/linear dubs bit-exact; when it does not (the shift WANDERS in humps), fall back to an
+    RDP polyline over the smoothed anchors. Cuts and exc_mask come from clean_cuts (TV
+    segmentation, final). The fit uses only baseline anchors, not outliers. Outside body
+    (head/tail), the plateau is extrapolated.
+    Returns: (curve[frames on T], cuts, fill[(t_end, t_nxt) silence spans], o_res, conf, body)."""
     o = np.asarray(o, float); w = np.asarray(w, float); T = np.asarray(T, float)
-    cuts, o_res, conf, body, exc_mask = clean_cuts(o, w, T, a_g, b_g, smax=smax)  # TV: резы финальные
+    cuts, o_res, conf, body, exc_mask = clean_cuts(o, w, T, a_g, b_g, smax=smax)  # TV: final cuts
     base = a_g * T + b_g
-    inbody = (T >= body[0]) & (T <= body[1])                      # вне тела (голова/хвост) — не тянем линию за краем
-    fit_ok = conf & ~exc_mask                                     # подгонка ТОЛЬКО по базовым якорям (не выбросам)
+    inbody = (T >= body[0]) & (T <= body[1])                      # outside the body (head/tail) -- don't extend the line past the edge
+    fit_ok = conf & ~exc_mask                                     # fit ONLY on baseline anchors (not outliers)
     bnds = [float(T[0]) - 1] + [c[0] for c in cuts] + [float(T[-1]) + 1]
     curve = np.zeros(len(T))
     for k in range(len(bnds) - 1):
@@ -385,61 +394,48 @@ def build_curve(o, w, T, a_g, b_g, *, smax=VIS_SMAX):
         cm = fit_ok & m & inbody
         if int(cm.sum()) >= 2:
             tt = T[cm]; yy = o_res[cm]; ww = w[cm]
-            sl, inter = _theilsen(tt, yy, smax)                  # прод-прямая (тот же Тейл-Сен, что был inline)
+            sl, inter = _theilsen(tt, yy, smax)                  # production-line fit: robust Theil-Sen slope/intercept for this segment
             line_resid = float(np.percentile(np.abs(yy - (sl * tt + inter)), 90))
-            if line_resid <= VIS_ADAPT_THR:                      # ПРЯМАЯ ложится → ступени/линия БИТ-В-БИТ как было
+            if line_resid <= VIS_ADAPT_THR:                      # LINE fits -> step/linear dubs are reproduced BIT-EXACT
                 curve[idx] = sl * T[idx] + inter + base[idx]
-            else:                                                # ГУЛЯЮЩИЙ горками → RDP-ломаная по сглаженным
+            else:                                                # WANDERS in humps -> RDP polyline over smoothed anchors
                 ys = _smooth_w(tt, yy, ww, VIS_SMOOTH_WIN)
                 nt, ny = _rdp(tt, ys, VIS_RDP_EPS)
                 curve[idx] = np.interp(T[idx], nt, ny) + base[idx]
         else:
             curve[idx] = base[idx]
-    fill = [(c[2], c[3]) for c in cuts]                           # пролёты тишины (резы)
+    fill = [(c[2], c[3]) for c in cuts]                           # silence spans (cuts)
     return curve, cuts, fill, o_res, conf, body
 
 
 def build_map(pred, asg, cos, fps_ref, fps_dub, dur_ref, dt, ax_ref=None, ax_dub=None):
-    """ВИДЕО-КАРТА ЧИСТЫМ построителем — ЕДИНСТВЕННЫЙ источник истины conform: СНЯТИЕ реального
-    масштаба + clean_cuts (РЕШАЕТ ДЕЛЬТА) + робастная укладка. Карта `tg_s` = укладка НАПРЯМУЮ,
-    БЕЗ монотонизации: между резами она и так монотонна (наклон ≤VIS_SMAX ≪ fps → дубль назад не
-    играется). Вырезы (где дубля нет) вызывающий гасит ТИШИНОЙ по резам `cuts` (−Δ → вырез ширины
-    |Δ|/fps; на резе tg_s локально падает, но та зона занулена — после неё дубль непрерывен).
-    Возврат: (grid, tg_s, cuts, o, w, curve).
-      cuts [(tc, Δкадры, t_end, t_nxt)] — РЕЗЫ укладки = ЕДИНСТВЕННЫЙ детектор; вырез =
-      промежуток МЕЖДУ якорями [t_end, t_nxt] (там нет дубля); o/w/curve — для графиков.
+    """The video map from the clean builder -- conform's sole source of truth: real-scale removal
+    plus clean_cuts (the DELTA decides) plus a robust layout. The `tg_s` map is the layout
+    directly, with no monotonization: between cuts it is monotonic by construction (slope
+    <= VIS_SMAX << fps, so the dub can never play backward). Excisions (spans with no dub content)
+    are filled with SILENCE by the caller, driven by `cuts` (a negative delta means an excision of
+    width |delta|/fps; tg_s dips locally at the cut, but that zone is zeroed out -- past it the dub
+    is continuous).
+    Returns: (grid, tg_s, cuts, o, w, curve).
+      cuts [(tc, delta_frames, t_end, t_nxt)] are the layout's cuts, the sole cut detector; an
+      excision is the gap BETWEEN anchors [t_end, t_nxt] (no dub content there); o/w/curve are for
+      plotting.
 
-    РЕАЛЬНЫЙ МАСШТАБ (вариант B): глобальный наклон дубля (PAL/ускорение/любой fps) снимается
-    БЕЗ потолка (`global_trend`), а детект+укладка идут на ОСТАТКЕ — где потолок VIS_SMAX
-    ограничивает уже ОТКЛОНЕНИЕ от реального масштаба, а не от нуля. Иначе ускоренный дубль
-    (напр. PAL −4.1%) упирался в потолок ~1.9% и уезжал «в космос». Здоровым (наклон~0) —
-    без изменений; вырезы (мгновенные ступени) остаются в остатке для детекта резов."""
-    T = make_T(dur_ref)                                   # сетка от РЕАЛЬНОЙ длины рефа (любая длительность)
+    Real scale: the dub's global slope (PAL/speed-up/any fps) is removed with no ceiling
+    (`global_trend`), and detection plus layout then run on the RESIDUAL, where the VIS_SMAX
+    ceiling bounds the DEVIATION from the real scale rather than from zero. Otherwise a sped-up
+    dub (e.g. PAL at -4.1%) would hit the ~1.9% ceiling and drift away. A healthy dub (slope~0) is
+    unaffected; excisions (instantaneous steps) remain in the residual for cut detection."""
+    T = make_T(dur_ref)                                   # grid from the REAL reference duration (any length)
     o, w = vision_ow(pred, asg, cos, fps_ref, fps_dub, T=T, ax_ref=ax_ref, ax_dub=ax_dub)
-    a_g, b_g = global_trend(o, w, T, fps_ref)             # реальный масштаб дубля (без потолка)
+    a_g, b_g = global_trend(o, w, T, fps_ref)             # dub's real scale (ceiling removed)
     curve, cuts4, _fill, _o_res, _conf, _body = build_curve(o, w, T, a_g, b_g)
-    # [(tc, Δкадры, t_end, t_nxt)] — рез + ГРАНИЦЫ выреза = промежуток МЕЖДУ якорями плато
-    # (t_end=последний якорь плато до, t_nxt=первый якорь плато после). Это и есть «нет дубля».
+    # [(tc, delta_frames, t_end, t_nxt)] -- cut + excision boundaries = the gap BETWEEN plateau anchors
+    # (t_end = last anchor of the plateau before, t_nxt = first anchor of the plateau after): no dub content there.
     cuts = [(float(tc), float(dv), float(te), float(tn)) for tc, dv, te, tn in cuts4]
     grid = np.arange(0, dur_ref, dt)
-    shift = np.interp(grid, T, curve)                     # сдвиг (кадры рефа) на grid рефа = укладка
-    tg_s = grid + shift / fps_ref                         # время дубля, с: кадры→сек по РЕАЛЬНОМУ fps_ref
-    #   (НЕ FRAME=23.976 — на NTSC/PAL давало масштаб 1.25×; сдвиг измерен в кадрах рефа vision_ow)
+    shift = np.interp(grid, T, curve)                     # shift (reference frames) at the reference grid = alignment
+    tg_s = grid + shift / fps_ref                         # dub time, s: frames -> seconds via the REAL fps_ref
+    #   (NOT FRAME=23.976 -- gave a 1.25x scale on NTSC/PAL; shift is measured in reference frames by vision_ow)
     return grid, tg_s.astype(np.float64), cuts, o, w, curve
 
-
-def render_plots(plot_dir, stem, o, w, curve, cuts):
-    """Графики укладки зрения (png + html) рядом с аудио — как band/muq. Read-only,
-    падение не должно ронять conform (ловит вызывающий тоже). Переиспользует anchor/plots
-    (точки o по уверенности + кривая укладки + резы); off0 нет → нули, GCC нет → None."""
-    from pathlib import Path
-    pd = Path(plot_dir); pd.mkdir(parents=True, exist_ok=True)
-    off0 = np.zeros(len(o), np.float64)
-    ttl = f"{stem} — зрение · резов {len(cuts)}"
-    from track_muxer.conform.anchor import plots as _p
-    _p.render_track(pd / f"{stem}__vision.png", o, w, off0, curve, cuts, title=ttl)
-    try:
-        from track_muxer.conform.anchor import plots_html as _ph
-        _ph.render_track_html(pd / f"{stem}__vision.html", o, w, off0, None, curve, cuts, title=ttl)
-    except Exception:  # noqa: BLE001 — html опционален (plotly)
-        pass

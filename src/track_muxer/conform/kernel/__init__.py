@@ -1,10 +1,7 @@
-"""Числовое ЯДРО conform — перенос 1-в-1 из исследовательского прототипа.
+"""The numeric CORE of conform.
 
-ВАЖНО: код этих модулей перенесён БЕЗ изменения логики и констант
-(DSYN/OPEN/EXT/пороги и сама динамика Drop-DTW). Менялись ТОЛЬКО импорты
-между модулями (на относительные) и убраны тестовые `main()` с привязкой к
-синтетическому датасету и matplotlib.
-Приёмка переноса — совпадение выхода по sha256 с прототипом.
+The DSYN/OPEN/EXT thresholds and the Drop-DTW dynamics were tuned together: changing one of them
+changes the algorithm as a whole and the output of every pair.
 """
 
 from __future__ import annotations

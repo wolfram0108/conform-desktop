@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""ОБЩЕЕ ядро детекта (одно на оба метода). Вход — (o,w) от любой карты.
-Взвешенная (вес=качество^qpow) ломающаяся-прямая DP-сегментация → seglines + резы;
-ПОСТФИЛЬТР по смещению хвоста (рез реален только если устойчивый уровень после ≠ до
-на ≥ порога). Контент-агностично и симметрично. Знак: правее=+; кадр=41.708мс."""
+"""The COMMON detection core (shared by both methods). Input: (o, w) from any map.
+Weighted (weight=quality^qpow) broken-line DP segmentation -> seglines + cuts; a POST-FILTER
+by tail shift (a cut is real only if the sustained level after differs from before by at least
+the threshold). Content-agnostic and symmetric. Sign: right=+; frame=41.708 ms."""
 import numpy as np
 from .params import T as _DEFT, PEN, QPOW, SMAX, MSIZE_S, STEP, MIN_FR
 
-# ---------- взвешенная DP-сегментация (ломающиеся прямые) ----------
+# ---------- weighted DP segmentation (broken-line fit) ----------
 def wfit(t, y, w):
     for _ in range(2):
         W = w.sum()
@@ -46,7 +46,7 @@ def _wsegment(t, y, w, pen, msize):
     while j > 0: i = back[j]; bnds.append((i, j)); j = i
     return bnds[::-1]
 
-# ---------- величина у стыка (локально, наклон ограничен) ----------
+# ---------- value at the joint (local, slope-bounded) ----------
 def _lvl(t, y, w, tc, Smax):
     a, b, _ = wfit(t, y, w.copy()); a = float(np.clip(a, -Smax, Smax))
     W = w.sum(); b = np.sum(w*(y-a*t))/W if W > 1e-9 else float(np.mean(y-a*t))
@@ -57,9 +57,9 @@ def local_value(o, w, tc, Wl=12.0, buf=5.0, Smax=SMAX, T=_DEFT):
     if lm.sum() < 4 or rm.sum() < 4: return None
     return float(_lvl(T[rm], o[rm], w[rm], tc, Smax) - _lvl(T[lm], o[lm], w[lm], tc, Smax))
 
-# ---------- кривая варпа (сегментные прямые + резы) ----------
+# ---------- warp curve (segment lines + cuts) ----------
 def warp_curve(o, w, pen=PEN, qpow=QPOW, S=SMAX, msize_s=MSIZE_S, T=_DEFT):
-    """-> seglines [(t_lo,t_hi,a,b)], cuts [(tc, величина_локальная)]."""
+    """-> seglines [(t_lo,t_hi,a,b)], cuts [(tc, local_magnitude)]."""
     wq = w**qpow; msize = int(round(msize_s/STEP)); segs = _wsegment(T, o, wq, pen, msize); P = _wtab(T, o, wq)
     seglines = []
     for k, (i, j) in enumerate(segs):
@@ -79,7 +79,7 @@ def warp_curve(o, w, pen=PEN, qpow=QPOW, S=SMAX, msize_s=MSIZE_S, T=_DEFT):
             m.append((tc, v))
     return seglines, m
 
-# ---------- ПОСТФИЛЬТР по смещению хвоста (зацепка пользователя) ----------
+# ---------- POST-FILTER by tail shift (catches remaining false positives) ----------
 def _gmask(base, w, gate):
     if gate > 0 and base.sum() >= 6:
         mm = base & (w >= np.quantile(w[base], gate))
@@ -93,7 +93,7 @@ def tail_value(o, wq, w, tc, prev, nxt, win=25.0, buf=6.0, Smax=SMAX, gate=0.0, 
     return float(_lvl(T[rm], o[rm], wq[rm], tc, Smax) - _lvl(T[lm], o[lm], wq[lm], tc, Smax))
 
 def tail_filter(o, w, cuts, qpow=QPOW, thr=MIN_FR, gate=0.0, T=_DEFT):
-    """Оставить только резы с устойчивым смещением хвоста ≥ thr; величина = это смещение."""
+    """Keep only cuts with a sustained tail shift >= thr; the magnitude is that shift."""
     wq = w**qpow; bnds = [c[0] for c in cuts]; out = []
     for k, (tc, v) in enumerate(cuts):
         prev = bnds[k-1] if k > 0 else float(T[0])
@@ -103,9 +103,9 @@ def tail_filter(o, w, cuts, qpow=QPOW, thr=MIN_FR, gate=0.0, T=_DEFT):
         if abs(tv) >= thr: out.append((tc, tv))
     return out
 
-# ---------- краевой рез (близко к началу/концу, короче msize) ----------
-EDGE_S = 15.0           # зона поиска краевого реза от края сегмента
-EDGE_MIN_S = 2.5        # мин длина плато до И после реза (= окно half; меньше — не якорится → исключение)
+# ---------- edge cut (close to the start/end, shorter than msize) ----------
+EDGE_S = 15.0           # search zone for an edge cut, from the segment edge
+EDGE_MIN_S = 2.5        # min plateau length before AND after the cut (= half window; shorter doesn't anchor: excluded)
 
 def _fit_seg(o, wq, lo, hi, T=_DEFT):
     m = (T >= lo) & (T <= hi)
@@ -114,8 +114,8 @@ def _fit_seg(o, wq, lo, hi, T=_DEFT):
     return (float(lo), float(hi), a, b)
 
 def _find_edge_cut(o, wq, t_lo, t_hi, side, T=_DEFT):
-    """Ступень плато→плато в краевой зоне сегмента [t_lo,t_hi]. -> (tc, jump) или None."""
-    if t_hi - t_lo < EDGE_S + EDGE_MIN_S: return None        # короткий сегмент — рез уже выделен
+    """A plateau-to-plateau step in the edge zone of segment [t_lo,t_hi]. -> (tc, jump) or None."""
+    if t_hi - t_lo < EDGE_S + EDGE_MIN_S: return None        # short segment: the cut is already isolated
     if side == "start": c0, c1 = t_lo+EDGE_MIN_S, t_lo+EDGE_S
     else:               c0, c1 = t_hi-EDGE_S, t_hi-EDGE_MIN_S
     cand = T[(T >= c0) & (T <= c1)]; best = None
@@ -129,7 +129,7 @@ def _find_edge_cut(o, wq, t_lo, t_hi, side, T=_DEFT):
     return best
 
 def _edge_refine(o, wq, seglines, cuts, T=_DEFT):
-    """Выделить рез в первом/последнем сегменте (краевая зона) и разбить сегмент."""
+    """Find a cut in the first/last segment (edge zone) and split the segment on it."""
     if len(seglines) < 1: return seglines, cuts
     new = list(seglines); extra = []
     ec = _find_edge_cut(o, wq, new[0][0], new[0][1], "start", T=T)
@@ -142,9 +142,9 @@ def _edge_refine(o, wq, seglines, cuts, T=_DEFT):
         new = new[:-1] + [_fit_seg(o, wq, s[0], tc, T=T), _fit_seg(o, wq, tc, s[1], T=T)]; extra.append((tc, j))
     return new, sorted(cuts + extra)
 
-# ---------- публичный детект ----------
+# ---------- public detect ----------
 def detect(o, w, T=_DEFT):
-    """-> (seglines [для сборки], cuts [(t,величина), фильтр по хвосту → 0 ложных])."""
+    """-> (seglines [for assembly], cuts [(t, magnitude), tail-filtered -> 0 false positives])."""
     wq = w**QPOW
     seglines, cuts0 = warp_curve(o, w, T=T)
     cuts = tail_filter(o, w, cuts0, T=T)
