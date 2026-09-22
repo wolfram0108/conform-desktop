@@ -1,17 +1,20 @@
 # -*- coding: utf-8 -*-
-"""ГРУБЫЙ аудио-проход на DTW (заменяет _coarse_off0). Находит аудио-события (вставки/вырезы),
-которых зрение не видит, на УЖЕ уложенном зрением потоке (post-vision). Порт валидированного стенда
-(приёмка на 340 дублях: 1 реальное событие, 0 ложных), license-free (DSP-48 band), без muq/контента, память-bounded.
+"""COARSE audio pass on DTW. Finds audio events (insertions/excisions) that vision does not see, on
+a stream ALREADY laid out by vision (post-vision). Validated on 340 dubs (1 real event, 0 false
+positives); license-free (DSP-48 band), no muq, no content-specific cues, memory-bounded.
 
-Конвейер (detect_one на масштабе HW): benv → оконный DSP-дескриптор (±HW, P точек) → whiten по реф-стате
-→ banded_dtw (полоса вокруг диагонали + colmin + СИГНАЛ-АДАПТИВНЫЙ ДИАГ-ПРИОР: тянет путь к лагу 0
-ТОЛЬКО где вокруг нет матча) → (o,w) на сетке → vision_detect.global_trend/build_curve → roundtrip_filter
-(выпрямить round-trip крупнее досягаемости тонкого band) → classify. cross_scale: событие реально ⟺
-HW6 ∩ HW18 (короткое окно-матчер + длинное окно-арбитр, |Δtc|≤20с).
+Pipeline (_detect_one at scale HW): _benv -> windowed DSP descriptor (±HW, P points) -> _whiten
+against the reference stats -> _banded_dtw (a band around the diagonal, plus colmin, plus a
+SIGNAL-ADAPTIVE DIAGONAL PRIOR that pulls the path toward lag 0 ONLY where there is no match
+nearby) -> (o, w) on the grid -> vision_detect.global_trend/build_curve -> _roundtrip_filter
+(straighten a round trip larger than the fine band pass can reach) -> _classify. cross_scale: an
+event counts as real only when HW6 and HW18 agree (short-window matcher and long-window arbiter,
+|Δtc| <= 20 s).
 
-Параметры обоснованы замерами:
-  AMERCE=0.04 (штраф варп-шага), DIAG_PRIOR=2.0/SIG_*(сигнал-гейт, окно широкое diag∈[2,8]×sig_hi∈[0.40,0.50]),
-  MINFR=80к (выше band ±0.7), flat_fr=band ±0.7 (round-trip выпрямлять). Знак: правее=+; кадр=41.708мс."""
+Parameters are backed by measurements:
+  AMERCE=0.04 (warp-step penalty), DIAG_PRIOR=2.0/SIG_* (signal gate, wide window diag in [2,8] x
+  sig_hi in [0.40,0.50]), MINFR=80 fr (above the band layer's ±0.7 s reach), flat_fr=band's ±0.7 s
+  (straightens a round trip). Sign convention: rightward = +; frame = 41.708 ms."""
 import numpy as np, torch
 from .maps import band as _B
 from .params import FRAME, STEP
@@ -22,56 +25,72 @@ from .. import cache as _cache
 from ..vision_detect import global_trend as _global_trend, build_curve as _build_curve, _wmedian
 
 DEV = _B.DEV
-# --- константы детектора (стендовые DTW-константы; ОТЛИЧНЫ от band_align 0.30/0.30) ---
-HW_SHORT, HW_LONG, P = 6.0, 18.0, 32          # окно дескриптора (матчер/арбитр), точек на окно
-AMERCE, DIAG_PRIOR = 0.04, 2.0                # штраф варп-шага; сила диаг-приора (окно [2,8])
-SIG_LO, SIG_HI, SIG_WIN = 0.20, 0.40, 40      # сигнал-гейт приора (окно sig_hi [0.40,0.50]); сглаж. ±10с
-MINFR = 80.0                                  # порог величины события, кадры (> band ±0.7)
-OPEN, EXT, DSYN, MATCH_THR = 0.20, 0.02, 0.20, 0.15   # аффинное ядро (стенд)
-CHUNK, OVERLAP, MARG = 800, 200, 160          # banded_dtw: кусок/перекрытие/полоса (память const)
-COARSE_FR = 2.5 * 1000.0 / FRAME              # ±2.5с в кадрах (ret_tol round-trip)
-BAND_FINE_FR = 0.7 * 1000.0 / FRAME           # досягаемость тонкого band ±0.7 (flat_fr round-trip)
-CROSS_TOL_S = 20.0                            # кросс-масштаб: |Δtc| ≤ этого = подтверждено
-FPS = _B.NB48["sr"] / _B.NB48["hop"]          # env-fps 62.5 (для classify длины)
+# --- detector constants (distinct from band_align's 0.30/0.30) ---
+HW_SHORT, HW_LONG, P = 6.0, 18.0, 32          # descriptor window (matcher/arbiter), points per window
+AMERCE, DIAG_PRIOR = 0.04, 2.0                # warp-step penalty; diagonal-prior strength (range [2,8])
+SIG_LO, SIG_HI, SIG_WIN = 0.20, 0.40, 40      # signal gate for the prior (sig_hi range [0.40,0.50]); smoothing ±10 s
+MINFR = 80.0                                  # event size threshold, frames (> band's ±0.7 reach)
+OPEN, EXT, DSYN, MATCH_THR = 0.20, 0.02, 0.20, 0.15   # affine kernel costs
+CHUNK, OVERLAP, MARG = 800, 200, 160          # banded_dtw: chunk/overlap/band width (constant memory)
+COARSE_FR = 2.5 * 1000.0 / FRAME              # ±2.5 s in frames (ret_tol round-trip)
+BAND_FINE_FR = 0.7 * 1000.0 / FRAME           # reach of the band layer's fine pass, ±0.7 s (flat_fr round-trip)
+CROSS_TOL_S = 20.0                            # cross-scale: |delta tc| <= this counts as confirmed
+FPS = _B.NB48["sr"] / _B.NB48["hop"]          # env-fps 62.5 (used by classify for length)
 _nfft, _hop, _sr = _B.NB48["nfft"], _B.NB48["hop"], _B.NB48["sr"]
 _win = torch.hann_window(_nfft).to(DEV); _BM = _B._bands(48, 50.0, 14000.0, _sr, _nfft)
 _fps_env = _sr / _hop
 
 
 def _benv(x):
-    """mono16 float32 → [48, Nf] band-огибающая (как _om_core, на всю дорожку)."""
-    xt = torch.from_numpy(np.ascontiguousarray(x, np.float32)).to(DEV)
-    return _B._benv(xt.unsqueeze(0), _BM, _nfft, _hop, _win)[0]
+    """mono16 float32 → [48, Nf] band envelope in HOST memory (block by block on the device, so the
+    peak is the block and not the track)."""
+    return _B.track_envelope(x, _BM, _nfft, _hop, _win)
+
+
+DESC_BATCH = 512          # centres per batch: the peak is set by the batch, never by the track
 
 
 @torch.no_grad()
 def _desc(E, hw):
-    """[48,Nf] → (дескриптор [n, 48*P], ts[c]). Окно ±hw ресэмплится в P точек, flatten. GRID=STEP."""
+    """[48,Nf] envelope in host memory → (descriptor [n, 48*P], ts[c]). The ±hw window is resampled
+    to P points and flattened. GRID=STEP. Centres go in batches, and each batch lifts only the
+    envelope span it reads — the device never holds the whole track."""
     Nf = E.shape[1]; dur = Nf / _fps_env; hwf = hw * _fps_env
     ts = np.arange(0, max(0.0, dur - 2 * hw), STEP) + hw
     if len(ts) == 0:
         return np.zeros((0, 48 * P), np.float32), ts
-    centers = torch.from_numpy(ts * _fps_env).to(DEV).float(); pp = torch.linspace(0, 1, P, device=DEV)
-    wlo = (centers - hwf).floor(); whi = (centers + hwf).floor(); Wd = (whi - wlo).clamp(min=1)
-    pos = (wlo[:, None] + pp[None, :] * (Wd[:, None] - 1)).clamp(0, Nf - 1)
-    lo = pos.floor().long(); hi = (lo + 1).clamp(max=Nf - 1); fr = (pos - lo.float())
-    Elo = E[:, lo.reshape(-1)].reshape(48, len(ts), P); Ehi = E[:, hi.reshape(-1)].reshape(48, len(ts), P)
-    seg = Elo * (1 - fr)[None] + Ehi * fr[None]
-    return seg.permute(1, 0, 2).reshape(len(ts), 48 * P).contiguous().cpu().numpy().astype(np.float32), ts
+    pp = torch.linspace(0, 1, P, device=DEV)
+    out = np.empty((len(ts), 48 * P), np.float32)
+    for b0 in range(0, len(ts), DESC_BATCH):
+        tb = ts[b0:b0 + DESC_BATCH]
+        centers = torch.from_numpy(tb * _fps_env).to(DEV).float()
+        wlo = (centers - hwf).floor(); whi = (centers + hwf).floor(); Wd = (whi - wlo).clamp(min=1)
+        pos = (wlo[:, None] + pp[None, :] * (Wd[:, None] - 1)).clamp(0, Nf - 1)
+        lo = pos.floor().long(); hi = (lo + 1).clamp(max=Nf - 1); fr = (pos - lo.float())
+        e0 = int(lo.min().item()); e1 = int(hi.max().item()) + 1
+        Eb = torch.from_numpy(E[:, e0:e1]).to(DEV)
+        Elo = Eb[:, (lo - e0).reshape(-1)].reshape(48, len(tb), P)
+        Ehi = Eb[:, (hi - e0).reshape(-1)].reshape(48, len(tb), P)
+        seg = Elo * (1 - fr)[None] + Ehi * fr[None]
+        out[b0:b0 + len(tb)] = seg.permute(1, 0, 2).reshape(len(tb), 48 * P).contiguous().cpu().numpy()
+        del centers, pos, lo, hi, fr, Eb, Elo, Ehi, seg
+    return out, ts
 
 
 def _whiten(Rr, Dr):
-    """Whiten дескрипторов по СТАТИСТИКЕ РЕФА + L2-норм (аудио cos≈0.5, нужна нормировка)."""
+    """Whitens descriptors against the REFERENCE'S STATISTICS, then L2-normalizes (audio cos ≈ 0.5, so normalization is needed)."""
     mu = Rr.mean(0, keepdims=True); sd = Rr.std(0, keepdims=True) + 1e-6
     wh = lambda o: ((o - mu) / sd) / (np.linalg.norm((o - mu) / sd, axis=1, keepdims=True) + 1e-8)
     return wh(Rr.astype(np.float64)), wh(Dr.astype(np.float64))
 
 
 def _banded_dtw(R, Dd, off, *, amerce=AMERCE, diag_prior=DIAG_PRIOR, on_prog=None):
-    """MEMORY-BOUNDED Drop-DTW (закон проекта: длительность не ограничена): полоса ±MARG вокруг ТРЕНДА
-    off, кусками CHUNK с OVERLAP. colmin по куску (аудио cos≈0.5). СИГНАЛ-АДАПТИВНЫЙ ДИАГ-ПРИОР после
-    colmin: штраф diag_prior·|откл.лага от тренда|·wsig, wsig=вес «нет матча ВОКРУГ» (сглаж. 1−colmin,
-    гейт SIG_LO/SIG_HI) — давит блуждание в слепых зонах, реальное событие свободно. -> pred[Nd] (ref-idx/-1)."""
+    """MEMORY-BOUNDED Drop-DTW (duration is not limited): a band of ±MARG around the TREND off,
+    processed in CHUNK-sized pieces with OVERLAP. colmin per piece (audio cos ≈ 0.5).
+    SIGNAL-ADAPTIVE DIAGONAL PRIOR applied after colmin: penalty diag_prior*|lag deviation from the
+    trend|*wsig, where wsig is the weight of "no match NEARBY" (smoothed 1-colmin, gated by
+    SIG_LO/SIG_HI) — it suppresses wandering in blind zones while leaving a real event free to
+    move. -> pred[Nd] (ref index or -1)."""
     N = len(Dd); Rn = len(R); pred_full = np.full(N, -2, np.int64); quality = np.full(N, -1, np.int64)
     for a in range(0, N, CHUNK - OVERLAP):
         b = min(a + CHUNK - 1, N - 1); ks = np.arange(a, b + 1); refk = ks + off[ks]
@@ -80,11 +99,11 @@ def _banded_dtw(R, Dd, off, *, amerce=AMERCE, diag_prior=DIAG_PRIOR, on_prog=Non
             if b == N - 1: break
             continue
         C = (1.0 - R[r1:r2 + 1] @ Dd[a:b + 1].T).astype(np.float64)
-        colmin = C.min(0); C -= colmin[None, :]                        # относит. лучшего матча кадра
-        if diag_prior > 0:                                            # сигнал-адаптивный приор (локальный)
+        colmin = C.min(0); C -= colmin[None, :]                        # relative to the frame's best match
+        if diag_prior > 0:                                            # signal-adaptive prior (local)
             best = 1.0 - colmin
             sm = np.convolve(best, np.ones(SIG_WIN) / SIG_WIN, "same") if len(best) > SIG_WIN else best
-            wsig = np.clip((SIG_HI - sm) / (SIG_HI - SIG_LO + 1e-9), 0.0, 1.0)   # 1=нет матча вокруг→приор ON
+            wsig = np.clip((SIG_HI - sm) / (SIG_HI - SIG_LO + 1e-9), 0.0, 1.0)   # 1 = no match nearby -> prior ON
             dev = np.arange(r1, r2 + 1)[:, None] - refk[None, :]
             C = C + diag_prior * np.abs(dev) * wsig[None, :]
         fs = (a == 0)
@@ -100,7 +119,7 @@ def _banded_dtw(R, Dd, off, *, amerce=AMERCE, diag_prior=DIAG_PRIOR, on_prog=Non
 
 
 def _aow(tr, sh, cs, T):
-    """Якоря (ref-время tr, сдвиг sh, cos cs) → (o,w) на сетке T (окно ±VIS_WIN, взвеш.медиана, agree)."""
+    """Anchors (reference time tr, shift sh, cos similarity cs) → (o,w) on grid T (window ±VIS_WIN, weighted median, agreement)."""
     order = np.argsort(tr); trs, shs, css = tr[order], sh[order], np.clip(cs[order], 0, None)
     o = np.full(len(T), np.nan); w = np.zeros(len(T))
     for i, t in enumerate(T):
@@ -123,9 +142,11 @@ def _levels(cuts, curve, T, win=8.0):
 
 
 def _roundtrip_filter(cuts, curve, T, *, ret_tol_fr=COARSE_FR, flat_fr=BAND_FINE_FR, win=8.0):
-    """Снять резы round-trip (лаг ушёл с базы и ВЕРНУЛСЯ) + выпрямить кривую. flat_fr=band ±0.7:
-    round-trip крупнее досягаемости тонкого band → кривую в БАЗУ (band его не вытянет; иначе ложный
-    ED-матч ~2с остаётся → регресс на титрах). Реальная правка = постоянная ступень (не возвращается) → выживает."""
+    """Removes round-trip cuts (a lag drifted from the base and RETURNED to it) and straightens the
+    curve. flat_fr=band's ±0.7 s: a round trip bigger than the fine band pass can reach is folded
+    back into the BASE curve (band would not stretch to it; otherwise a spurious ~2 s match on the
+    ending credits would remain and regress). A real correction is a permanent step that never
+    returns, so it survives this filter."""
     curve = np.asarray(curve, float).copy(); n = len(cuts)
     if n < 2: return list(cuts), curve
     lv = _levels(cuts, curve, T, win); keep = [True] * n
@@ -145,7 +166,7 @@ def _roundtrip_filter(cuts, curve, T, *, ret_tol_fr=COARSE_FR, flat_fr=BAND_FINE
 
 
 def _classify(cuts, tR, pred, drs, *, minfr=MINFR):
-    """резы build_curve → события: вырез (drop≥.15 и |dv|≥minfr) / вставка (hwarp≥2 и длина≥minfr)."""
+    """Turns build_curve's cuts into events: excision (drop≥.15 and |dv|≥minfr) or insertion (hwarp≥2 and length≥minfr)."""
     cutsL = []; insL = []
     for tc, dv, te, tn in cuts:
         s = int(np.searchsorted(tR, te)); e = max(int(np.searchsorted(tR, tn)), s + 1)
@@ -160,10 +181,11 @@ def _classify(cuts, tR, pred, drs, *, minfr=MINFR):
 
 
 def _detect_one(Rr, tR, Dr, tD, vspans, on_prog=None):
-    """Один масштаб: whiten → banded_dtw(diag-приор) → (o,w) → global_trend/build_curve → roundtrip → classify.
-    post-vision: тренд off=0 (поток уже уложен зрением). -> (events_cuts, events_inserts, curve[на tR], o, w)."""
+    """One scale: _whiten → _banded_dtw (diagonal prior) → (o,w) → global_trend/build_curve →
+    _roundtrip_filter → _classify. post-vision: the trend off=0 (the stream is already laid out by
+    vision). -> (events_cuts, events_inserts, curve[on tR], o, w)."""
     R, Dd = _whiten(Rr, Dr)
-    off = np.clip(np.searchsorted(tR, tD), 0, len(tR) - 1) - np.arange(len(tD))   # ≈0 (диагональ)
+    off = np.clip(np.searchsorted(tR, tD), 0, len(tR) - 1) - np.arange(len(tD))   # ~0 (diagonal)
     pred = _banded_dtw(R, Dd, off.astype(np.int64), on_prog=on_prog)
     m = pred >= 0; di = np.where(m)[0]; ri = pred[m]; trf = tR[np.clip(ri, 0, len(tR) - 1)]
     drs = (set(range(int(ri.min()), int(ri.max()) + 1)) - set(int(x) for x in ri)) if m.any() else set()
@@ -171,7 +193,7 @@ def _detect_one(Rr, tR, Dr, tD, vspans, on_prog=None):
     cos = np.array([float(Dd[di[i]] @ R[np.clip(ri[i], 0, len(R) - 1)]) for i in range(len(di))])
     T = tR.copy(); o, w = _aow(trf, sh, cos, T)
     if vspans:
-        for sa, sb in vspans: w[(T >= sa) & (T <= sb)] = 0.0       # тишина зрения → не строим якоря
+        for sa, sb in vspans: w[(T >= sa) & (T <= sb)] = 0.0       # vision silence: no anchors built there
     a, b = _global_trend(o, w, T, FPS)
     curve, cuts_all, _fill, _ores, _conf, _body = _build_curve(o, w, T, a, b)
     cuts_kept, curve = _roundtrip_filter(cuts_all, curve, T)
@@ -180,22 +202,23 @@ def _detect_one(Rr, tR, Dr, tD, vspans, on_prog=None):
 
 
 def _ref_benv(ref_mono16, ref_cache):
-    """benv РЕФА с диск-кэшем CK4 (дорогой STFT переиспользуется между дублями эпизода/запусками).
-    f32 .npy, бит-в-бит (GPU→CPU→save→load→GPU точно). Падение кэша не роняет — пересчёт."""
+    """The reference's band envelope with the CK4 on-disk cache (the expensive STFT is reused across
+    the episode's dubs and across runs). Stored as f32 .npy, bit-for-bit exact (GPU→CPU→save→load→GPU).
+    A broken cache does not fail the run — it is recomputed."""
     if ref_cache is not None:
         from pathlib import Path as _P
         p = _P(ref_cache)
         if p.exists():
             try:
-                e = torch.from_numpy(np.load(str(p))).to(DEV)
+                e = np.load(str(p))
                 _cache._a("CK4 benv реф", True, p.name)
                 return e
-            except Exception:  # noqa: BLE001 — битый кэш → пересчёт
+            except Exception:  # noqa: BLE001 -- a broken cache triggers a recompute
                 pass
         _cache._a("CK4 benv реф", False, p.name)
         E = _benv(ref_mono16)
         try:
-            p.parent.mkdir(parents=True, exist_ok=True); np.save(str(p), E.cpu().numpy().astype(np.float32))
+            p.parent.mkdir(parents=True, exist_ok=True); np.save(str(p), E.astype(np.float32))
         except Exception:  # noqa: BLE001
             pass
         return E
@@ -203,9 +226,10 @@ def _ref_benv(ref_mono16, ref_cache):
 
 
 def detect(ref_mono16, dub_mono16, *, vspans=None, ref_cache=None, on_prog=None):
-    """ПОЛНЫЙ детектор: кросс-масштаб (HW6 матчер ∩ HW18 арбитр). Вход — mono @16к (post-vision дубль + реф).
-    ref_cache (путь .npy) — CK4: кэш benv рефа (реф переиспользуется между дублями). -> dict: curve
-    (кадры, на сетке ts короткого окна), ts, o, w, events_cuts, events_inserts (подтв. кросс-масштабом)."""
+    """The FULL detector: cross-scale (HW6 matcher confirmed by the HW18 arbiter). Input is mono @16
+    kHz (post-vision dub + reference). ref_cache (a .npy path) is CK4: the cache of the reference's
+    band envelope (the reference is reused across dubs). -> dict: curve (frames, on the short
+    window's ts grid), ts, o, w, events_cuts, events_inserts (confirmed by cross-scale)."""
     Er = _ref_benv(ref_mono16, ref_cache)
     if on_prog is not None: on_prog(0.15)
     Ed = _benv(dub_mono16)
@@ -214,7 +238,7 @@ def detect(ref_mono16, dub_mono16, *, vspans=None, ref_cache=None, on_prog=None)
     cutsL, insL, curve, o, w = _detect_one(Rr6, tR6, Dr6, tD6, vspans, on_prog=part(on_prog, 0.30, 0.75))
     cand = [(t, dv, te, tn) for t, dv, te, tn in cutsL] + [(t, None, None, None) for t, ln in insL]
     conf_c, conf_i = cutsL, insL
-    if cand:                                                       # кросс-масштаб ЛЕНИВО: только при кандидатах
+    if cand:                                                       # cross-scale check runs lazily, only when candidates exist
         Rr18, tR18 = _desc(Er, HW_LONG); Dr18, tD18 = _desc(Ed, HW_LONG)
         lc, li, _cv, _o, _w = _detect_one(Rr18, tR18, Dr18, tD18, vspans, on_prog=part(on_prog, 0.75, 1.0))
         long_t = [t for t, dv, te, tn in lc] + [t for t, ln in li]

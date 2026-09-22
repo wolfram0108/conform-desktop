@@ -1,7 +1,11 @@
-"""Очередь conform — плоский реестр СЕРИЙ-задач + пул с порогом. По образцу
-core/pipeline.py (но проще): единица = серия (1 реф + список озвучек), воркер =
-conform_episode (реф декодится один раз). Состояние — источник правды, наружу
-ТОЛЬКО через API. Персист `_conform.json`; restore: оборванные running→queued.
+"""The conform queue -- a flat registry of EPISODE jobs and the dispatcher of their worker. Modeled on
+core/pipeline.py (but simpler): the unit is an episode (1 ref + a list of dubs). State is the source
+of truth, exposed to the outside ONLY through the API. Persisted to `_conform.json`; on restore, jobs
+left running become queued.
+
+The jobs themselves run in a separate process, the conform worker (conform/worker.py), which alone
+touches the GPU. The queue starts it when a job begins and lets it go when no job is running, so a
+daemon with nothing to do holds nothing on the card — a CUDA context dies only with its process.
 """
 
 from __future__ import annotations
@@ -13,53 +17,47 @@ import shutil
 import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable, Literal, Protocol
 
 from loguru import logger
-from pydantic import BaseModel, Field
+from pydantic import Field
 
-from track_muxer.conform import features, procreg
-from track_muxer.conform.episode import conform_episode
+from track_muxer.conform import procreg
 from track_muxer.conform.models import PairResult
+from track_muxer.conform.schema import ApiModel
+from track_muxer.conform.task_params import AudioMethod, DriftSpeedPct, DRIFT_SPEED_DEFAULT
 
 QUEUED = "queued"
-PAUSED = "paused"                # ждёт РУЧНОГО пуска (кнопка ▶ у строки очереди)
+PAUSED = "paused"                # waits for a manual start (the ▶ button on the queue row)
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
 CANCELLED = "cancelled"
 _TERMINAL = {DONE, FAILED, CANCELLED}
 _PERSIST = "_conform.json"
-DEFAULT_LIMIT = 1                # серии по очереди (порог меняется на лету)
+DEFAULT_LIMIT = 1                # episodes run one at a time (the threshold can change on the fly)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _pfps(s: str | None) -> float | None:
-    """fps из строки ('24000/1001', '24.0') → float; None/мусор → None (авто)."""
-    if not s:
-        return None
-    try:
-        return float(eval(str(s), {"__builtins__": {}}, {}))  # noqa: S307 — доверенный ввод
-    except Exception:  # noqa: BLE001
-        return None
+ConformStatus = Literal["queued", "paused", "running", "done", "failed", "cancelled"]
 
 
-class PlotRef(BaseModel):
-    """Ссылка на PNG-график укладки (band/muq). Файл в <out_dir>/_plots/<name>."""
+class PlotRef(ApiModel):
+    """Reference to a PNG alignment plot (band/muq). The file lives at <out_dir>/_plots/<name>."""
 
-    kind: str                       # "track" (весь трек) | "cut" (зум на рез)
-    name: str                       # имя файла png
-    t: float | None = None          # время реза, с (для kind=cut)
-    v_ms: float | None = None       # величина реза, мс (для kind=cut)
+    kind: Literal["track", "html", "cut"]   # the track picture, its interactive page; "cut" is met in stored jobs only
+    name: str                       # png file name
+    t: float | None = None          # cut time, s (for kind=cut)
+    v_ms: float | None = None       # cut size, ms (for kind=cut)
 
 
-class MediaInfo(BaseModel):
-    """Паспорт файла для показа и оценки времени (метаданные, без прохода по файлу)."""
+class MediaInfo(ApiModel):
+    """Passport of a file for display and time estimates: metadata only, the file is not read through."""
 
     duration_s: float = 0.0
     width: int = 0
@@ -69,60 +67,75 @@ class MediaInfo(BaseModel):
     has_video: bool = True
 
 
-class JobOp(BaseModel):
-    """Одна ВЫПОЛНЕННАЯ или идущая операция задачи — для показа хода работы.
+class JobOp(ApiModel):
+    """One finished or running operation of a job, for showing the course of the work.
 
-    Порядок операций детерминирован, поэтому панели достаточно знать, какие
-    из них уже пройдены и сколько заняли. `slice_i` = 0 — подготовка референса
-    (общая на всю задачу), 1..N — соответствующая аудиодорожка.
+    The order of operations is fixed, so a client only needs to know which of them are done and
+    how long they took. `slice_i` = 0 is the preparation of the reference, shared by the whole
+    job; 1..N is the matching audio track.
     """
 
-    slice_i: int                     # 0 = референс, иначе номер дорожки (1-based)
-    op: str                          # код операции: decode/extract/coarse/geom/band/resample/audio/write
-    sec: float = 0.0                 # фактическая длительность; для идущей — сколько уже идёт
-    state: str = "run"               # "run" | "done" | "failed"
+    slice_i: int                     # 0 = reference, otherwise the track number (1-based)
+    op: str                          # operation code: decode/extract/coarse/geom/band/resample/audio/write
+    sec: float = 0.0                 # actual duration; for a running operation, how long it has run so far
+    state: Literal["run", "done", "failed"] = "run"
 
 
-class DubResult(BaseModel):
-    """Паспорт одной озвучки (снимок для API)."""
+class TextTrackReport(ApiModel):
+    """What became of one text track lying next to a source."""
+
+    source: str
+    file: str | None = None          # the written file; None: nothing was written
+    cues_in: int = 0
+    cues_out: int = 0
+    dropped_drawings: int = 0
+    dropped_empty: int = 0
+    dropped_duplicates: int = 0
+    dropped_settings: int = 0
+    error: str | None = None
+
+
+class DubResult(ApiModel):
+    """Passport of one dub (a snapshot for the API)."""
 
     dub: str
+    atrack: int = 0                 # audio track of the file this result belongs to
     ok: bool = False
-    mode: str = "av"                # "av" = зрение+звук | "audio" = аудио-only (озвучка без видео)
-    skipped: bool = False           # уже было готово (файл на диске)
-    out_path: str | None = None     # путь к выходному аудиофайлу (формат — деталь записи)
-    out_size: int = 0               # размер выхода, байт (0 = файла нет / не удалось узнать)
+    mode: Literal["av", "audio"] = "av"   # vision and sound, or a dub without a video stream
+    skipped: bool = False           # already done (file present on disk)
+    out_path: str | None = None     # path to the output audio file (format is a recording detail)
+    out_size: int = 0               # output size, bytes (0 = no file / could not be read)
     assigned_pct: float = 0.0
     slope: float = 0.0
     cos_median: float = 0.0
     real_cuts: int = 0
-    filled_cuts: int = 0            # вырезов заполнено оригиналом рефа
-    edge_recovered: int = 0        # кадров возвращено доп-проходом на краях (опенинг/концовка)
-    audio_resid_ms: float = 0.0    # остаточный аудио-сдвиг ПОСЛЕ доводки (мс; меньше=лучше)
+    filled_cuts: int = 0            # excisions filled with the reference's original sound
+    edge_recovered: int = 0        # frames recovered by the extra edge pass (opening/ending)
+    audio_resid_ms: float = 0.0    # residual audio shift after the audio layer's pass (ms; lower is better)
     blind_zones: int = 0
     dropped_intro_s: float = 0.0
-    audio_cuts: int = 0            # band/muq: дискретных правок стыков (резов)
-    audio_max_step_ms: float = 0.0 # band/muq: крупнейший рез, мс
-    audio_coverage: float = 0.0    # band/muq: доля трека с надёжными якорями (0..1)
-    audio_span_ms: float = 0.0     # band/muq: диапазон движения сдвига, мс
+    audio_cuts: int = 0            # band/muq: number of discrete seam fixes (cuts)
+    audio_max_step_ms: float = 0.0 # band/muq: the largest cut, ms
+    audio_coverage: float = 0.0    # band/muq: fraction of the track with reliable anchors (0..1)
+    audio_span_ms: float = 0.0     # band/muq: range of shift movement, ms
     mirror_used: bool = False      # dub frames are horizontally mirrored; matched on mirrored features
-    geom_used: bool = False        # применена геом-коррекция (кроп/зум/анаморф/полосы) — зрение слепло без неё
-    geom_n_in: int = 0             # геом: inlier-якорей консенсуса (надёжность регистрации)
-    geom_sx: float = 0.0           # геом: масштаб по X (анаморф = sx≠sy)
-    geom_sy: float = 0.0           # геом: масштаб по Y
-    plots: list[PlotRef] = Field(default_factory=list)  # PNG-графики укладки
-    suspect: bool = False          # авто-флаг брака (cos<0.3 / назнач<90 / ошибка)
-    warnings: list[str] = Field(default_factory=list)  # предупреждения «обрати внимание» (с причинами)
+    geom_used: bool = False        # geometric correction applied (crop/zoom/anamorphic/bars) — vision was blind without it
+    geom_n_in: int = 0             # geometry: inlier anchors in the consensus (registration reliability)
+    geom_sx: float = 0.0           # geometry: X scale (anamorphic when sx≠sy)
+    geom_sy: float = 0.0           # geometry: Y scale
+    plots: list[PlotRef] = Field(default_factory=list)  # PNG alignment plots
+    suspect: bool = False          # auto-flagged as suspect (cos<0.3 / assigned<90 / error)
+    warnings: list[str] = Field(default_factory=list)  # "pay attention" warnings, with reasons
     critical: list[str] = Field(default_factory=list)  # red: output sync not trustworthy by the audio layer's result
     error: str | None = None
     elapsed_s: float = 0.0
     trace: list[dict] = Field(default_factory=list)  # decision trace of the pair (conform.trace)
-    # Sidecar subtitles carried onto the reference timeline: [{source, file, cues_in, cues_out, dropped_drawings, dropped_empty, dropped_duplicates, dropped_settings, error}].
-    text_tracks: list[dict] = Field(default_factory=list)
+    # Sidecar subtitles carried onto the reference timeline, one report per text track.
+    text_tracks: list[TextTrackReport] = Field(default_factory=list)
 
 
-class ConformJob(BaseModel):
-    """Одна серия-задача. Сериализуется в JSON (API + персист)."""
+class ConformJob(ApiModel):
+    """One episode job. Serialized to JSON (API + persistence)."""
 
     id: str
     seq: int = 0
@@ -130,34 +143,28 @@ class ConformJob(BaseModel):
     ref: str
     dubs: list[str]
     out_dir: str
-    cache_dir: str | None = None       # подкаталог кеша (<серия>/_conform_cache)
-    keep_tmp: bool = False             # tmp-чекпоинты: сохранить ВСЁ промежуточное (реф SRM + дубль
-                                       # CK1/2/3) → повтор без GPU-декода; OFF → кеш чистится после серии
-    # опции (как в align/CLI)
-    fps_ref: str | None = None
-    fps_dub: str | None = None
-    free_start: bool = True
-    fill_silence: bool = True          # «вырезы оригиналом»: тишину озвучки заполнить рефом ПОСЛЕ
-                                       # band/muq (только синхронно; при аудио off неактивно)
-    audio_band: bool = True            # ДЕФОЛТ: anchor-пайплайн, карта DSP 48 полос (GPU, без модели)
-    audio_muq: bool = False            # anchor-пайплайн, карта MuQ (GPU, опц. transformers)
-    apply_cuts: bool = True            # band/muq: применять резкую правку резов (иначе только дрейф ≤2%)
-    drift_speed_pct: float = 1.25      # band/muq: потолок скорости изменения сдвига кривой дрейфа, %/с
-    ref_atrack: int = 0                # ⭐ 5.1: аудиодорожка РЕФА (звуковой эталон band/заливки)
-    dub_atracks: list[int] | None = None   # ⭐ 5.1: дорожка каждой озвучки (параллельно dubs; None → все 0)
-    autostart: bool = True             # False → задача встаёт в PAUSED и ждёт ручного пуска
-    # состояние
-    status: str = QUEUED
-    progress: float = 0.0          # 0..1 общий
-    stage: str = ""               # decode/extract/align/geom/resample/write
-    stage_pct: float = 0.0         # 0..1 ВНУТРИ текущей фазы (для панели)
-    detail: str = ""               # живая деталь фазы (напр. "12000 кадров, 1300 к/с")
+    cache_dir: str | None = None       # cache subdirectory (<episode>/_conform_cache)
+    keep_tmp: bool = False             # tmp checkpoints: keep ALL intermediates (reference SRM + dub
+                                       # CK1/2/3) for a rerun without GPU decode; OFF clears the cache after the episode
+    # Task parameters: a choice about the method or the content of the result, never a fix for a track.
+    audio_method: AudioMethod = AudioMethod.BAND    # meter of the audio layer
+    drift_speed_pct: DriftSpeedPct = DRIFT_SPEED_DEFAULT   # how fast the laid sound may follow a drift, % per second
+    fill_silence: bool = True          # fill the silence left in the dub with the reference sound
+    ref_atrack: int = 0                # audio track of the reference (the sound standard for band/fill)
+    dub_atracks: list[int] | None = None   # audio track of each dub (parallel to dubs; None means all 0)
+    autostart: bool = True             # False: the job comes up PAUSED and waits for a manual start
+    # state
+    status: ConformStatus = QUEUED
+    progress: float = 0.0          # 0..1 overall
+    stage: str = ""               # name of the running phase: free text, for display only
+    stage_pct: float = 0.0         # 0..1 inside the current phase (for the panel)
+    detail: str = ""               # live detail of the phase (e.g. "12000 frames, 1300 fps")
     dub_index: int = 0
     dub_total: int = 0
     cur_dub: str = ""
-    ref_info: MediaInfo | None = None                # паспорт референса (для шапки и прогноза)
-    dub_infos: list[MediaInfo] = Field(default_factory=list)   # паспорта исходных файлов
-    ops: list[JobOp] = Field(default_factory=list)   # журнал операций: что пройдено и за сколько
+    ref_info: MediaInfo | None = None                # reference passport (for the header and the estimate)
+    dub_infos: list[MediaInfo] = Field(default_factory=list)   # source file passports
+    ops: list[JobOp] = Field(default_factory=list)   # operation log: what ran and how long it took
     results: list[DubResult] = Field(default_factory=list)
     error: str | None = None
     elapsed_s: float = 0.0
@@ -181,19 +188,18 @@ def _dir_size(p: Path) -> int:
 
 
 def _purge_tmp(job: ConformJob) -> int:
-    """Удалить временные файлы завершённой задачи. Возврат: освобождено байт.
+    """Remove the temporary files of a finished job. Returns: bytes freed.
 
-    Что удаляем: кеш серии (CK1/CK2/CK3-чекпоинты, гигабайты) и наши каталоги
-    `_tmp` рядом с исходниками (memmap-раскладки декода). Что НЕ трогаем НИКОГДА:
-    выходной каталог задачи с аудиофайлами и `_plots` — прямое требование
-    пользователя. При отмене штатная чистка `conform_episode` не отрабатывает
-    (серия прервана) — этот проход её и заменяет.
+    Removes: the episode's cache (CK1/CK2/CK3 checkpoints, gigabytes) and this job's own `_tmp`
+    directories next to the sources (memmap decode layouts). NEVER touched: the job's output
+    directory with the audio files and `_plots`. On cancel, `conform_episode`'s regular cleanup does
+    not run (the episode was interrupted), so this pass replaces it.
     """
     out = Path(job.out_dir)
     targets: list[Path] = []
     if job.cache_dir:
         targets.append(Path(job.cache_dir))
-    targets.append(Path(job.ref).parent / "_conform_cache")     # дефолтная раскладка серии
+    targets.append(Path(job.ref).parent / "_conform_cache")     # default episode cache layout
     for src in [job.ref, *job.dubs]:
         targets.append(Path(src).parent / "_tmp")
 
@@ -206,7 +212,7 @@ def _purge_tmp(job: ConformJob) -> int:
         seen.add(key)
         if not t.is_dir():
             continue
-        if _is_inside(out, t) or t.resolve() == out.resolve():   # защита результатов
+        if _is_inside(out, t) or t.resolve() == out.resolve():   # protect the results
             logger.warning("conform purge: пропуск {} — внутри выходного каталога", t)
             continue
         size = _dir_size(t)
@@ -217,33 +223,180 @@ def _purge_tmp(job: ConformJob) -> int:
     return freed
 
 
-def _suspect(r: PairResult) -> bool:
-    if r.skipped:                      # готовое не пересчитывали — не оцениваем как брак
+def suspect(r: PairResult) -> bool:
+    if r.skipped:                      # a job already done was not recomputed — don't flag it as suspect
         return False
     if getattr(r, "mode", "av") == "audio":
-        # аудио-only: полей зрения (cos/assigned) нет по построению — судим по слуху:
-        # покрытие якорями и остаток доводки (главный критерий ±80мс).
+        # audio-only: vision fields (cos/assigned) don't exist by design — judge by hearing:
+        # anchor coverage and the audio layer's residual shift (the main criterion is ±80 ms).
         return (not r.ok) or r.audio_coverage < 0.5 or abs(r.audio_resid_ms) > 80.0
     return (not r.ok) or r.cos_median < 0.30 or r.assigned_pct < 90.0
 
 
-class ConformQueue:
-    """Реестр серий-задач + один пул. Потокобезопасен (RLock). Параллелизм режет
-    диспетчер по порогу `_limit` (меняется на лету), не размер пула."""
+class Feed(Protocol):
+    """Where the queue tells what happens to its jobs. The application supplies it; the queue
+    calls sync() wherever it persists the jobs and progress() while a job runs."""
 
-    def __init__(self, output_dir: Path, limit: int = DEFAULT_LIMIT) -> None:
+    def sync(self, items: list[dict]) -> None: ...
+
+    def progress(self, item_id: str, fields: dict) -> None: ...
+
+
+class _NoFeed:
+    """Nobody listens: the queue used on its own."""
+
+    def sync(self, items: list[dict]) -> None:
+        pass
+
+    def progress(self, item_id: str, fields: dict) -> None:
+        pass
+
+
+class _Worker:
+    """The daemon's end of one conform worker process (conform/worker.py).
+
+    A reader thread takes the worker's events off the pipe and hands them to the queue; when the pipe
+    ends, the worker is gone, and the queue hears it as an event too. The worker's live subprocesses
+    are kept on record here with their start marks: a worker that dies leaves them running in their
+    own sessions, and this record is the only way left to stop them."""
+
+    # Guards, not synchronisation. A worker told to retire has no job left and exits in seconds
+    # (the CUDA teardown); one still alive this long after the retire is stuck, and is killed.
+    RETIRE_GRACE_S = 60.0
+    # Once its pipe has ended a worker is exiting anyway; this long is how long its exit code is
+    # awaited before the process is killed and reported with whatever code it has.
+    GONE_GRACE_S = 5.0
+
+    def __init__(self, on_event: Callable, on_gone: Callable) -> None:
+        import multiprocessing as mp
+
+        from track_muxer.conform import worker
+
+        ctx = mp.get_context("spawn")          # never fork a threaded daemon
+        self._conn, child = ctx.Pipe(duplex=True)
+        self.proc = ctx.Process(target=worker.serve, args=(child,), name="conform-worker", daemon=True)
+        self.proc.start()
+        child.close()                           # only the worker holds it now: its exit ends the pipe
+        self.retired = False
+        self.jobs: set[str] = set()             # runs sent here that have not reported an outcome
+        self.procs: dict[int, int | None] = {}  # live subprocess pid -> its start mark
+        # Set by the reader once it has waited the process out. Only the reader waits on the process:
+        # two threads reaping one child race for its status, and the loser reads no exit code.
+        self._gone = threading.Event()
+        self._ended = threading.Event()         # the pipe has ended: the worker is dead or leaving
+        self._send_lock = threading.Lock()
+        threading.Thread(target=self._read, args=(on_event, on_gone), daemon=True,
+                         name="conform-link").start()
+
+    def send(self, msg: tuple) -> None:
+        with self._send_lock:
+            try:
+                self._conn.send(msg)
+            except (OSError, EOFError):         # a dead worker is reported by the reader, not here
+                pass
+
+    def alive(self) -> bool:
+        """Whether runs may still go here. Judged by the pipe, not by asking the process: asking reaps
+        a child from this thread, and the reader then finds no exit status to report."""
+        return not self._ended.is_set()
+
+    def retire(self) -> None:
+        """Tell the worker to leave. The guard counts from here, not from the end of the pipe: a
+        worker that hangs before it closes the pipe would otherwise never be caught."""
+        self.retired = True
+        self.send(("retire",))
+        threading.Thread(target=self._guard_retire, daemon=True, name="conform-retire").start()
+
+    def _guard_retire(self) -> None:
+        if not self._gone.wait(self.RETIRE_GRACE_S):
+            logger.error("conform: исполнитель pid {} не вышел за {:.0f} с после retire — убит",
+                         self.proc.pid, self.RETIRE_GRACE_S)
+            self.proc.kill()
+
+    def kill(self) -> None:
+        if self.proc.is_alive():
+            self.proc.kill()
+
+    def kill_orphans(self) -> int:
+        """Kill the subprocesses the worker left behind; a pid since given to another process is spared."""
+        n = sum(procreg.kill_pid(pid, mark) for pid, mark in list(self.procs.items()))
+        self.procs.clear()
+        return n
+
+    def _read(self, on_event: Callable, on_gone: Callable) -> None:
+        from track_muxer.conform.worker import EVENTS
+
+        while True:
+            try:
+                msg = self._conn.recv()
+            except (EOFError, OSError):
+                self._ended.set()
+                break
+            if not isinstance(msg, tuple) or not msg or msg[0] not in EVENTS:
+                logger.error("conform: неизвестное событие исполнителя {!r}", msg)   # the catalogue is the contract
+                continue
+            if msg[0] == "proc":
+                _, pid, alive, mark = msg
+                if alive:
+                    self.procs[pid] = mark
+                else:
+                    self.procs.pop(pid, None)
+                continue
+            # A handler that fails must not end this thread: the pipe would go unread, the worker
+            # would block on a full pipe holding the card, and no run would ever report an outcome.
+            try:
+                on_event(self, msg)
+            except Exception:  # noqa: BLE001
+                logger.exception("conform: событие исполнителя {!r} не обработано", msg[0])
+        if not self.retired:
+            self.proc.join(self.GONE_GRACE_S)
+        if self.proc.is_alive() and not self.retired:
+            logger.error("conform: исполнитель pid {} закрыл канал, но не вышел — убит", self.proc.pid)
+            self.proc.kill()
+        self.proc.join()                        # after a retire the guard thread bounds this wait
+        self._gone.set()
+        try:
+            on_gone(self, self.proc.exitcode)   # None only if another reaper took the status first
+        except Exception:  # noqa: BLE001
+            logger.exception("conform: уход исполнителя pid {} не обработан", self.proc.pid)
+
+
+def _code(exitcode: int | None) -> str:
+    return "код не получен" if exitcode is None else f"код {exitcode}"
+
+
+class _Clock:
+    """When a running job started, and when its current operation began (daemon time)."""
+
+    def __init__(self) -> None:
+        self.t0 = time.perf_counter()
+        self.op_t0 = self.t0
+
+
+class ConformQueue:
+    """Registry of episode jobs plus the dispatcher of their worker. Thread-safe (RLock).
+    Concurrency is capped by the `_limit` threshold (changeable on the fly)."""
+
+    def __init__(self, output_dir: Path, limit: int = DEFAULT_LIMIT,
+                 feed: Feed | None = None, spawn: Callable | None = None) -> None:
         self.output_dir = Path(output_dir)
+        self.feed: Feed = feed if feed is not None else _NoFeed()
         self.path = self.output_dir / _PERSIST
         self._lock = threading.RLock()
         self._items: dict[str, ConformJob] = {}
-        self._stops: dict[str, threading.Event] = {}
-        self._groups: dict[str, procreg.ProcGroup] = {}   # живые подпроцессы задач (надёжная отмена)
+        # A run is one attempt of a job in the worker. Cancel-then-retry puts two runs of one job in
+        # flight; events are applied to the job only when they come from its current run.
+        self._runs = itertools.count(1)
+        self._run_of: dict[str, str] = {}       # job id -> its current run id
+        self._job_of: dict[str, str] = {}       # run id -> job id, while the run is in flight
+        self._clocks: dict[str, _Clock] = {}    # run id -> its clock
         self._limit = limit
         self._active = 0
         self._counter = itertools.count(1)
-        self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="conform")
+        self._spawn = spawn or _Worker          # a test hands in a worker of its own
+        self._worker = None                     # the live worker; None while no job runs
 
-    # ── публичный API ──
+    # -- public API --
 
     def enqueue(self, spec: dict) -> ConformJob:
         with self._lock:
@@ -253,7 +406,6 @@ class ConformQueue:
             if not job.autostart:
                 job.status = PAUSED
             self._items[job.id] = job
-            self._stops[job.id] = threading.Event()
             self._persist_locked()
             self._pump_locked()
             return job.model_copy(deep=True)
@@ -268,33 +420,25 @@ class ConformQueue:
             return j.model_copy(deep=True) if j else None
 
     def cancel(self, jid: str) -> bool:
-        """Отмена задачи. Для RUNNING — НАДЁЖНАЯ: помимо стоп-флага (проверяется между
-        этапами) немедленно убивает дерево живых подпроцессов задачи, иначе длинный
-        ffmpeg-декод доработал бы до конца. Для терминальной — удаление записи."""
-        group = None
+        """Cancel a job. For RUNNING, this is RELIABLE: the worker raises the job's stop flag
+        (checked between stages) and kills its subprocesses at once, otherwise a long ffmpeg decode
+        would run to completion. For a terminal job, this removes its record."""
         with self._lock:
             j = self._items.get(jid)
             if j is None:
                 return False
             if j.status in _TERMINAL:
                 self._items.pop(jid, None)
-                self._stops.pop(jid, None)
-                self._groups.pop(jid, None)
             else:
-                ev = self._stops.get(jid)
-                if ev is not None:
-                    ev.set()
-                group = self._groups.get(jid)
+                rid = self._run_of.get(jid)
+                if j.status == RUNNING and rid is not None and self._worker is not None:
+                    self._worker.send(("stop", rid))
                 self._set(j, CANCELLED)
             self._persist_locked()
-        if group is not None:                     # kill вне блокировки (ждёт смерти процессов)
-            n = group.kill_all()
-            if n:
-                logger.info("conform {}: отмена — убито процессов: {}", jid, n)
         return True
 
     def pause(self, jid: str) -> bool:
-        """QUEUED → PAUSED (задача ждёт ручного пуска). Running не трогаем — для него отмена."""
+        """QUEUED -> PAUSED (the job waits for a manual start). RUNNING is left untouched -- for that, use cancel."""
         with self._lock:
             j = self._items.get(jid)
             if j is None or j.status != QUEUED:
@@ -304,7 +448,7 @@ class ConformQueue:
         return True
 
     def start(self, jid: str) -> bool:
-        """PAUSED → QUEUED + попытка немедленного запуска (кнопка ▶ у строки)."""
+        """PAUSED -> QUEUED, then an immediate attempt to start (the ▶ button on the queue row)."""
         with self._lock:
             j = self._items.get(jid)
             if j is None or j.status != PAUSED:
@@ -315,34 +459,29 @@ class ConformQueue:
         return True
 
     def shutdown(self) -> int:
-        """Завершение работы приложения: остановить ВСЕ активные задачи и убить их
-        подпроцессы. Без этого закрытие окна оставляет ffmpeg-сирот, продолжающих
-        писать файлы. Возврат: сколько процессов убито."""
+        """Application shutdown: stop ALL active jobs, the worker and its subprocesses. Without this,
+        closing the window leaves orphaned ffmpeg processes that keep writing files. Returns: how
+        many processes were killed."""
         with self._lock:
-            groups = list(self._groups.values())
-            for ev in self._stops.values():
-                ev.set()
             for j in self._items.values():
                 if j.status == RUNNING:
                     self._set(j, CANCELLED)
             self._persist_locked()
-        killed = 0
-        for g in groups:
-            killed += g.kill_all()
-        if killed:
-            logger.info("conform shutdown: убито процессов: {}", killed)
+            w, self._worker = self._worker, None
+        if w is None:
+            return 0
+        w.kill()
+        killed = 1 + w.kill_orphans()
+        logger.info("conform shutdown: убито процессов: {}", killed)
         return killed
 
     def clear_done(self) -> dict:
-        """Убрать ЗАВЕРШЁННЫЕ задачи из очереди И удалить их временные файлы.
-        Выходные аудиофайлы и графики (_plots) НЕ трогаются — решение пользователя
-        2026-08-06. Активные задачи не задеваются."""
+        """Remove FINISHED jobs from the queue AND delete their temporary files. Output audio files
+        and plots (_plots) are NEVER touched. Active jobs are left untouched."""
         with self._lock:
             gone = [j.model_copy(deep=True) for j in self._items.values() if j.status in _TERMINAL]
             for j in gone:
                 self._items.pop(j.id, None)
-                self._stops.pop(j.id, None)
-                self._groups.pop(j.id, None)
             self._persist_locked()
         freed = 0
         for j in gone:
@@ -362,22 +501,22 @@ class ConformQueue:
             j.dub_index = 0
             j.cur_dub = ""
             j.elapsed_s = 0.0
-            self._stops[jid] = threading.Event()
             self._set(j, QUEUED)
             self._persist_locked()
             self._pump_locked()
         return True
 
     def clear(self) -> int:
-        """Остановить ВСЕ задачи и удалить ВСЕ записи очереди. Возврат: сколько удалено.
-        Running-воркеры получают сигнал стоп (по should_stop между озвучками/при декоде),
-        их финальный блок увидит пустой реестр и просто свернётся."""
+        """Stop ALL jobs and delete ALL queue records. Returns: how many were removed. Running jobs
+        are stopped in the worker; their outcomes find an empty registry and are simply dropped."""
         with self._lock:
             n = len(self._items)
-            for ev in self._stops.values():
-                ev.set()
+            if self._worker is not None:
+                for j in self._items.values():
+                    rid = self._run_of.get(j.id)
+                    if j.status == RUNNING and rid is not None:
+                        self._worker.send(("stop", rid))
             self._items.clear()
-            self._stops.clear()
             self._persist_locked()
         return n
 
@@ -393,7 +532,7 @@ class ConformQueue:
             self._pump_locked()
             return {"limit": self._limit, "active": self._active}
 
-    # ── диспетчер ──
+    # -- dispatcher --
 
     def _pump_locked(self) -> None:
         while self._active < self._limit:
@@ -403,8 +542,27 @@ class ConformQueue:
             self._set(nxt, RUNNING)
             nxt.progress = 0.0
             self._active += 1
-            self._stops.setdefault(nxt.id, threading.Event())
-            self._pool.submit(self._run, nxt.id)
+            if self._worker is None or not self._worker.alive():
+                # A worker that died has not been reported yet: its own end fails its runs; a new
+                # run goes to a new worker rather than into a dead pipe.
+                self._worker = self._spawn(self._on_event, self._on_gone)
+            rid = f"{nxt.id}.{next(self._runs)}"
+            self._run_of[nxt.id] = rid
+            self._job_of[rid] = nxt.id
+            self._clocks[rid] = _Clock()
+            self._worker.jobs.add(rid)
+            self._worker.send(("run", rid, nxt.model_dump(mode="json")))
+        self._publish_locked()      # a start is a change of state even when nothing is written to disk
+
+    def _retire_if_idle_locked(self) -> None:
+        """No job is running: the worker leaves, and the GPU goes back to the driver with it. Decided
+        under the same lock that starts jobs, so a `run` never reaches a worker on its way out."""
+        if self._active == 0 and self._worker is not None:
+            w, self._worker = self._worker, None
+            w.retire()
+
+    def _publish_locked(self) -> None:
+        self.feed.sync([j.model_dump(mode="json") for j in self._items.values()])
 
     def _next(self, status: str) -> ConformJob | None:
         c = [j for j in self._items.values() if j.status == status]
@@ -415,175 +573,171 @@ class ConformQueue:
         job.status = status
         job.updated_at = _now()
 
-    # ── воркер (вне _lock; состояние трогаем под _lock) ──
+    # -- the worker's events (from its reader thread; state is touched only under _lock) --
 
-    def _run(self, jid: str) -> None:
-        with self._lock:
-            j = self._items.get(jid)
-            if j is None or j.status != RUNNING:
-                self._active = max(0, self._active - 1)
-                self._pump_locked()
-                return
-            spec = j.model_copy(deep=True)
-            stop = self._stops.get(jid)
-            group = procreg.ProcGroup()          # реестр подпроцессов ЭТОЙ задачи
-            self._groups[jid] = group
-        procreg.bind(group)                      # потоко-локально: чужие задачи не задеты
+    def _current(self, rid: str) -> tuple[str | None, ConformJob | None]:
+        """The job a run belongs to, and the job itself only while this run is its current one."""
+        jid = self._job_of.get(rid)
+        if jid is None or self._run_of.get(jid) != rid:
+            return jid, None
+        return jid, self._items.get(jid)
 
-        op_t0 = [time.perf_counter()]      # момент начала текущей операции
-
-        def _op_mark(jj: ConformJob, slice_i: int, op: str) -> None:
-            """Отметить, какая операция идёт сейчас, и закрыть предыдущую по времени.
-
-            Панель показывает имя, состояние и длительность КАЖДОЙ операции; вывести
-            их постфактум неоткуда — фиксируем по ходу, на переходах.
-            """
-            if not op:
-                return
-            now = time.perf_counter()
-            last = jj.ops[-1] if jj.ops else None
-            if last is not None and last.slice_i == slice_i and last.op == op:
-                last.sec = now - op_t0[0]          # та же операция — уточняем, сколько идёт
-                return
-            if last is not None:
-                last.sec = now - op_t0[0]
-                if last.state == "run":
-                    last.state = "done"
-            op_t0[0] = now
-            jj.ops.append(JobOp(slice_i=slice_i, op=op))
-
-        def progress(p) -> None:
+    def _on_event(self, w, msg: tuple) -> None:
+        kind, rid = msg[0], msg[1]
+        if kind == "progress":
+            self._on_progress(rid, msg[2])
+        elif kind == "pair":
+            self._on_pair(rid, msg[2])
+        elif kind == "infos":
             with self._lock:
-                jj = self._items.get(jid)
-                if jj is None:
-                    return
-                _op_mark(jj, p.dub_index, p.stage)
-                jj.stage = p.stage
-                jj.stage_pct = p.pct
-                jj.detail = p.detail
-                jj.dub_index = p.dub_index
-                jj.dub_total = p.dub_total
-                jj.cur_dub = p.dub_name
-                # Полоса = (реф + dub_total) РАВНЫХ долей по 1/(N+1). Доля 0 — реф; доли 1..N —
-                # озвучки. Внутри доли — УПОРЯДОЧЕННЫЕ диапазоны этапов В ПОРЯДКЕ ВЫПОЛНЕНИЯ
-                # (монотонно, без дыр, без скачков назад). Каждый этап: intra = lo + (hi−lo)·pct;
-                # все этапы эмитят pct плавно (бэкенды инструментированы по итерациям циклов).
-                # geom — между coarse и band (если зрение слепло; иначе диапазон пропускается ВПЕРЁД).
-                slices = jj.dub_total + 1
-                if p.dub_index == 0:                  # РЕФ: декод видео + извлечение аудио
-                    lo, hi = {"decode": (0.0, 0.85), "extract": (0.85, 1.0)}.get(p.stage, (0.0, 0.85))
-                else:                                 # ОЗВУЧКА: этапы по порядку (decode доминирует)
-                    lo, hi = {"decode":   (0.00, 0.52),   # SRM дубля (по кадрам)
-                              "coarse":   (0.52, 0.55),   # грубый проход
-                              "geom":     (0.55, 0.62),   # геом-разбор (кроп/зум/полосы)
-                              "band":     (0.62, 0.78),   # полоса Drop-DTW (по чанкам)
-                              "extract":  (0.78, 0.88),   # декод аудио дубля (по кадрам)
-                              "resample": (0.88, 0.93),   # ресэмпл/варп (по блокам)
-                              "audio":    (0.93, 0.97),   # доводка band/muq
-                              "write":    (0.97, 1.00)}.get(p.stage, (0.62, 0.78))
-                intra = lo + (hi - lo) * min(1.0, max(0.0, p.pct))
-                jj.progress = min(0.999, (p.dub_index + intra) / slices)
-                jj.elapsed_s = time.perf_counter() - t0   # растёт ПО ХОДУ, а не только в финале
-                jj.updated_at = _now()
-
-        def on_pair(res: PairResult) -> None:
-            if res.ok:
-                logger.info("conform {} озвучка {} готова: назначено {:.1f}%, остаток {:.1f} мс, "
-                            "покрытие {:.3f}, выход {}", jid, res.dub, res.assigned_pct,
-                            res.audio_resid_ms, res.audio_coverage, res.out_path)
-            else:
-                logger.error("conform {} озвучка {} НЕ удалась: {}", jid, res.dub,
-                             res.error or "без сообщения")
-            with self._lock:
-                jj = self._items.get(jid)
-                if jj is None:
-                    return
-                if jj.ops:                      # дорожка закончилась — закрыть её последнюю операцию
-                    jj.ops[-1].sec = time.perf_counter() - op_t0[0]
-                    jj.ops[-1].state = "done" if res.ok else "failed"
-                    op_t0[0] = time.perf_counter()
-                try:
-                    out_size = res.out_path.stat().st_size if res.out_path else 0
-                except OSError:
-                    out_size = 0
-                jj.results.append(DubResult(
-                    dub=res.dub, ok=res.ok, mode=getattr(res, "mode", "av"), skipped=res.skipped,
-                    out_path=(str(res.out_path) if res.out_path else None), out_size=out_size,
-                    assigned_pct=res.assigned_pct, slope=res.slope, cos_median=res.cos_median,
-                    real_cuts=len(res.real_cuts), filled_cuts=res.filled_cuts,
-                    edge_recovered=res.edge_recovered, audio_resid_ms=res.audio_resid_ms,
-                    blind_zones=res.blind_zones,
-                    dropped_intro_s=res.dropped_intro_s,
-                    audio_cuts=res.audio_cuts, audio_max_step_ms=res.audio_max_step_ms,
-                    audio_coverage=res.audio_coverage, audio_span_ms=res.audio_span_ms,
-                    mirror_used=res.mirror_used, geom_used=res.geom_used, geom_n_in=res.geom_n_in,
-                    geom_sx=res.geom_sx, geom_sy=res.geom_sy,
-                    plots=[PlotRef(**p) for p in res.plots],
-                    suspect=_suspect(res),
-                    warnings=res.warnings, critical=res.critical,
-                    error=res.error, elapsed_s=res.elapsed_s, trace=list(res.trace),
-                    text_tracks=list(res.text_tracks)))
-                # +1 доля — реф (slices = dub_total + 1): после k готовых озвучек → (k+1)/(N+1)
-                jj.progress = min(0.999, (len(jj.results) + 1) / (jj.dub_total + 1))
-                jj.updated_at = _now()
-                self._persist_locked()
-
-        def should_stop() -> bool:
-            return stop is not None and stop.is_set()
-
-        status, err = DONE, None
-        t0 = time.perf_counter()
-        logger.info("conform {} старт: реф={} озвучек={} выход={}",
-                    jid, Path(spec.ref).name, len(spec.dubs), spec.out_dir)
-        # Паспорта файлов — по метаданным, до начала работы: панель показывает, с чем
-        # работаем, и оценивает остаток (нормативы привязаны к минутам и гигапикселям).
-        try:
-            infos = [features.probe_media_info(Path(p)) for p in [spec.ref, *spec.dubs]]
-            with self._lock:
-                jj = self._items.get(jid)
+                _, jj = self._current(rid)
                 if jj is not None:
-                    jj.ref_info = MediaInfo(**infos[0]) if infos[0] else None
-                    jj.dub_infos = [MediaInfo(**i) if i else MediaInfo() for i in infos[1:]]
-        except Exception as e:  # noqa: BLE001 — сведения для показа, работу не блокируют
-            logger.warning("conform {}: не удалось прочитать паспорта файлов: {}", jid, e)
-        try:
-            conform_episode(
-                spec.ref, spec.dubs, spec.out_dir,
-                cache_dir=spec.cache_dir,
-                keep_tmp=spec.keep_tmp,             # tmp-чекпоинты: всё промежуточное (реф+дубль)
-                low_mem=True,                       # 3.1: фичи через memmap — RAM не растёт с длиной
-                fps_ref=_pfps(spec.fps_ref), fps_dub=_pfps(spec.fps_dub),
-                free_start=spec.free_start, fill_silence=spec.fill_silence,
-                audio_band=spec.audio_band, audio_muq=spec.audio_muq,
-                apply_cuts=spec.apply_cuts,
-                drift_speed_pct=spec.drift_speed_pct,
-                ref_atrack=spec.ref_atrack, dub_atracks=spec.dub_atracks,
-                progress=progress, should_stop=should_stop, on_pair=on_pair)
-        except Exception as e:  # noqa: BLE001
-            status, err = FAILED, str(e)
-            logger.exception("conform job {} упал", jid)
+                    try:
+                        infos = msg[2]
+                        jj.ref_info = MediaInfo(**infos[0]) if infos[0] else None
+                        jj.dub_infos = [MediaInfo(**i) if i else MediaInfo() for i in infos[1:]]
+                    except Exception as e:  # noqa: BLE001 — display only, it must not cost the run
+                        logger.warning("conform {}: паспорта файлов не приняты: {}", jj.id, e)
+        elif kind == "finished":
+            self._on_finished(w, rid, msg[2], msg[3])
 
-        procreg.bind(None)
+    def _op_mark(self, jj: ConformJob, clock: _Clock, slice_i: int, op: str) -> None:
+        """Mark which operation is running now, and close out the previous one's timing.
+
+        The panel shows the name, state, and duration of EVERY operation; there is no way to
+        produce them after the fact, so they are recorded as they happen, at each transition.
+        """
+        if not op:
+            return
+        now = time.perf_counter()
+        last = jj.ops[-1] if jj.ops else None
+        if last is not None and last.slice_i == slice_i and last.op == op:
+            last.sec = now - clock.op_t0          # same operation — update how long it has run
+            return
+        if last is not None:
+            last.sec = now - clock.op_t0
+            if last.state == "run":
+                last.state = "done"
+        clock.op_t0 = now
+        jj.ops.append(JobOp(slice_i=slice_i, op=op))
+
+    def _on_progress(self, rid: str, p: dict) -> None:
         with self._lock:
-            self._groups.pop(jid, None)
-            jj = self._items.get(jid)
-            if jj is not None and jj.status == RUNNING:   # не перетирать CANCELLED
+            jid, jj = self._current(rid)
+            clock = self._clocks.get(rid)
+            if jj is None or clock is None:
+                return
+            stage, pct, dub_index = p["stage"], p["pct"], p["dub_index"]
+            self._op_mark(jj, clock, dub_index, stage)
+            jj.stage = stage
+            jj.stage_pct = pct
+            jj.detail = p["detail"]
+            jj.dub_index = dub_index
+            jj.dub_total = p["dub_total"]
+            jj.cur_dub = p["dub_name"]
+            # The bar = (reference + dub_total) EQUAL shares of 1/(N+1). Share 0 is the reference;
+            # shares 1..N are the dubs. Inside a share, the stage ranges are ORDERED by EXECUTION
+            # ORDER (monotonic, no gaps, no steps back). Per stage: intra = lo + (hi-lo)*pct; every
+            # stage emits pct smoothly (backends are instrumented per loop iteration). geom sits
+            # between coarse and band (when vision went blind; otherwise the range is skipped FORWARD).
+            slices = jj.dub_total + 1
+            if dub_index == 0:                    # reference: video decode + audio extraction
+                lo, hi = {"decode": (0.0, 0.85), "extract": (0.85, 1.0)}.get(stage, (0.0, 0.85))
+            else:                                 # dub: stages in order (decode dominates)
+                lo, hi = {"decode":   (0.00, 0.52),   # dub SRM (per frame)
+                          "coarse":   (0.52, 0.55),   # coarse pass
+                          "geom":     (0.55, 0.62),   # geometry analysis (crop/zoom/bars)
+                          "band":     (0.62, 0.78),   # Drop-DTW band (per chunk)
+                          "extract":  (0.78, 0.88),   # dub audio decode (per frame)
+                          "resample": (0.88, 0.93),   # resample/warp (per block)
+                          "audio":    (0.93, 0.97),   # audio layer's pass
+                          "write":    (0.97, 1.00)}.get(stage, (0.62, 0.78))
+            intra = lo + (hi - lo) * min(1.0, max(0.0, pct))
+            jj.progress = min(0.999, (dub_index + intra) / slices)
+            jj.elapsed_s = time.perf_counter() - clock.t0   # grows as it runs, not only at the end
+            jj.updated_at = _now()
+            self.feed.progress(jid, {
+                "status": jj.status, "progress": jj.progress, "stage": jj.stage,
+                "stage_pct": jj.stage_pct, "detail": jj.detail, "dub_index": jj.dub_index,
+                "dub_total": jj.dub_total, "cur_dub": jj.cur_dub, "elapsed_s": jj.elapsed_s,
+                "ops": [op.model_dump(mode="json") for op in jj.ops]})
+
+    def _on_pair(self, rid: str, result: dict) -> None:
+        with self._lock:
+            _, jj = self._current(rid)
+            clock = self._clocks.get(rid)
+            if jj is None:
+                return
+            res = DubResult(**result)
+            if jj.ops and clock is not None:      # the track finished — close its last operation
+                jj.ops[-1].sec = time.perf_counter() - clock.op_t0
+                jj.ops[-1].state = "done" if res.ok else "failed"
+                clock.op_t0 = time.perf_counter()
+            jj.results.append(res)
+            # +1 share for the reference (slices = dub_total + 1): after k finished dubs -> (k+1)/(N+1)
+            jj.progress = min(0.999, (len(jj.results) + 1) / (jj.dub_total + 1))
+            jj.updated_at = _now()
+            self._persist_locked()
+
+    def _end_run_locked(self, rid: str) -> tuple[_Clock | None, ConformJob | None]:
+        """Forget a run that has ended. -> its clock, and its job if the run was the job's current one."""
+        _, jj = self._current(rid)
+        jid = self._job_of.pop(rid, None)
+        if jid is not None and self._run_of.get(jid) == rid:
+            del self._run_of[jid]
+        return self._clocks.pop(rid, None), jj
+
+    def _on_finished(self, w, rid: str, status: str, err: str | None) -> None:
+        with self._lock:
+            w.jobs.discard(rid)
+            clock, jj = self._end_run_locked(rid)
+            if jj is not None and jj.status == RUNNING:   # don't overwrite CANCELLED
                 jj.error = err
-                jj.elapsed_s = time.perf_counter() - t0
-                self._set(jj, status)
+                if clock is not None:
+                    jj.elapsed_s = time.perf_counter() - clock.t0
+                self._set(jj, DONE if status == DONE else FAILED)
                 if status == DONE:
                     jj.progress = 1.0
             self._active = max(0, self._active - 1)
             self._persist_locked()
             self._pump_locked()
+            self._retire_if_idle_locked()
 
-    # ── персист / restore ──
+    def _on_gone(self, w, exitcode: int | None) -> None:
+        """The worker's process ended. After a retire that is the plan; with jobs still on it, it
+        died, and each of them fails with the reason instead of hanging as RUNNING."""
+        orphans = w.kill_orphans()
+        with self._lock:
+            lost = sorted(w.jobs)
+            w.jobs.clear()
+            for rid in lost:
+                _, jj = self._end_run_locked(rid)
+                if jj is not None and jj.status == RUNNING:
+                    jj.error = f"процесс conform завершился аварийно ({_code(exitcode)})"
+                    self._set(jj, FAILED)
+            self._active = max(0, self._active - len(lost))
+            if self._worker is w:
+                self._worker = None
+            if lost:
+                self._persist_locked()
+                self._pump_locked()
+                self._retire_if_idle_locked()
+        if lost:
+            logger.error("conform: исполнитель pid {} погиб ({}), задания провалены: {}; "
+                         "убито осиротевших процессов: {}", w.proc.pid, _code(exitcode), ", ".join(lost), orphans)
+        else:
+            logger.info("conform: исполнитель pid {} завершён ({}) — видеопамять возвращена "
+                        "драйверу{}", w.proc.pid, _code(exitcode),
+                        f"; убито осиротевших процессов: {orphans}" if orphans else "")
+
+    # -- persist / restore --
 
     def _persist_locked(self) -> None:
         try:
             self.output_dir.mkdir(parents=True, exist_ok=True)
             payload = {"items": [j.model_dump(mode="json") for j in self._items.values()],
                        "limit": self._limit, "updated_at": _now()}
+            self.feed.sync(payload["items"])
             fd, tmp = tempfile.mkstemp(prefix="_conform.", suffix=".tmp", dir=str(self.output_dir))
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -604,10 +758,13 @@ class ConformQueue:
             maxseq = 0
             for d in data.get("items") or []:
                 try:
+                    # A job stored with the former pair of switches keeps the user's choice of meter.
+                    if "audio_method" not in d and d.get("audio_muq"):
+                        d["audio_method"] = "muq"
                     job = ConformJob(**d)
                 except Exception:  # noqa: BLE001
                     continue
-                if job.status == RUNNING:              # оборвано рестартом → переиграть
+                if job.status == RUNNING:              # cut short by a restart -> replay it
                     job.status = QUEUED
                     job.progress = 0.0
                     job.stage = ""
@@ -616,7 +773,6 @@ class ConformQueue:
                     job.results = []
                     job.ops = []
                 self._items[job.id] = job
-                self._stops[job.id] = threading.Event()
                 maxseq = max(maxseq, job.seq)
             self._counter = itertools.count(maxseq + 1)
             self._pump_locked()

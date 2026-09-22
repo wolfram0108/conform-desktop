@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Мультиспектр 16 полос (чистый DSP, GPU) — ИЗМЕРИТЕЛЬ ОСТАТКА после сборки.
-drift(refz,dubz,T) -> Δ(t) в кадрах (по согласию полос). Знак: правее=+; кадр=41.708мс.
-Используется core/assemble для замера остаточного дрейфа corrected↔ref."""
+"""16-band multispectral analysis (pure DSP, GPU) -- a RESIDUAL METER after assembly.
+drift(refz,dubz,T) -> delta(t) in frames (by band agreement). Sign: right=+; frame=41.708ms.
+The audio layer uses it to measure the drift left between the laid sound and the reference."""
 import numpy as np, torch
 
 FRAME = 41.708; SR = 16000
-DEV = "cuda" if torch.cuda.is_available() else "cpu"     # GPU-first, CPU-fallback (закон проекта)
+DEV = "cuda" if torch.cuda.is_available() else "cpu"     # GPU-first, CPU fallback
 NB = 16; NFFT = 1024; HOP = 256; WIN = 5.0; MAXLAG = 0.7
 _fb = torch.linspace(0, SR/2, NFFT//2+1)
 _edg = torch.logspace(np.log10(50), np.log10(min(14000, SR/2-1)), NB+1)
@@ -20,12 +20,16 @@ def _benv(x):
 
 @torch.no_grad()
 def drift(refz, dubz, T, win=WIN, on_prog=None):
+    """refz/dubz — mono @16k arrays in HOST memory. DURATION LAW: only the span of the current
+    batch of windows goes to the device, so the peak is set by the batch, never by the track."""
     w = int(win*SR); half = w//2; out = np.empty(len(T))
-    n = min(int(refz.shape[0]), int(dubz.shape[0]))      # окна не за конец дорожки (короткие)
+    n = min(int(refz.shape[0]), int(dubz.shape[0]))      # keep windows inside the shorter track
     for i in range(0, len(T), 256):
         idx = (T[i:i+256]*SR).astype(int)
         c0 = np.clip(idx - half, 0, max(0, n - w))
-        A = torch.stack([refz[s:s+w] for s in c0]); B = torch.stack([dubz[s:s+w] for s in c0])
+        s0 = int(c0[0]); s1 = int(c0[-1]) + w
+        rb = torch.from_numpy(refz[s0:s1]).to(DEV); db = torch.from_numpy(dubz[s0:s1]).to(DEV)
+        A = torch.stack([rb[s-s0:s-s0+w] for s in c0]); B = torch.stack([db[s-s0:s-s0+w] for s in c0])
         er = _benv(A); ed = _benv(B); Tf = er.shape[2]; nf = 1 << int(np.ceil(np.log2(2*Tf)))
         Er = torch.fft.rfft(er, nf, dim=2); Ed = torch.fft.rfft(ed, nf, dim=2)
         cc = torch.fft.irfft(Ed*torch.conj(Er), nf, dim=2); cc = torch.roll(cc, Tf-1, dims=2)[:, :, :2*Tf-1]

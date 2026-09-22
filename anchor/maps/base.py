@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Общее для карт: поверхность корреляции → (o,w) и опциональный файловый кеш.
-o[t] — сдвиг (кадры), w[t] — качество якоря (норм. по медиане). Кеш по методу+хэшу пути."""
-import os, hashlib, numpy as np
-from ..params import T as _T
+"""Shared by the maps: a correlation surface -> (o, w). o[t] is the shift in frames, w[t] the quality
+of the anchor, normalised by its median."""
+import numpy as np
 
 
 def offset_quality(S, lagf):
-    """Поверхность S[t,lag] → o[t] (argmax+парабола), w[t] (высота пика, норм.)."""
+    """Surface S[t,lag] -> o[t] (argmax plus parabolic interpolation), w[t] (peak height, normalized)."""
     n = len(S); o = np.full(n, np.nan); w = np.zeros(n)
     for i in range(n):
         row = S[i]
@@ -24,18 +23,3 @@ def offset_quality(S, lagf):
     if w.max() > 0: w = w/np.median(w[w > 0])
     return o, w
 
-
-def _key(method, dub):
-    h = hashlib.md5(os.path.abspath(str(dub)).encode()).hexdigest()[:6]
-    return f"{method}_{os.path.splitext(os.path.basename(str(dub)))[0]}_{h}_n{len(_T)}"
-
-
-def cached(method, dub, build_fn, cache_dir=None):
-    """(o,w) из кеша или построить build_fn()->(o,w). cache_dir=None → без файлового кеша."""
-    if cache_dir is None:
-        return build_fn()
-    os.makedirs(cache_dir, exist_ok=True)
-    p = os.path.join(cache_dir, f"om_{_key(method, dub)}.npz")
-    if os.path.exists(p):
-        d = np.load(p); return d["o"], d["w"]
-    o, w = build_fn(); np.savez(p, o=o, w=w); return o, w

@@ -1,2 +1,2 @@
 # -*- coding: utf-8 -*-
-"""Карты Δ(t)→(o,w): band (DSP) и muq (SSL). Различие методов — только здесь."""
+"""Maps Δ(t) -> (o,w): band (DSP) and muq (SSL). The methods differ only here."""

@@ -1,12 +1,14 @@
-"""Дисковый SRM-кеш (для РЕФА). Кладётся в подкаталог каталога серии
-(`<серия>/_conform_cache/`), ключ — по содержимому файла (имя+размер+mtime).
+"""On-disk SRM cache (for the REFERENCE). Stored in a subdirectory of the series
+directory (`<series>/_conform_cache/`), keyed by file content (name+size+mtime).
 
-Зачем: реф переиспользуется между озвучками (в пределах серии) И между ЗАПУСКАМИ
-(появилась новая озвучка — реф берётся из кеша без передекода). Озвучки не кешируем.
+Why: the reference is reused across dubs (within a series) AND across RUNS (a new
+dub arrives -- the reference is served from cache without re-decoding). Dubs are
+not cached.
 
-Формат: фичи лежат raw `.f16` (плоский float16, форма (N, D)), мета — `.json` (N, fps).
-Загрузка отдаёт **np.memmap** (read-only) — реф НЕ грузится в RAM целиком (важно для
-длинных файлов). Старые `.npz`-кеши не читаются — просто перестроятся.
+Format: features are stored raw as `.f16` (flat float16, shape (N, D)), metadata as
+`.json` (N, fps). Loading returns an **np.memmap** (read-only) -- the reference is
+NOT loaded into RAM in full (matters for long files). Old `.npz` caches are not
+read -- they are simply rebuilt.
 """
 
 from __future__ import annotations
@@ -26,26 +28,27 @@ _CACHE_AUDIT = bool(os.environ.get("TM_CACHE_AUDIT"))
 
 
 def _a(stage: str, hit: bool, name: str = "") -> None:
-    """Аудит реюза кэша (env TM_CACHE_AUDIT=1): код САМ пишет, взял кэш отсюда или строит на GPU.
-    Включается только для тестовых прогонов; в проде по умолчанию молчит."""
+    """Cache-reuse audit (env TM_CACHE_AUDIT=1): the code itself logs whether it took
+    the cache here or built on GPU. Enabled only for test runs; silent by default in production."""
     if _CACHE_AUDIT:
         print(f"[КЭШ] {stage:16s} {'РЕЮЗ ✓' if hit else 'промах → строю/декодю'}  {name}", flush=True)
 
-D = GW * GH * 2          # размерность вектора кадра (rk+rd)
+D = GW * GH * 2          # frame vector dimensionality (rk+rd)
 
-# Версии этапов для инвалидации чекпоинтов (режим tmp). Бампать при смене кода ЭТАПА —
-# тогда стухший чекпоинт пересоберётся, а тяжёлое выше возьмётся из кэша. Пользователь не
-# управляет. EMB_VER — SRM/эмбединг (features.build_srm), покрывает кэш SRM рефа И дубля.
+# Stage versions for checkpoint invalidation (tmp mode). Bump when a STAGE's code changes -- a
+# stale checkpoint then rebuilds while the heavier stages above it are served from cache; this is
+# not user-controlled. EMB_VER is the SRM/embedding stage (features.build_srm), covering the SRM
+# cache for both the reference and the dub.
 EMB_VER = 1
-EXT_VER = 3              # извлечение аудио (_extract_wav[_mmap]) — кэш аудио CK2
+EXT_VER = 3              # audio extraction (_extract_wav[_mmap]) -- the CK2 audio cache
 #   v3: audio is laid on the video axis by the container delay (features.probe_av_delay);
 #   v2 caches of files with video_start != audio_start hold the audio shifted by that delay.
-#   v2 (2026-08-06): декод аудио ВСЕГДА идёт через `aresample=async=1:first_pts=0`
-#   (был тумблер audio_fix, выкл. по умолчанию — см. align._extract_base). На чистом входе
-#   данные идентичны v1 (бит-в-бит), но кэш файла С ДЫРОЙ PTS, снятый по v1, рассинхронен.
-DSP_VER = 3             # DSP-48 benv РЕФА (coarse_dtw) — кэш CK4. Бампать при смене benv/полос/ресэмпла.
+#   v2: audio decoding always goes through `aresample=async=1:first_pts=0` (see align._extract_base).
+#   On clean input the data is bit-identical to v1, but a v1-built cache of a file with a PTS gap
+#   is out of sync.
+DSP_VER = 3             # DSP-48 benv of the REFERENCE (coarse_dtw) -- the CK4 cache. Bump when benv/bands/resampling changes.
 #   v3: reference audio decode now applies the container delay (see EXT_VER v3).
-#   v2 (2026-08-06): benv считается по аудио рефа, а его декод изменился (см. EXT_VER).
+#   v2: benv is computed from the reference audio, and its decode changed (see EXT_VER).
 
 
 def cache_key(video: Path) -> str:
@@ -54,13 +57,13 @@ def cache_key(video: Path) -> str:
 
 
 def _crop_tag(crop: str | None) -> str:
-    """Суффикс ключа для КРОПНУТОГО SRM (геом-коррекция): None → '' (обычный кэш)."""
+    """Key suffix for a CROPPED SRM (geometry correction): None -> '' (the plain cache)."""
     return ("__c" + crop.replace(":", "_")) if crop else ""
 
 
 def srm_file(cache_dir: Path | str, video: Path | str, crop: str | None = None) -> Path:
-    """Путь к raw-файлу фич (.f16) — туда же build_srm пишет потоком при low_mem.
-    crop задан → отдельный ключ кропнутого SRM (геом-режим), не пересекается с обычным."""
+    """Path to the raw features file (.f16) -- build_srm streams into it directly under low_mem.
+    When crop is given, uses a separate key for the cropped SRM (geometry mode), not overlapping the plain one."""
     return Path(cache_dir) / (cache_key(Path(video)) + _crop_tag(crop) + ".f16")
 
 
@@ -69,8 +72,8 @@ def _meta_file(cache_dir: Path | str, video: Path | str, crop: str | None = None
 
 
 def load_srm(cache_dir: Path | str, video: Path | str, crop: str | None = None) -> SrmFeatures | None:
-    """Реф/дубль из кеша как memmap (read-only). None — если кеша нет/битый. Логирует реюз (аудит).
-    crop задан → кропнутый SRM (геом-режим)."""
+    """Reference/dub from the cache as a memmap (read-only). None if the cache is
+    missing or broken. Logs the reuse for the audit. When crop is given, loads the cropped SRM (geometry mode)."""
     r = _load_srm(cache_dir, video, crop)
     _a("CK1 SRM" + (" geom" if crop else ""), r is not None, Path(video).name)
     return r
@@ -85,31 +88,32 @@ def _load_srm(cache_dir: Path | str, video: Path | str, crop: str | None = None)
         return None
     try:
         meta = json.loads(mp.read_text(encoding="utf-8"))
-        # Инвалидация по версии эмбединга: отсутствие поля = версия 1 (так строили существующие
-        # кэши до ввода чекпоинтов) → не ломаем их сейчас, но бамп EMB_VER пересоберёт.
+        # Invalidation by embedding version: a missing field means version 1 (how existing caches
+        # were built before checkpoints existed); those stay valid, and bumping EMB_VER rebuilds.
         if int(meta.get("emb_ver", 1)) != EMB_VER:
             return None
         n = int(meta["n"]); d = int(meta.get("d", D))
-        if n <= 0:                       # ПУСТОЙ/битый SRM-кэш (сборка упала, оставила n=0/0-байт) →
-            return None                  # инвалид → conform пересоберёт SRM (иначе len/fps=0 → div0)
-        # fps ПЕРЕ-ВЫВОДИМ из файла, НЕ доверяем meta: старые кэши хранят fps от раздутой
-        # контейнерной длительности (битый Segment Duration → fps врёт). Кадры от fps не зависят →
-        # SRM не пересобираем, лишь освежаем fps. Сбой probe → фолбэк на сохранённое значение.
+        if n <= 0:                       # empty/broken SRM cache (the build failed, left n=0/0 bytes) ->
+            return None                  # invalid -> conform rebuilds the SRM (otherwise len/fps=0 -> div0)
+        # fps is RE-DERIVED from the file, not trusted from meta: old caches store fps from an
+        # inflated container duration (a broken Segment Duration makes fps lie). Frames don't
+        # depend on fps, so the SRM is not rebuilt, only fps is refreshed; a failed probe falls
+        # back to the stored value.
         fps = float(meta.get("fps", 0.0))
         try:
             vd = probe_video_duration(Path(video))
             if vd and n:
                 fps = n / vd
-        except Exception:  # noqa: BLE001 — probe недоступен → старое значение
+        except Exception:  # noqa: BLE001 -- probe unavailable -> keep the value from meta
             pass
         arr = np.memmap(sp, dtype=np.float16, mode="r", shape=(n, d)) if n else np.zeros((0, d), np.float16)
-        # Ось VFR НЕ кэшируем — перепробиваем из исходника при каждой загрузке (0.05–1.2с,
-        # пакетный проход без декода; сам SRM-декод, который кэш экономит, 40–60с). CFR → None
-        # (без затрат на подавляющем большинстве файлов кроме той же пробы). Как в build_srm:
-        # при живой оси fps = средняя плотность по оси.
+        # The VFR axis is NOT cached -- it is re-probed from the source on every load (0.05-1.2s,
+        # a batch pass without decoding; the SRM decode itself, which the cache saves, is 40-60s).
+        # CFR yields None (no cost beyond that same probe on the vast majority of files). As in
+        # build_srm: with a live axis, fps is the average density over the axis.
         try:
             pts_ax = vfr_time_axis(Path(video), n)
-        except Exception:  # noqa: BLE001 — проба недоступна → консервативно без оси
+        except Exception:  # noqa: BLE001 -- probe unavailable -> conservatively no axis
             pts_ax = None
         if pts_ax is not None and pts_ax[-1] > 0:
             fps = (n - 1) / float(pts_ax[-1])
@@ -121,8 +125,8 @@ def _load_srm(cache_dir: Path | str, video: Path | str, crop: str | None = None)
 
 def save_meta(cache_dir: Path | str, video: Path | str, n: int, fps: float, d: int = D,
               crop: str | None = None) -> None:
-    """Записать мету (когда build_srm уже записал .f16 потоком напрямую в кеш)."""
-    if int(n) <= 0:                      # НЕ кэшируем пустой SRM (сборка упала) — иначе poison → div0
+    """Write the metadata (after build_srm has already streamed the .f16 directly into the cache)."""
+    if int(n) <= 0:                      # do NOT cache an empty SRM (the build failed) -- otherwise poison -> div0
         return
     try:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -134,10 +138,10 @@ def save_meta(cache_dir: Path | str, video: Path | str, n: int, fps: float, d: i
 
 
 def save_srm(cache_dir: Path | str, video: Path | str, feats: SrmFeatures) -> None:
-    """Сохранить уже построенные (в RAM) фичи: raw .f16 + мета. Для in-RAM пути."""
+    """Save already-built (in-RAM) features: raw .f16 + metadata. For the in-RAM path."""
     try:
         arr = np.asarray(feats.srm, np.float16)
-        if arr.shape[0] <= 0:            # пустой SRM не кэшируем (сборка упала) — иначе poison → div0
+        if arr.shape[0] <= 0:            # do not cache an empty SRM (the build failed) -- otherwise poison -> div0
             return
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         arr.tofile(srm_file(cache_dir, video))
@@ -146,16 +150,16 @@ def save_srm(cache_dir: Path | str, video: Path | str, feats: SrmFeatures) -> No
         logger.warning("conform cache save failed: {}", e)
 
 
-# ── CK2: кэш извлечённого аудио (raw int16 [N,C], как _extract_wav_mmap) ──
+# ── CK2: extracted-audio cache (raw int16 [N,C], as in _extract_wav_mmap) ──
 
 def _atr_tag(atrack: int) -> str:
-    """Суффикс ключа для НЕ-нулевой аудиодорожки (многодорожечность, этап 5.1 standalone).
-    atrack=0 → пустой (старые ключи бит-в-бит валидны)."""
+    """Key suffix for a non-zero audio track (multi-track support).
+    atrack=0 -> empty (old keys stay valid bit-for-bit)."""
     return f"__a{int(atrack)}" if atrack else ""
 
 
 def audio_raw(cache_dir: Path | str, video: Path | str, atrack: int = 0) -> Path:
-    """Путь к raw-аудио (.raw, int16 [N*C]) — туда _extract_wav_mmap(dest=) пишет напрямую."""
+    """Path to the raw audio (.raw, int16 [N*C]) -- _extract_wav_mmap(dest=) writes into it directly."""
     return Path(cache_dir) / (cache_key(Path(video)) + _atr_tag(atrack) + "__audio.raw")
 
 
@@ -165,7 +169,7 @@ def _audio_meta(cache_dir: Path | str, video: Path | str, atrack: int = 0) -> Pa
 
 def load_audio_mmap(cache_dir: Path | str, video: Path | str, channels: int,
                     *, ext_ver: int = EXT_VER, atrack: int = 0):
-    """CK2: int16-memmap [N,channels] из кэша (read-only) или None. Ключ=файл+EXT_VER+каналы+дорожка."""
+    """CK2: int16 memmap [N,channels] from the cache (read-only), or None. Key = file+EXT_VER+channels+track."""
     r = _load_audio_mmap(cache_dir, video, channels, ext_ver=ext_ver, atrack=atrack)
     _a("CK2 аудио дубль", r is not None, Path(video).name)
     return r
@@ -192,7 +196,7 @@ def _load_audio_mmap(cache_dir: Path | str, video: Path | str, channels: int,
 
 def save_audio_meta(cache_dir: Path | str, video: Path | str, channels: int,
                     *, ext_ver: int = EXT_VER, atrack: int = 0) -> None:
-    """Записать мету CK2 (raw уже записан _extract_wav_mmap(dest=audio_raw(...)))."""
+    """Write the CK2 metadata (the raw file has already been written by _extract_wav_mmap(dest=audio_raw(...)))."""
     try:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         _audio_meta(cache_dir, video, atrack).write_text(
@@ -201,18 +205,20 @@ def save_audio_meta(cache_dir: Path | str, video: Path | str, channels: int,
         logger.warning("conform audio cache meta save failed: {}", e)
 
 
-# ── CK4: кэш DSP-48 benv РЕФА (coarse_dtw; реф переиспользуется между дублями эпизода) ──
+# ── CK4: DSP-48 benv cache of the REFERENCE (coarse_dtw; the reference is reused across the episode's dubs) ──
 
 def dsp_ref_path(cache_dir: Path | str, video: Path | str, atrack: int = 0) -> Path:
-    """Путь к кэшу benv рефа (.npy, f32 [48,Nf]) с версией DSP_VER в имени (бамп → пересборка).
-    benv считается по АУДИО рефа ⟹ реф-дорожка входит в ключ (atrack=0 → старое имя)."""
+    """Path to the reference benv cache (.npy, f32 [48,Nf]) with DSP_VER in the name
+    (bumping it forces a rebuild). benv is computed from the reference AUDIO, so the
+    reference track is part of the key (atrack=0 -> the legacy name)."""
     return Path(cache_dir) / (cache_key(Path(video)) + _atr_tag(atrack) + f"__dsp{DSP_VER}.npy")
 
 
-# ── CK-geom: кэш РЕЗУЛЬТАТА consensus_G (crop/scale per-pair). LoFTR-geom ДОРОГОЙ (декод+нейроматчер)
-#    И флаки (анкоры/GPU) → НЕЛЬЗЯ перезапускать каждый conform. Ключ = дубль (уникален на пару) +
-#    проверка идентичности рефа. Хит → кропаем БЕЗ повторного geom (и даже без kornia — она нужна
-#    лишь для ВЫЧИСЛЕНИЯ кропа, не для применения). Бамп GEOM_VER при смене geom-алгоритма. ──
+# ── CK-geom: cache of the consensus_G RESULT (per-pair crop/scale). LoFTR-geom is EXPENSIVE
+#    (decode+neural matcher) and flaky (anchors/GPU), so it must not rerun on every conform. Key =
+#    dub (unique per pair) + a check that the reference matches. A hit crops WITHOUT rerunning geom
+#    (and without even kornia -- it is only needed to COMPUTE the crop, not to apply it). Bump
+#    GEOM_VER when the geom algorithm changes. ──
 GEOM_VER = 1
 
 
@@ -221,7 +227,8 @@ def _geom_meta(cache_dir: Path | str, dub_video: Path | str) -> Path:
 
 
 def load_geom(cache_dir: Path | str, ref_video: Path | str, dub_video: Path | str):
-    """Геом-результат (dict crop_ref/crop_dub/sx/sy/n_in) из кэша или None (нет/версия/реф сменился)."""
+    """Geometry result (dict crop_ref/crop_dub/sx/sy/n_in) from the cache, or None
+    (missing, version mismatch, or the reference changed)."""
     try:
         p = _geom_meta(cache_dir, dub_video)
     except OSError:
@@ -241,7 +248,7 @@ def load_geom(cache_dir: Path | str, ref_video: Path | str, dub_video: Path | st
 
 
 def save_geom(cache_dir: Path | str, ref_video: Path | str, dub_video: Path | str, G: dict) -> None:
-    """Сохранить геом-результат пары (после успешного consensus_G)."""
+    """Save the pair's geometry result (after a successful consensus_G)."""
     try:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
         _geom_meta(cache_dir, dub_video).write_text(
@@ -252,7 +259,7 @@ def save_geom(cache_dir: Path | str, ref_video: Path | str, dub_video: Path | st
 
 
 def clear_dir(cache_dir: Path | str) -> None:
-    """Удалить кеш-подкаталог целиком (когда флаг «сохранять кеш рефа» выключен)."""
+    """Remove the whole cache subdirectory (when the "keep reference cache" flag is off)."""
     try:
         d = Path(cache_dir)
         if d.exists():

@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
-"""ЕДИНЫЙ график укладки: ЗРЕНИЕ (всегда) + СЛУХ band/muq (если включено) в ОДНОМ.
+"""UNIFIED layout plot: VISION (always) + AUDIO band/muq (when enabled) in ONE chart.
 
-Обе панели — в ДРЕЙФ-форме (откл. сдвига от робастной линейной базы): наклон/дрейф и
-ступени-резы видны вокруг 0. Зрение всегда есть → минимум 1 панель; слух добавляет вторую
-(общая ось времени, синхронный зум/ховер).
+Both panels are in DRIFT form (the shift's deviation from a robust linear baseline): the
+slope/drift and the cut steps are visible around 0. Vision is always present, so there is
+at least 1 panel; audio adds a second one (a shared time axis, synchronized zoom/hover).
 
-⭐ ГРАФИК ЗРЕНИЯ = РОВНО ТО, ЧТО В ЗВУКЕ (один источник, 100% по построению):
-  - оранжевая = `vision["curve"]` = применённая укладка (сдвиг из tg_s, по которой ресэмплится out),
-    РВЁТСЯ в вырезах (там дубля нет — показывать нечего);
-  - красные зоны = `vision["fill_spans"]` = РОВНО зоны, занулённые в out (вырезы −Δ + швы +Δ).
+THE VISION PLOT IS EXACTLY WHAT ENDS UP IN THE AUDIO (one source, 100% by construction):
+  - the orange line is `vision["curve"]`, the applied layout (the shift from tg_s that out
+    is resampled by), which BREAKS across excisions (there is no dub there to show);
+  - the red zones are `vision["fill_spans"]`, EXACTLY the zones zeroed out in out (excisions
+    -delta plus seams +delta).
 
-Паспорт пары (`passport`) — единый источник зон, событий, участков скорости и метрик шапки для
-обеих панелей и обоих рендеров; график ничего не считает сам, а только раскладывает его по
-панелям. Все подписи — ключами из `plot_terms` (язык — параметр).
+The pair's passport (`passport`) is the single source of zones, events, speed segments and
+header metrics for both panels and both renders; the plot computes nothing itself, it only
+lays the passport out across the panels. All labels are keys from `plot_terms` (language is
+a parameter).
 
 API:
   render_unified(plot_dir, stem, *, vision, audio=None, title="", passport=None, lang="ru") -> list[plots]
@@ -20,9 +22,10 @@ API:
     audio    = dict(T, o, w, wcurve, det_cuts, gcc) | None
     passport = dict(zones=[{kind,a,b}], events=[{kind,t,value}], segments=[{a,b,speed_pct}],
                     header=[[{key,value[,tpl]}, ...], [...]], verdict, verdict_text)
-  Пишет: <stem>__track.png (превью) + <stem>__track.html (plotly, для модалки).
+  Writes: <stem>__track.png (preview) + <stem>__track.html (plotly, for the modal).
 
-Read-only диагностика: падение рендера не должно ронять conform. Знак: правее=+; кадр=FRAME мс."""
+Read-only diagnostics: a render failure must not bring conform down. Sign convention:
+right = positive; a frame is FRAME ms."""
 from __future__ import annotations
 
 import html
@@ -30,7 +33,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .params import T as GT, FRAME
+from .params import T as GT
 from .plot_terms import term, DEFAULT_LANG
 
 # Zone kinds: colour, alpha on (vision panel, audio panel), hatch. Event kinds: colour, dash, panel.
@@ -97,9 +100,10 @@ def _label_slots(items, x0, x1, plot_px):
     return slots
 
 
-# ───────────────────────── общие помощники ─────────────────────────
+# ───────────────────────── shared helpers ─────────────────────────
 def _baseline(t_ref, shift_fr, head_s):
-    """Робастная линейная база сдвига зрения по ТЕЛУ (Тейл-Сен) — для дрейф-формы (старые данные)."""
+    """Robust linear baseline of the vision shift over the BODY (Theil-Sen) -- used for the
+    drift form when the data has no stored scale."""
     tr = np.asarray(t_ref, float); sh = np.asarray(shift_fr, float)
     body = tr > (head_s + 5.0)
     if body.sum() < 10:
@@ -118,7 +122,7 @@ def _baseline(t_ref, shift_fr, head_s):
 
 
 def _breaks(curve, cut_t, Tarr):
-    """NaN на точках-резах — линия не соединяет куски через разрыв (для аудио-панели)."""
+    """NaN at the cut points, so the line does not connect pieces across a break (for the audio panel)."""
     c = np.asarray(curve, float).copy()
     for tc in cut_t:
         j = int(np.searchsorted(Tarr, tc))
@@ -128,7 +132,7 @@ def _breaks(curve, cut_t, Tarr):
 
 
 def _mask_spans(Tarr, curve, spans):
-    """РАЗРЫВ линии в зонах spans=[(a,b)] (там дубля нет → показывать нечего). Возврат: копия с NaN."""
+    """Breaks the line across the zones spans=[(a,b)] (there is no dub there to show). Returns a copy with NaN in those zones."""
     T = np.asarray(Tarr, float); c = np.asarray(curve, float).copy()
     for a, b in spans:
         c[(T >= a) & (T <= b)] = np.nan
@@ -136,13 +140,14 @@ def _mask_spans(Tarr, curve, spans):
 
 
 def _vis_dev(vis):
-    """Зрение в дрейф-форме: (база a,b; девиация якорей; девиация ПРИМЕНЁННОЙ карты; предел оси;
-    число якорей за пределом). Ось задаёт УКЛАДКА — она и есть результат; якоря, ушедшие дальше
-    (замершие кадры, ложные совпадения), обрезаются и считаются, а не растягивают ось."""
+    """Vision in drift form: (baseline a,b; anchor deviation; deviation of the APPLIED map;
+    axis limit; count of anchors beyond the limit). The LAYOUT sets the axis, since it is
+    the actual result; anchors that stray further (frozen frames, false matches) are
+    clipped and counted rather than stretching the axis."""
     Tv = np.asarray(vis.get("T", GT), float)
-    if "scale_a" in vis:                                 # тот же РОБАСТНЫЙ масштаб, что в карте
+    if "scale_a" in vis:                                 # the same robust scale the time map itself uses
         a, b = float(vis["scale_a"]), float(vis["scale_b"])
-    else:                                                # старые данные без масштаба → Тейл-Сен база
+    else:                                                # older data with no stored scale falls back to a Theil-Sen baseline
         a, b = _baseline(vis["t_ref"], vis["shift_fr"], vis["head_s"])
     base_T = a * Tv + b
     dev_anchor = np.asarray(vis["shift_fr"], float) - (a * np.asarray(vis["t_ref"], float) + b)
@@ -220,7 +225,7 @@ def _legend(passport, panel, present_kinds, lang):
     return handles, labels
 
 
-# ───────────────────────── PNG (превью, 1/2 панели) ─────────────────────────
+# ───────────────────────── PNG (preview, 1 or 2 panels) ─────────────────────────
 def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG, xlim=None, suffix="track"):
     import matplotlib
     matplotlib.use("Agg")
@@ -264,7 +269,7 @@ def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG,
                         color=est["color"], fontsize=7, ha="left" if side == "right" else "right", va="top",
                         zorder=7)
 
-    # --- зрение ---
+    # --- vision ---
     ax1.axhline(0, color="#bbb", lw=0.7)
     st = max(1, len(vision["t_ref"]) // 8000)
     sc1 = ax1.scatter(vision["t_ref"][::st], np.clip(dev_anchor, -vlim, vlim)[::st], c=vision["cos"][::st],
@@ -292,12 +297,12 @@ def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG,
     hz, lz = _legend(passport, 1, present, lang)
     ax1.legend(h1 + hz, l1 + lz, loc="lower right", fontsize=7)   # the top rows belong to event labels
     fig.colorbar(sc1, ax=ax1, pad=0.01, fraction=0.02).set_label(term("colorbar.cos", lang))
-    # --- слух ---
+    # --- audio ---
     if two:
         ao = np.asarray(audio["o"], float); Tb = np.asarray(audio["T"], float)
         ax2.axhline(0, color="#bbb", lw=0.7)
         draw_zones(ax2, 1)
-        wA = np.asarray(audio["w"], float); am = wA > 1e-3   # вес≈0 = тишина зрения → НЕ якорь, не рисуем
+        wA = np.asarray(audio["w"], float); am = wA > 1e-3   # weight near 0 means vision silence, not an anchor: skip drawing it
         Tm, aom, wm = Tb[am], ao[am], wA[am]
         bst = max(1, len(Tm) // 8000)
         sc2 = ax2.scatter(Tm[::bst], aom[::bst], c=np.clip(wm, 0, 1.2)[::bst],
@@ -333,7 +338,7 @@ def _png(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG,
     return p.name
 
 
-# ───────────────────────── HTML (plotly, для модалки) ─────────────────────────
+# ───────────────────────── HTML (plotly, for the modal) ─────────────────────────
 def _html(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG):
     from plotly.subplots import make_subplots
     two = audio is not None
@@ -378,7 +383,7 @@ def _html(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG
                                xanchor="left" if side == "right" else "right", yanchor="top",
                                xshift=3 if side == "right" else -3, row=row, col=1)
 
-    # зрение
+    # vision
     fig.add_hline(y=0, line=dict(color="#bbb", width=0.7), row=1, col=1)
     st = max(1, len(vision["t_ref"]) // 9000)
     tr = np.asarray(vision["t_ref"])[::st]
@@ -406,7 +411,7 @@ def _html(plot_dir, stem, vision, audio, title, passport=None, lang=DEFAULT_LANG
         fig.add_annotation(xref="x domain", yref="y domain", x=0.005, y=0.97, showarrow=False,
                            text=term("anchors_clipped", lang, value=clipped), font=dict(size=9), row=1, col=1)
     fig.update_yaxes(range=[-vlim, vlim], title_text=term("axis.vision_y", lang), row=1, col=1)
-    # слух
+    # audio
     if two:
         Tb = np.asarray(audio["T"], float); ao = np.asarray(audio["o"], float)
         fig.add_hline(y=0, line=dict(color="#bbb", width=0.7), row=2, col=1)
@@ -473,9 +478,9 @@ def _page(title, header, event_list, chart_div, lang):
     return "".join(parts)
 
 
-# ───────────────────────── публичный рендер ─────────────────────────
+# ───────────────────────── public render entry point ─────────────────────────
 def render_unified(plot_dir, stem, *, vision, audio=None, title="", passport=None, lang=DEFAULT_LANG):
-    """Единый график (1 панель зрение / 2 панели зрение+слух). -> список PlotRef."""
+    """The unified plot (1 panel for vision / 2 panels for vision+audio). Returns a list of PlotRef."""
     pd = Path(plot_dir); pd.mkdir(parents=True, exist_ok=True)
     plots = []
     name = _png(pd, stem, vision, audio, title, passport=passport, lang=lang)
@@ -483,6 +488,6 @@ def render_unified(plot_dir, stem, *, vision, audio=None, title="", passport=Non
     try:
         hname = _html(pd, stem, vision, audio, title, passport=passport, lang=lang)
         plots.append({"kind": "html", "name": hname, "t": None, "v_ms": None})
-    except Exception:  # noqa: BLE001 — HTML опционален (plotly)
+    except Exception:  # noqa: BLE001 — HTML is optional (depends on plotly)
         pass
     return plots

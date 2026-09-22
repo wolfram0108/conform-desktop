@@ -1,14 +1,14 @@
-"""SRM-фичи: видео → вектора кадров (декод ffmpeg + свёртка KB/D1).
+"""SRM features: video -> per-frame vectors (ffmpeg decode + KB/D1 convolution).
 
-Канон ИДЕНТИЧЕН research-сборке (_real_test.build_srm / _build_srm_cache):
-gray 128×72, ядра KB и D1, clip ±3, L2-норма по каналу, concat ×1/√2, float16,
-ffmpeg `-vsync 0` (passthrough — индекс кадра = позиция). Любое отклонение здесь
-ломает бит-в-бит совпадение с эталонным кэшем/wav.
+The encoding is fixed: gray 128x72, the KB and D1 kernels, clip +-3, per-channel L2 norm,
+concat x1/sqrt(2), float16, ffmpeg `-vsync 0` (passthrough -- frame index = position). Any
+deviation here breaks bit-exact matching against a cached SRM or wav.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import time
 from pathlib import Path
@@ -41,7 +41,7 @@ def probe_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
 
 
 def _parse_hhmmss(s: str | None) -> float | None:
-    """'00:25:11.410000000' → секунды (float). Невалидно → None."""
+    """'00:25:11.410000000' -> seconds (float). Invalid input -> None."""
     s = (s or "").strip()
     if not s:
         return None
@@ -57,11 +57,11 @@ def _parse_hhmmss(s: str | None) -> float | None:
 
 
 def probe_video_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
-    """Реальная длительность ВИДЕОПОТОКА (НЕ контейнерная format=duration). Контейнерная бывает
-    раздута битым Segment Duration в mkv или длинным хвостом аудио/субтитров — тогда
-    fps=кадры/длительность врёт (Призрак-2: format 1748с против видео 1511с → fps 25.9 вместо
-    29.97 → растяжка выхода и развал аудио-доводки). Приоритет: длительность видеопотока →
-    его тег DURATION → format.duration (фолбэк)."""
+    """The real duration of the VIDEO STREAM (NOT the container's format=duration). The container
+    value can be inflated by a broken Segment Duration in mkv or a long trailing audio/subtitle
+    tail -- then fps=frames/duration lies (observed: format 1748 s against a video stream of
+    1511 s -> fps 25.9 instead of 29.97, stretching the output and breaking audio touch-up).
+    Priority: video stream duration -> its DURATION tag -> format.duration (fallback)."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=duration", "-of", "csv=p=0", str(video)],
@@ -73,7 +73,7 @@ def probe_video_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
             return v
     except ValueError:
         pass
-    r = procreg.run(                                   # тег DURATION видеопотока ('00:25:11.41' — надёжен в mkv)
+    r = procreg.run(                                   # video stream's DURATION tag ('00:25:11.41' — reliable in mkv)
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream_tags=DURATION", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
@@ -81,21 +81,19 @@ def probe_video_duration(video: Path, ffprobe: str = FFPROBE) -> float | None:
     v = _parse_hhmmss(r.stdout)
     if v and v > 0:
         return v
-    return probe_duration(video, ffprobe)                 # фолбэк: контейнер (когда видеопоток молчит)
+    return probe_duration(video, ffprobe)                 # fallback: container duration (when the video stream is silent)
 
 
 def probe_audio_channels(video: Path, ffprobe: str = FFPROBE,
                          atrack: int = 0) -> tuple[int, str | None]:
-    """Число каналов и раскладка аудиодорожки `atrack` (дефолт 0 — как было) — чтобы
-    наследовать 2.0/5.1/7.1 на выход. -> (channels, channel_layout|None). При любой
-    неудаче — безопасный fallback (2, None).
+    """Channel count and layout of audio track `atrack` (default 0), so 2.0/5.1/7.1 carries through
+    to the output. -> (channels, channel_layout|None). Any failure -> a safe fallback (2, None).
 
-    ⚠ Разбор ТОЛЬКО по JSON. Текстовый формат ffprobe (`-of csv`) на потоках с
-    дополнительными данными даёт ХВОСТОВУЮ ЗАПЯТУЮ: у обычного файла строка
-    `2,stereo`, а у ремукса с HDR — `6,5.1(side),`. Прежний разбор отдавал раскладку
-    вместе с запятой, ffmpeg отвечал `Unable to parse "ch_layout" option value
-    "5.1(side)," as channel layout` и умирал на старте записи — а мы видели лишь
-    «Broken pipe» после полутора часов работы (случай 2026-08-07)."""
+    Parsing must use ONLY the JSON output. ffprobe's text format (`-of csv`) emits a TRAILING
+    COMMA on streams with extra data: a plain file gives `2,stereo`, but an HDR remux gives
+    `6,5.1(side),`. A layout parsed with that trailing comma makes ffmpeg reject it
+    (`Unable to parse "ch_layout" option value "5.1(side)," as channel layout`) and die at the
+    start of encoding, which otherwise surfaces only as a broken pipe well into a long run."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", f"a:{int(atrack)}",
          "-show_entries", "stream=channels,channel_layout", "-of", "json", str(video)],
@@ -159,10 +157,10 @@ def av_delay_filters(delay_s: float) -> list[str]:
 
 
 def probe_audio_tracks(video: Path, ffprobe: str = FFPROBE) -> list[dict]:
-    """Список ВСЕХ аудиодорожек файла — для выбора дорожки в UI (реф-дорожка /
-    дорожки озвучек). Каждая запись:
-    {index (0-based среди аудио), codec, channels, layout, lang, title, default}.
-    Ошибка/нет аудио → []."""
+    """The list of ALL audio tracks in the file, for track selection in the UI (the reference
+    track / dub tracks). Each entry:
+    {index (0-based among audio streams), codec, channels, layout, lang, title, default}.
+    Error or no audio -> []."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "a",
          "-show_entries",
@@ -192,7 +190,7 @@ def probe_audio_tracks(video: Path, ffprobe: str = FFPROBE) -> list[dict]:
 
 
 def probe_resolution(video: Path, ffprobe: str = FFPROBE) -> int:
-    """Высота кадра ПЕРВОГО видеопотока — для выбора бэкенда декода (CPU/GPU). Ошибка → 0 (→ CPU)."""
+    """Frame height of the FIRST video stream, for choosing the decode backend (CPU/GPU). Error -> 0 (-> CPU)."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=height", "-of", "csv=p=0", str(video)],
@@ -204,41 +202,48 @@ def probe_resolution(video: Path, ffprobe: str = FFPROBE) -> int:
         return 0
 
 
-def _parse_fps(s: str | None) -> float | None:
-    """'24000/1001' → 23.976. Пусто/0/мусор → None."""
+def parse_fps(s: str | None) -> float | None:
+    """'24000/1001' or '23.976' -> frames per second; anything else -> None.
+
+    The only parser of a frame rate given as text, for ffprobe output and for user input alike:
+    a number or a ratio of two numbers, never an evaluated expression. The result is finite and
+    positive or it is None."""
     s = (s or "").strip()
     try:
         if "/" in s:
             a, b = s.split("/")
-            return float(a) / float(b) if float(b) else None
-        return float(s) if s else None
+            v = float(a) / float(b)
+        else:
+            v = float(s)
     except (ValueError, ZeroDivisionError):
         return None
+    return v if (math.isfinite(v) and v > 0) else None
 
 
 def probe_fps(video: Path, ffprobe: str = FFPROBE) -> float | None:
-    """fps видеопотока (r_frame_rate, напр. '24000/1001') — для ОЦЕНКИ числа кадров в прогрессе."""
+    """fps of the video stream (r_frame_rate, e.g. '24000/1001'), for ESTIMATING the frame count in progress reporting."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", str(video)],
         capture_output=True, text=True,
     )
-    return _parse_fps(r.stdout)
+    return parse_fps(r.stdout)
 
 
 def probe_frame_count_hints(video: Path, ffprobe: str = FFPROBE) -> tuple[int | None, float | None]:
-    """(nb_frames, avg_frame_rate) видеопотока — из МЕТАДАННЫХ, без прохода по файлу.
+    """(nb_frames, avg_frame_rate) of the video stream, from METADATA, with no pass over the file.
 
-    Зачем в обход `r_frame_rate`: он бывает МУСОРНЫМ. Замер на 92 реальных файлах веб-плееров
-    (cvh/Persona99): r_frame_rate=48.0 и 90000.0 (последнее — timebase MPEG-TS 90кГц, просочившийся
-    в поле) при реальных 23.976 → гейт полноты ниже считал ожидание вдвое/в 3750 раз завышенным и
-    ронял ЦЕЛУЮ серию на честном файле. При этом `nb_frames` был заполнен и ТОЧНО равен числу
-    видеопакетов у всех 71 файла, где он есть (0 расхождений).
-    ⚠ `avg_frame_rate` НЕ является честным источником на VFR: у Matroska с переменной частотой
-    он остаётся номинальным (замер: 24000/1001 при реальных 3237 кадрах за 180с = 17.98) —
-    поэтому при отсутствии `nb_frames` считаем пакеты честно (`probe_packet_count`)."""
-    # JSON, не csv: ffprobe выводит поля во ВНУТРЕННЕМ порядке, а не в порядке запроса
-    # (проверено: `stream=nb_frames,avg_frame_rate` → csv «avg,nb»), позиционный разбор хрупок.
+    Why bypass `r_frame_rate`: it can be GARBAGE. Measured on 92 real web-player files (cvh):
+    r_frame_rate=48.0 and 90000.0 (the latter is the MPEG-TS 90 kHz timebase leaking into the
+    field) against a real 23.976 -> the completeness gate below treated the expectation as
+    2x/3750x inflated and dropped an entire honest episode. Meanwhile `nb_frames`, when present,
+    was filled in and matched the video packet count EXACTLY on all 71 files that had it
+    (0 discrepancies).
+    `avg_frame_rate` is NOT an honest source on VFR: on a variable-rate Matroska it stays nominal
+    (measured: 24000/1001 against a real 3237 frames over 180 s = 17.98) -- so when `nb_frames` is
+    missing, packets are counted honestly instead (`probe_packet_count`)."""
+    # JSON, not csv: ffprobe outputs fields in its OWN internal order, not the order requested
+    # (checked: `stream=nb_frames,avg_frame_rate` -> csv gives "avg,nb"), so positional parsing is fragile.
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "stream=nb_frames,avg_frame_rate", "-of", "json", str(video)],
@@ -248,7 +253,7 @@ def probe_frame_count_hints(video: Path, ffprobe: str = FFPROBE) -> tuple[int | 
         st = (json.loads(r.stdout or "{}").get("streams") or [{}])[0]
     except (json.JSONDecodeError, IndexError):
         return None, None
-    avg = _parse_fps(st.get("avg_frame_rate"))
+    avg = parse_fps(st.get("avg_frame_rate"))
     try:
         nb = int(st.get("nb_frames"))
     except (TypeError, ValueError):
@@ -257,15 +262,15 @@ def probe_frame_count_hints(video: Path, ffprobe: str = FFPROBE) -> tuple[int | 
 
 
 def probe_media_info(path: Path, ffprobe: str = FFPROBE) -> dict:
-    """Паспорт файла ОДНОЙ пробой метаданных: длительность, кадр, частота, число кадров.
+    """File passport from ONE metadata probe: duration, frame size, rate, frame count.
 
-    Нужен панели: показать, с чем работаем, и оценить остаток времени (нормативы
-    привязаны к минутам материала и к гигапикселям декода).
+    Used by the panel to show what is being worked on and estimate the remaining time (the
+    estimate scales with minutes of material and decode gigapixels).
 
-    Только метаданные, БЕЗ прохода по файлу: цена — доли секунды. Число кадров может
-    отсутствовать (VFR, битые заголовки) — тогда оценивается как длительность × частоту,
-    а если и частоты нет, остаётся None. Здесь это допустимо: величина идёт в оценку
-    времени, а не в укладку. Любая неудача → пустой словарь, вызывающий работает без него.
+    Metadata only, with NO pass over the file: costs a fraction of a second. The frame count can
+    be missing (VFR, broken headers) -- then it is estimated as duration times rate, and if the
+    rate is also missing it stays None. That is acceptable here: the value feeds a time estimate,
+    not the layout. Any failure -> an empty dict, and the caller works without it.
 
     -> {duration_s, width, height, fps, frames, has_video}
     """
@@ -290,7 +295,7 @@ def probe_media_info(path: Path, ffprobe: str = FFPROBE) -> dict:
             return None
 
     dur = _f(st.get("duration")) or _f(fmt.get("duration"))
-    fps = _parse_fps(st.get("avg_frame_rate")) or _parse_fps(st.get("r_frame_rate"))
+    fps = parse_fps(st.get("avg_frame_rate")) or parse_fps(st.get("r_frame_rate"))
     try:
         frames = int(st.get("nb_frames"))
     except (TypeError, ValueError):
@@ -303,11 +308,12 @@ def probe_media_info(path: Path, ffprobe: str = FFPROBE) -> dict:
 
 
 def probe_packet_count(video: Path, ffprobe: str = FFPROBE) -> int | None:
-    """ЧЕСТНОЕ число видеопакетов — один проход по файлу БЕЗ декода пикселей.
+    """The HONEST video packet count: one pass over the file WITHOUT decoding pixels.
 
-    Единственный источник, не врущий на VFR (там и `nb_frames` отсутствует, и `avg_frame_rate`
-    номинален). Цена замерена: 0.04с на клип 180с, 0.68с на MP4 182МБ, 4.3с на MKV 1.5ГБ —
-    против 40-60с самого декода SRM, т.е. ≤10% накладных, и только когда `nb_frames` нет."""
+    The only source that does not lie on VFR (where `nb_frames` is missing and `avg_frame_rate`
+    is nominal). Cost measured: 0.04 s on a 180 s clip, 0.68 s on a 182 MB MP4, 4.3 s on a 1.5 GB
+    MKV -- against the 40-60 s of the SRM decode itself, i.e. <=10% overhead, and only paid when
+    `nb_frames` is missing."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0", "-count_packets",
          "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(video)],
@@ -321,11 +327,11 @@ def probe_packet_count(video: Path, ffprobe: str = FFPROBE) -> int | None:
 
 
 def probe_has_video(video: Path, ffprobe: str = FFPROBE) -> bool:
-    """Есть ли у файла НАСТОЯЩИЙ видеопоток. Голое аудио (flac/mka/mp3/aac…) → False —
-    признак ветки АУДИО-ONLY conform.
-    ⚠ Обложка (attached_pic у mp3/flac) — формально видеопоток, но НЕ видео: исключаем по
-    disposition. Ошибка пробы → True (консервативно: пусть падает видео-путь с понятной
-    ошибкой, а не молча уходит в аудио-режим)."""
+    """Whether the file has a REAL video stream. Bare audio (flac/mka/mp3/aac...) -> False,
+    the signal for conform's AUDIO-ONLY branch.
+    A cover image (attached_pic on mp3/flac) is formally a video stream but is NOT video: excluded
+    by disposition. A probe failure -> True (conservative: let the video path fail with a clear
+    error rather than silently fall back to audio mode)."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v",
          "-show_entries", "stream=codec_type:stream_disposition=attached_pic",
@@ -343,10 +349,10 @@ def probe_has_video(video: Path, ffprobe: str = FFPROBE) -> bool:
 
 
 def probe_frame_pts(video: Path, ffprobe: str = FFPROBE) -> np.ndarray | None:
-    """PTS всех ВИДЕОПАКЕТОВ (сек), отсортированные по возрастанию — это и есть времена кадров
-    в порядке показа. Замер (VFR-клип стенда): sorted(packet pts_time) == frame pts_time
-    БИТ-В-БИТ (0.000 мс расхождения) при цене 0.05с против 2.80с покадрового прохода с декодом;
-    на реальном MKV 700МБ — 1.2с. Любой N/A / мусор / пусто → None (осторожный отказ)."""
+    """PTS of every VIDEO PACKET (seconds), sorted ascending -- exactly the frame display times.
+    Measured on a VFR clip: sorted(packet pts_time) == frame pts_time BIT-FOR-BIT
+    (0.000 ms difference), at a cost of 0.05 s against 2.80 s for a per-frame decode pass; 1.2 s
+    on a real 700 MB MKV. Any N/A / garbage / empty -> None (fail cautiously)."""
     r = procreg.run(
         [ffprobe, "-v", "error", "-select_streams", "v:0",
          "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(video)],
@@ -359,7 +365,7 @@ def probe_frame_pts(video: Path, ffprobe: str = FFPROBE) -> np.ndarray | None:
             continue
         try:
             vals.append(float(x))
-        except ValueError:                # N/A и прочий мусор → оси нет
+        except ValueError:                # N/A or other junk means there is no axis
             return None
     if not vals:
         return None
@@ -367,17 +373,18 @@ def probe_frame_pts(video: Path, ffprobe: str = FFPROBE) -> np.ndarray | None:
 
 
 def vfr_time_axis(video: Path, n_frames: int, ffprobe: str = FFPROBE) -> np.ndarray | None:
-    """Ось времени кадров (сек ОТ ПЕРВОГО КАДРА, t[0]=0) — ТОЛЬКО для реального VFR; иначе None.
+    """Frame time axis (seconds FROM THE FIRST FRAME, t[0]=0), ONLY for real VFR; otherwise None.
 
-    None ⟹ потребители считают время как индекс/fps — СТАРЫЙ путь бит-в-бит (CFR-регресс
-    по построению). Критерий VFR — невязка к НАИЛУЧШЕЙ равномерной сетке
-    (шаг = t[-1]/(n-1)), порог 1.5 кадра. Почему не медианный шаг: Matroska квантует метки
-    в мс (42/41 вперемешку при истинных 41.708) — медиана 42.00 «уплывает» на 10с за серию
-    и даёт ложный VFR на честном CFR. Замер на 5 файлах: CFR-mkv квантованный → невязка
-    0.02 кадра; реальные VFR-энкоды → 539–1425 кадров. Зазор классов — 4 порядка.
+    None means downstream consumers compute time as index/fps, bit-exact with the CFR case by
+    construction. The VFR criterion is the residual against the BEST-FIT uniform grid
+    (step = t[-1]/(n-1)), threshold 1.5 frames. Why not the median step: Matroska quantizes
+    timestamps to whole milliseconds (42/41 alternating for a true 41.708), so the median (42.00)
+    drifts by 10 s over an episode and reports false VFR on an honest CFR file. Measured on 5
+    files: a quantized CFR mkv gives a residual of 0.02 frame; real VFR encodes give 539-1425
+    frames -- the gap between the two classes spans 4 orders of magnitude.
 
-    len(pts) != n_frames (битые пакеты, обрыв декода) → None: сшивка пакет↔кадр по индексу
-    обязана быть 1:1, иначе оси не верим."""
+    len(pts) != n_frames (broken packets, a decode abort) -> None: the packet-to-frame stitch by
+    index must be 1:1, or the axis is not trusted."""
     if n_frames < 2:
         return None
     pts = probe_frame_pts(video, ffprobe)
@@ -405,55 +412,58 @@ def build_srm(
     backend: str = "cpu",
     reporter: Reporter | None = None,
 ) -> SrmFeatures:
-    """Декод видео + свёртка → SrmFeatures. fps=None → авто (кадры/длительность).
+    """Decode the video and convolve -> SrmFeatures. fps=None means auto (frames/duration).
 
     Progress of the decode goes to `reporter` (stage Reporter); `progress`+`progress_meta`
     build one for stage "decode" when no reporter is given.
-    should_stop() == True → прерывает декод (RuntimeError("stopped")).
-    mmap_path задан → фичи ПОТОКОМ пишутся в raw-файл f16 (в RAM не копятся), srm
-    возвращается как np.memmap (read-only). Значения идентичны in-RAM пути (бит-в-бит).
-    crop='W:H:X:Y' (геом-коррекция, conform.geom): обрезать кадр ДО scale=128:72 —
-    приводит дубль к кадрированию рефа, когда SRM слепнет от кропа/зума/анаморфа/полос.
-    None (по умолчанию) → как было, бит-в-бит.
-    backend='cuda' → декод на GPU (NVDEC, `-hwaccel cuda`); scale 128×72 ОСТАЁТСЯ на CPU
-    (без output_format cuda) → кадры бит-в-бит идентичны 'cpu' (декод детерминирован), кэш не
-    зависит от бэкенда. Выбор делает conform.decode_backend по разрешению/потолку NVDEC.
+    should_stop() == True interrupts the decode (RuntimeError("stopped")).
+    mmap_path given: features are STREAMED to a raw f16 file (not accumulated in RAM), and srm
+    is returned as an np.memmap (read-only). Values are bit-exact with the in-RAM path.
+    crop='W:H:X:Y' (geometry correction, conform.geom): crop the frame BEFORE scale=128:72,
+    matching the dub's framing to the reference when crop/zoom/anamorphic stretch/letterboxing
+    would otherwise blind the SRM. crop=None (default) leaves the frame uncropped, bit-exact.
+    backend='cuda' decodes on the GPU (NVDEC, `-hwaccel cuda`); the 128x72 scale STAYS on the CPU
+    (no output_format cuda), so frames are bit-exact with 'cpu' (the decode is deterministic) and
+    the cache does not depend on the backend. conform.decode_backend picks the backend by
+    resolution against the NVDEC ceiling.
     """
     video = Path(video)
-    dur = probe_video_duration(video, ffprobe)                # видеопоток, не контейнер
-    # fps видеопотока — для оценки числа кадров: прогресс-бар И гейт полноты декода (ниже).
+    dur = probe_video_duration(video, ffprobe)                # video stream, not the container
+    # fps of the video stream — for estimating the frame count: the progress bar AND the decode
+    # completeness gate (below).
     fps_est = fps if fps else probe_fps(video, ffprobe)
-    nb_meta, avg_fps = probe_frame_count_hints(video, ffprobe)   # честные источники для гейта
+    nb_meta, avg_fps = probe_frame_count_hints(video, ffprobe)   # honest sources for the gate
     rep = reporter if reporter is not None else Reporter.of(progress, "decode", progress_meta)
 
     vf = (f"crop={crop},scale={GW}:{GH},format=gray" if crop
           else f"scale={GW}:{GH},format=gray")
-    pre = ["-hwaccel", "cuda"] if backend == "cuda" else []   # GPU-декод; scale остаётся на CPU → бит-в-бит
+    pre = ["-hwaccel", "cuda"] if backend == "cuda" else []   # GPU decode; scale stays on CPU -> bit-exact
     cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", *pre, "-i", str(video), "-an",
            "-vf", vf, "-vsync", "0", "-f", "rawvideo", "-"]
     fb = GW * GH
-    D = GW * GH * 2                       # размерность вектора кадра (rk[9216]+rd[9216])
+    D = GW * GH * 2                       # frame vector dimension (rk[9216]+rd[9216])
     p = procreg.popen(cmd, stdout=subprocess.PIPE, bufsize=fb * _RBLOCK)
-    out_f = open(mmap_path, "wb") if mmap_path is not None else None   # поток на диск (низкая RAM)
-    vecs: list[np.ndarray] = []           # используется только при mmap_path is None
+    out_f = open(mmap_path, "wb") if mmap_path is not None else None   # stream to disk (keeps RAM low)
+    vecs: list[np.ndarray] = []           # used only when mmap_path is None
     n_written = 0
     buf = b""
     t0 = time.perf_counter()
-    # Ожидаемое число кадров для гейта полноты (ниже) и прогресс-бара. Источники по убыванию
-    # честности. `r_frame_rate` — ТОЛЬКО последний фолбэк, он бывает мусорным (48.0 и 90000.0
-    # при реальных 23.976 у cvh/Persona99 → гейт ронял честную серию целиком); `avg_frame_rate`
-    # тоже НЕ честен на VFR (номинальный 24000/1001 при реальных 17.98) → при отсутствии
-    # nb_frames считаем пакеты (цена ≤10% от декода, см. probe_packet_count).
+    # Expected frame count for the completeness gate (below) and the progress bar. Sources are
+    # listed from most to least honest. `r_frame_rate` is ONLY the last fallback — it can be
+    # garbage (e.g. 48.0 or 90000.0 against a real 23.976), which made the gate drop a whole
+    # honest episode; `avg_frame_rate` is also NOT honest on VFR (a nominal 24000/1001 against a
+    # real 17.98), so when nb_frames is missing we count packets instead (costs ≤10% of the
+    # decode time, see probe_packet_count).
     if nb_meta:
-        n_expect = nb_meta                                   # точное число кадров из контейнера
+        n_expect = nb_meta                                   # exact frame count from the container
     else:
-        n_pkt = probe_packet_count(video, ffprobe)            # честный счёт (VFR/Matroska)
+        n_pkt = probe_packet_count(video, ffprobe)            # honest count (VFR/Matroska)
         if n_pkt:
             n_expect = n_pkt
         elif dur and avg_fps:
             n_expect = int(round(dur * avg_fps))
         elif dur and fps_est:
-            n_expect = int(round(dur * fps_est))             # как было (последний фолбэк)
+            n_expect = int(round(dur * fps_est))             # the last-resort fallback
         else:
             n_expect = 0
     try:
@@ -478,7 +488,7 @@ def build_srm(
                     rd /= np.linalg.norm(rd) + 1e-6
                     bvs[j] = (np.concatenate([rk, rd]) * 0.7071068).astype(np.float16)
                 if out_f is not None:
-                    out_f.write(bvs.tobytes())     # на диск, в RAM держим только блок
+                    out_f.write(bvs.tobytes())     # to disk — only the current block is kept in RAM
                 else:
                     vecs.append(bvs)
                 n_written += k
@@ -492,14 +502,16 @@ def build_srm(
         if out_f is not None:
             out_f.close()
 
-    # ── Гейт целостности декода: обрыв ffmpeg (NVDEC/OOM/битый поток) по пайпу неотличим от конца
-    #    файла → без гейта обрубок молча становился «успешным» SRM (dr-stone ep09: 4357/34552
-    #    кадров, fps=n/dur=3.02 заражал кэш и валил все озвучки серии). ──
+    # -- Decode integrity gate: an ffmpeg abort (NVDEC/OOM/broken stream) over a pipe is
+    #    indistinguishable from the end of the file. Without this gate a truncated decode
+    #    silently became a "successful" SRM (e.g. 4357 of 34552 frames, fps=n/dur=3.02),
+    #    poisoning the cache and failing every dub of the episode. --
     if p.returncode not in (0, None):
         raise RuntimeError(f"декод SRM упал (ffmpeg rc={p.returncode}) на кадре {n_written}: {video.name}")
-    # 0.9: реальный обрыв = доли файла (12.6% в кейсе dr-stone); честные потери кадров — единицы
-    # процентов. Ожидание считается от nb_frames/avg_fps (см. выше), а НЕ от r_frame_rate —
-    # иначе мусорный r_frame_rate роняет честный файл (cvh/Persona99: 0.4995 и 0.0003 от «ожидания»).
+    # 0.9: a real abort loses a large fraction of the file (seen as low as 12.6%); honest frame
+    # loss stays within a few percent. The expectation is computed from nb_frames/avg_fps (see
+    # above), never from r_frame_rate — a garbage r_frame_rate would otherwise drop an honest
+    # file (seen giving 0.4995 and 0.0003 of the expected count).
     if n_expect and n_written < 0.9 * n_expect:
         raise RuntimeError(
             f"декод SRM неполон: {n_written} из ~{n_expect} кадров — обрыв декодера ({video.name})")
@@ -511,11 +523,12 @@ def build_srm(
         arr = np.concatenate(vecs) if vecs else np.zeros((0, D), np.float16)
     if fps is None:
         if dur is None:
-            dur = probe_video_duration(video, ffprobe)    # видеопоток, не раздутый контейнер
+            dur = probe_video_duration(video, ffprobe)    # video stream, not the bloated container
         fps = (len(arr) / dur) if dur else 0.0
-    # Реальная ось времени кадров — только для VFR (иначе None → старый путь индекс/fps
-    # бит-в-бит). На VFR попутно честнеет fps: средняя плотность кадров по оси, а не n/dur
-    # от контейнерной длительности (для плотностных окон и ratio ref/dub в даунстриме).
+    # A real frame time axis exists only for VFR (otherwise None, and downstream computes time
+    # as index/fps, bit-exact). On VFR this also makes fps honest: the average frame density over the
+    # axis, not n/dur from the container duration (used by density windows and the ref/dub
+    # ratio downstream).
     pts_ax = vfr_time_axis(video, len(arr), ffprobe)
     if pts_ax is not None and pts_ax[-1] > 0:
         fps = (len(arr) - 1) / float(pts_ax[-1])

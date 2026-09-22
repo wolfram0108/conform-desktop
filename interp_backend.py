@@ -1,16 +1,19 @@
-"""Линейная интерполяция аудио по дробным точкам (варп/ресэмпл) — GPU/CPU бэкенд.
+"""Linear interpolation of audio at fractional points (warp/resample) — a GPU/CPU backend.
 
-Эквивалент `np.interp(src, np.arange(len(y)), y)` с клампом краёв (без экстраполяции).
-В цикле conform этих варпов несколько на ПОЛНОЙ длине (@44.1к × каналы): выходной ресэмпл
-аудио на сетку рефа (align) + варпы band (_warp_by_off0/_warp_piecewise). На CPU (`np.interp`)
-это ~16–22с; на GPU те же линейные lerp'ы — ×10 (по замеру).
+Equivalent to `np.interp(src, np.arange(len(y)), y)` with edges clamped (no extrapolation).
+The conform pipeline runs several of these warps at FULL length (@44.1 kHz × channels): the
+output resample of audio onto the reference grid (align) plus the band warps
+(_warp_by_off0/_warp_piecewise). On CPU (`np.interp`) that is ~16-22s; on GPU the same linear
+lerps run ×10 faster (measured).
 
-GPU-ветка считает в float64 ТОЙ ЖЕ формулой, что np.interp (y0 + f·(y1−y0)) → бит-в-бит с CPU
-(сложение/умножение IEEE коммутативны точно; деление на шаг сетки =1.0 точное). CPU-fallback
-(`np.interp`) — тоже бит-в-бит со старым кодом. fp64 на варпе memory-bound → почти без замедления.
+The GPU branch computes in float64 with the SAME formula as np.interp (y0 + f·(y1−y0)) → bit-exact
+with the CPU path (IEEE addition/multiplication are exactly commutative; dividing by a grid step
+of 1.0 is exact). The CPU fallback (`np.interp`) is bit-exact by construction, since it IS
+np.interp. fp64 on the warp is memory-bound, so it costs almost no extra time.
 
-ЗАКОН ДЛИТЕЛЬНОСТИ: GPU-ветка БЛОЧНАЯ (по `block` точек) — VRAM const, не растёт с длиной файла.
-ЗАКОН GPU-FIRST: CUDA есть → GPU, иначе CPU (потребитель без GPU не теряется).
+DURATION LAW: the GPU branch is CHUNKED (by `block` points) — VRAM stays constant, it does not
+grow with the file's length.
+GPU-FIRST LAW: CUDA available → GPU, otherwise CPU (a consumer with no GPU is never left out).
 """
 
 from __future__ import annotations
@@ -18,7 +21,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-# Окно блока (точек src). ~90с@44.1к; y-окно блока + src ≈ десятки МБ → VRAM const на любой длине.
+# Block window (src points). ~90s@44.1k; the block's y-window plus src is tens of MB, so VRAM
+# stays constant at any length.
 WARP_BLOCK = 4_000_000
 
 
@@ -27,26 +31,27 @@ def cuda_ok() -> bool:
 
 
 def warp_interp(y, src, *, block: int = WARP_BLOCK) -> np.ndarray:
-    """Линейная интерполяция значений `y` (на целочисл. сетке 0..len(y)-1) в дробных точках `src`.
-    Клампит края как np.interp (без экстраполяции). GPU блочно при CUDA, иначе CPU (бит-в-бит).
-    Возврат: float32 формы `src`."""
+    """Linear interpolation of `y` values (on the integer grid 0..len(y)-1) at fractional points `src`.
+    Clamps the edges like np.interp (no extrapolation). GPU, chunked, when CUDA is available,
+    otherwise CPU (bit-exact either way).
+    Returns: float32 shaped like `src`."""
     y = np.ascontiguousarray(y, dtype=np.float32)
     src = np.asarray(src, dtype=np.float64)
     n = int(y.shape[0])
     if n < 2 or not cuda_ok():
-        return np.interp(src, np.arange(n), y).astype(np.float32)   # CPU-fallback — бит-в-бит
+        return np.interp(src, np.arange(n), y).astype(np.float32)   # CPU fallback — bit-exact
 
     out = np.empty(src.shape, dtype=np.float32)
     for s0 in range(0, len(src), block):
         sb = src[s0:s0 + block]
-        lo = min(max(0, int(np.floor(sb.min()))), n - 2)    # y-окно блока; clamp lo≤n-2 → срез НЕ пустой
-        hi = max(min(n, int(np.ceil(sb.max())) + 2), lo + 2)  # весь блок за концом аудио → края (как np.interp), без краша
-        # float64 ТОЙ ЖЕ формулой, что np.interp → бит-в-бит с CPU; финальный каст float32 в конце
+        lo = min(max(0, int(np.floor(sb.min()))), n - 2)    # the block's y-window; clamp lo<=n-2 keeps the slice non-empty
+        hi = max(min(n, int(np.ceil(sb.max())) + 2), lo + 2)  # a block entirely past the audio end clamps to the edge (like np.interp), no crash
+        # float64 with the SAME formula as np.interp -> bit-exact with CPU; the final cast to float32 happens at the end
         yt = torch.from_numpy(y[lo:hi]).to("cuda", torch.float64)
-        st = torch.from_numpy(sb).to("cuda")                 # src уже float64
+        st = torch.from_numpy(sb).to("cuda")                 # src is already float64
         m = int(yt.shape[0])
         idx = torch.clamp(torch.floor(st).long() - lo, 0, m - 2)
-        f = (st - lo - idx.double()).clamp_(0.0, 1.0)        # доля в float64; clamp = без экстрапол.
+        f = (st - lo - idx.double()).clamp_(0.0, 1.0)        # fraction in float64; clamp means no extrapolation
         y0 = yt[idx]
         out[s0:s0 + block] = (y0 + f * (yt[idx + 1] - y0)).to(torch.float32).cpu().numpy()
     return out

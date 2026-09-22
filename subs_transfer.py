@@ -1,4 +1,7 @@
-"""Carry a video's sidecar subtitles onto the reference timeline with the pair's vision map.
+"""Carry a source's sidecar subtitles onto the reference timeline with the pair's time map.
+
+The pair's time map is the layout of what the subtitles are tied to: the vision map for a dub with
+a video, the audio layout for a dub without one.
 
 The map is stored next to the pair's output, so subtitles can be transferred again later
 (new sidecars, a finished pair) without repeating the matching.
@@ -12,6 +15,7 @@ import numpy as np
 from loguru import logger
 
 from track_muxer.conform.features import FFPROBE, probe_video_duration, probe_video_start
+from track_muxer.conform.subtitles.ass import parse_ass
 from track_muxer.conform.subtitles.clean import clean_cues
 from track_muxer.conform.subtitles.retime import TimeMap, build_time_map, retime_cues
 from track_muxer.conform.subtitles.sidecars import text_track_sidecars, text_track_tail
@@ -21,7 +25,7 @@ from track_muxer.conform.subtitles.vtt import neutral_cues, parse_vtt
 MAP_DIR = "_timemap"
 # Source format -> reader giving (format-neutral cues, cue settings dropped).
 # A format without a reader is reported, never guessed at.
-_READERS = {".vtt": lambda text: neutral_cues(parse_vtt(text))}
+_READERS = {".vtt": lambda text: neutral_cues(parse_vtt(text)), ".ass": parse_ass}
 # The format is a detail of writing: one place decides what lands next to the aligned audio.
 OUT_EXT, _WRITE = ".srt", dump_srt
 
@@ -51,9 +55,25 @@ def load_time_map(out_path: Path) -> TimeMap | None:
                               float(z["fps_ref"]), float(z["dur_ref"]))
 
 
+def identity_layout(dur: float):
+    """(T, curve, cuts) of a source that already sits on the reference timeline."""
+    return np.array([0.0, dur]), np.zeros(2), []
+
+
 def identity_time_map(fps: float, dur: float) -> TimeMap:
     """The reference's own subtitles already sit on its timeline."""
-    return build_time_map(np.array([0.0, dur]), np.zeros(2), [], fps, dur)
+    return build_time_map(*identity_layout(dur), fps, dur)
+
+
+def _read_text(path: Path) -> str:
+    """A text track as text. The byte order mark names the encoding; without one it is UTF-8."""
+    raw = path.read_bytes()
+    # The UTF-32 marks begin with the UTF-16 ones, so they are looked at first.
+    if raw[:4] in (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff"):
+        return raw.decode("utf-32")
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16")
+    return raw.decode("utf-8-sig")
 
 
 def transfer_sidecars(video: Path, out_dir: Path, out_stem: str, tmap: TimeMap,
@@ -84,7 +104,7 @@ def transfer_sidecars(video: Path, out_dir: Path, out_stem: str, tmap: TimeMap,
             entry["error"] = f"no reader for {src.suffix}"
             continue
         try:
-            cues_in, n_settings = read(src.read_text(encoding="utf-8-sig"))
+            cues_in, n_settings = read(_read_text(src))
             cues, dropped = clean_cues(cues_in)
             cues = [c.at(c.start - video_start, c.end - video_start) for c in cues]
             moved = retime_cues(cues, tmap, dur_src)

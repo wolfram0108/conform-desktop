@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""PNG-миниатюра укладки band/muq (read-only диагностика, matplotlib Agg).
-Кривая варпа (дрейф+горки, оранжевая) + грубая off0 (синяя) + точки o по уверенности +
-вертикали резов. Знак: правее=+; кадр=41.708мс. Интерактивный график — в plots_html.py."""
+"""PNG thumbnail of the band/muq layout (read-only diagnostics, matplotlib Agg).
+The warp curve (drift+ramps, orange) + coarse off0 (blue) + o points by confidence +
+vertical lines at cuts. Sign: rightward=+; frame=41.708 ms. The interactive plot lives in
+plots_html.py."""
 import numpy as np
 
 from .params import T as _DEFT, FRAME
@@ -9,7 +10,7 @@ from .params import T as _DEFT, FRAME
 
 def _setup():
     import matplotlib
-    matplotlib.use("Agg")            # без дисплея (сервер)
+    matplotlib.use("Agg")            # no display available (server)
     import matplotlib.pyplot as plt
     return plt
 
@@ -20,7 +21,7 @@ def _wn(w):
 
 
 def _wc_breaks(wcurve, cuts, T):
-    """Кривая с NaN на резах — чтобы линия не соединяла куски через разрыв."""
+    """The curve with NaN at cuts, so the line does not connect pieces across the break."""
     wc = np.asarray(wcurve, float).copy()
     for tc, _ in cuts:
         j = int(np.searchsorted(T, tc))
@@ -30,11 +31,11 @@ def _wc_breaks(wcurve, cuts, T):
 
 
 def render_track(path, o, w, off0, wcurve, cuts, *, title="", T=None):
-    """Весь трек: точки o (яркость=уверенность) + грубая off0 + кривая варпа + резы.
+    """The whole track: o points (brightness = confidence) + coarse off0 + the warp curve + cuts.
 
-    T — сетка времени тех же длин, что o/w (make_T реальной длительности пары). None →
-    дефолтная сетка params.T (как было; годится ТОЛЬКО когда длительность пары совпадает
-    со стандартной — на нестандартной падало «x and y must be the same size», 2026-08-06)."""
+    T is a time grid of the same length as o/w (make_T of the pair's real duration). None uses the
+    default grid params.T, which fits ONLY when the pair's duration matches the standard one -- on a
+    non-standard duration this raises "x and y must be the same size"."""
     T = _DEFT if T is None else np.asarray(T, float)
     plt = _setup()
     fig, ax = plt.subplots(figsize=(15, 4.6), dpi=110)
